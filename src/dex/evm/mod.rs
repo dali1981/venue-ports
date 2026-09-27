@@ -6,5 +6,6 @@ mod simulated;
 mod stub;
 mod tx;
 
+pub use live::EvmLive;
 pub use simulated::EvmSimulated;
 pub use stub::{EvmStub, RecordedCall};

@@ -7,11 +7,17 @@ description = "A tested, reusable connection layer between an automated trading 
 repository = "https://github.com/dali1981/venue-ports"
 
 [dependencies]
-alloy-primitives = { version = "1.7.3", features = ["std"] }
+alloy-consensus = "2.5.0"
+alloy-primitives = { version = "1.7.3", features = ["std", "k256"] }
 anyhow = "1.0.104"
 async-trait = "0.1.92"
 hex = "0.4.3"
 hmac = "0.12.1"
+# Pinned to the exact version `alloy-primitives`'s own `k256` feature pulls
+# in (its `Signature: From<(k256::ecdsa::Signature, RecoveryId)>` impl is
+# only defined against that version's types) — letting this float to 0.14
+# would give two incompatible `k256` versions in the graph.
+k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa", "std"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 rust_decimal = "1.43.0"
 serde = { version = "1.0.219", features = ["derive"] }
