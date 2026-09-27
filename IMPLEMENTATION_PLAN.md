@@ -12,6 +12,59 @@ Guiding constraints carried over from the spec (do not relitigate these while im
 - A `Stub` is only trustworthy once a contract test proves it agrees with `Simulated`/`Live` (§7) — no
   adapter counts as done without running the shared suite from `src/testkit/contract.rs` against it.
 
+## BLOCKED — everything below needs input only you can give
+
+Phases 0, 1, 2, 3, 4, 6, and 9 are complete and require nothing further. **Phases 5 and 7 cannot start
+or continue without the items below.** Nothing here can be worked around, guessed, or defaulted —
+each one is either a credential Claude cannot generate, or a decision the spec deliberately leaves to
+whoever integrates a real venue.
+
+### Blocker 1 — `EvmSimulated` has not cleared its real-world acceptance bar (blocks Phase 5)
+
+`SPEC.md` §9.2 requires the contract suite to pass **100 times against a real RPC endpoint**, with a
+real router and token, every result reconciled to the exact wei, including deliberately injected
+failures for each `Outcome` variant. So far `EvmSimulated` has only been run against a local mocked
+RPC server (`wiremock`) — it has never touched a real chain. `EvmLive` (Phase 5) is explicitly gated on
+this bar being cleared first (§9.4): nothing signs or sends anything real before it is.
+
+**Needed from you, all three:**
+1. An RPC endpoint URL for an EVM chain (any public endpoint works — the state-override technique
+   `EvmSimulated` uses needs no forked node and no paid tier).
+2. A concrete DEX router address and a token pair on that chain to run the 100 test swaps against.
+3. Confirmation of the two conventions this session picked in the absence of a real router to test
+   against (documented at the top of `src/dex/evm/simulated.rs`, flagged but never confirmed):
+   - `RouteQuote.payload` is read as `router_address (20 bytes) ++ calldata`.
+   - The router's return data is decoded as a single `uint256` (`amount_out`) — will not work if the
+     real router returns an array or tuple instead.
+
+### Blocker 2 — `EvmLive` needs real signing credentials (blocks Phase 5, after Blocker 1)
+
+Once Blocker 1 clears, `EvmLive` (`src/dex/evm/live.rs`, `src/dex/evm/tx.rs` — currently empty
+placeholders) signs and broadcasts real transactions. This needs, from you, when you are ready to
+spend real funds testing it:
+- A private key or signer to hold the funds and sign with (never asked for or stored by Claude on its
+  own initiative — this is a human-triggered action per §3/§9.4, always).
+- The chain and the real router/tokens to trade, and the amount you're willing to risk on first runs.
+
+### Blocker 3 — No CEX venue has been chosen or credentialed (blocks Phase 7)
+
+`src/cex/<venue>/` does not exist yet because no venue has been picked. `SPEC.md`'s own example symbol
+(`"SOLUSDT"`) suggests Binance, but this is a guess, not a confirmed decision — every venue has its own
+signing scheme, rate limits, and symbol/step-size rules that are not swappable later without rework, so
+this needs deciding up front, not defaulted.
+
+**Needed from you, both:**
+1. Which venue to build first (confirm Binance, or name a different one).
+2. Sandbox/testnet API credentials for that venue — required before `CexLive` can be pointed at the
+   sandbox host, which *is* "Simulated" for a CEX per §3 (no separate struct). Production credentials
+   are a separate, later ask, only needed once the sandbox run clears §9's bar.
+
+### What is NOT blocked
+
+`EvmStub` and `CexStub` are both done, pass the shared contract suite, and are safe to build a trading
+system against right now — see [`examples/basic_usage.rs`](examples/basic_usage.rs). Nothing above
+blocks writing or testing consumer code against the stubs.
+
 ## Phase 0 — Scaffolding
 
 - `cargo init --lib`, matching the module layout in §8.

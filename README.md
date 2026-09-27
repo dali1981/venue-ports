@@ -26,6 +26,11 @@ for a minimal sketch of calling both ports and handling what comes back.
 Neither `Live` adapter is exercised by an automated test or a schedule — per `SPEC.md` §3/§9, that is
 only ever a deliberate, human-triggered action.
 
+**Both `Live` adapters are currently blocked on input only a human can give — RPC access, a router/venue
+choice, and credentials.** See the "BLOCKED" section at the top of
+[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md#blocked--everything-below-needs-input-only-you-can-give)
+for exactly what is needed and why nothing further can proceed without it.
+
 ## Scope, in one paragraph
 
 Given a route or an order that something else has already decided to send, this crate is responsible
