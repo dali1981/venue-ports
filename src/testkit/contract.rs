@@ -37,39 +37,7 @@ pub async fn dex_executor_contract(executor: &dyn DexExecutor, fixture: Contract
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dex::{Prepared, Realised};
-    use anyhow::Result;
-    use async_trait::async_trait;
-
-    /// A throwaway mock proving `dex_executor_contract` compiles and holds
-    /// against *some* implementation. Delete this once `EvmStub` (Phase 3)
-    /// exists to run the suite against for real.
-    struct ThrowawayMock;
-
-    #[async_trait]
-    impl DexExecutor for ThrowawayMock {
-        async fn prepare(&self, route: &RouteQuote, req: &SwapRequest) -> Result<Prepared> {
-            Ok(Prepared {
-                to: route.token_out.clone(),
-                calldata: Vec::new(),
-                value: req.min_amount_out,
-            })
-        }
-
-        async fn execute(&self, prepared: &Prepared, _at: Option<u64>) -> Result<Realised> {
-            Ok(Realised {
-                amount_out: Some(prepared.value),
-                outcome: Outcome::Success,
-                at: 0,
-                provenance: Provenance::Simulated,
-                tx_ref: None,
-            })
-        }
-
-        fn label(&self) -> &'static str {
-            "throwaway-mock"
-        }
-    }
+    use crate::dex::evm::EvmStub;
 
     fn fixture() -> ContractFixture {
         ContractFixture {
@@ -91,7 +59,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn throwaway_mock_satisfies_the_contract() {
-        dex_executor_contract(&ThrowawayMock, fixture()).await;
+    async fn evm_stub_satisfies_the_contract() {
+        dex_executor_contract(&EvmStub::new(), fixture()).await;
     }
 }

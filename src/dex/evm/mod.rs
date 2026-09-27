@@ -5,3 +5,5 @@ mod live;
 mod simulated;
 mod stub;
 mod tx;
+
+pub use stub::{EvmStub, RecordedCall};
