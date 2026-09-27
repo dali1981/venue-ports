@@ -122,22 +122,29 @@ impl EvmSimulated {
         })
     }
 
+    /// `from` matters whenever the call itself depends on `msg.sender` —
+    /// a real router's swap reads it to decide whose balance/allowance to
+    /// pull from (`TransferHelper`'s `"STF"` revert is exactly what a real
+    /// Sepolia run of this adapter hit before `from` was wired through:
+    /// omitting it left the call's `msg.sender` at the zero address, so
+    /// the state overrides below — written against the *route's* sender —
+    /// were never the address the router actually checked). It's
+    /// irrelevant for a pure view call like `balanceOf`/`allowance`, so
+    /// the slot-probing call sites pass `None`.
     async fn eth_call(
         &self,
         to: Address,
         data: &[u8],
         block: u64,
         overrides: Value,
+        from: Option<Address>,
     ) -> Result<Vec<u8>> {
+        let mut call = json!({ "to": to.to_string(), "data": format!("0x{}", hex::encode(data)) });
+        if let Some(from) = from {
+            call["from"] = json!(from.to_string());
+        }
         let result = self
-            .rpc_call(
-                "eth_call",
-                json!([
-                    { "to": to.to_string(), "data": format!("0x{}", hex::encode(data)) },
-                    format!("0x{block:x}"),
-                    overrides,
-                ]),
-            )
+            .rpc_call("eth_call", json!([call, format!("0x{block:x}"), overrides]))
             .await?;
         let hex_str = result
             .as_str()
@@ -170,7 +177,9 @@ impl EvmSimulated {
             let overrides = json!({
                 token.to_string(): { "stateDiff": { slot.to_string(): format_u256(marker) } }
             });
-            let data = self.eth_call(token, &calldata, block, overrides).await?;
+            let data = self
+                .eth_call(token, &calldata, block, overrides, None)
+                .await?;
             if U256::from_be_slice(&data) == marker {
                 self.balance_slot_cache.lock().unwrap().insert(token, index);
                 return Ok(index);
@@ -207,7 +216,9 @@ impl EvmSimulated {
             let overrides = json!({
                 token.to_string(): { "stateDiff": { slot.to_string(): format_u256(marker) } }
             });
-            let data = self.eth_call(token, &calldata, block, overrides).await?;
+            let data = self
+                .eth_call(token, &calldata, block, overrides, None)
+                .await?;
             if U256::from_be_slice(&data) == marker {
                 self.allowance_slot_cache
                     .lock()
@@ -292,7 +303,13 @@ impl DexExecutor for EvmSimulated {
         });
 
         match self
-            .eth_call(router, &prepared.calldata, block, overrides)
+            .eth_call(
+                router,
+                &prepared.calldata,
+                block,
+                overrides,
+                Some(ctx.sender),
+            )
             .await
         {
             Ok(data) => {
@@ -666,5 +683,119 @@ mod tests {
             Outcome::Reverted { reason: got } => assert_eq!(got, reason),
             other => panic!("expected Reverted, got {other:?}"),
         }
+    }
+
+    /// Everything above proves this adapter's logic against a mocked
+    /// JSON-RPC server. This test proves the one part a mock can't: that
+    /// the slot-probing state-override technique actually works against a
+    /// *real* node's real storage layout — SPEC.md §9.2's real-RPC bar,
+    /// worked toward incrementally rather than all at once.
+    ///
+    /// No-ops (does not fail) when `EVM_LIVE_RPC_URL` is unset, so it's
+    /// silent for every contributor and CI run that hasn't opted in —
+    /// exactly the "network-dependent job gated on a secret being present"
+    /// `IMPLEMENTATION_PLAN.md` Phase 4 asks for. Read-only (`eth_call`,
+    /// no transaction), so it needs no signer and spends nothing: probing
+    /// `balanceOf`/`allowance` for an arbitrary address is safe against
+    /// any real ERC-20.
+    #[tokio::test]
+    async fn against_real_sepolia_usdc_finds_real_balance_and_allowance_slots() {
+        let Ok(rpc_url) = std::env::var("EVM_LIVE_RPC_URL") else {
+            eprintln!("skipping: EVM_LIVE_RPC_URL is not set");
+            return;
+        };
+
+        // Circle's official Sepolia USDC (a real, verified-deployed proxy
+        // contract) and Uniswap V3's SwapRouter02 on Sepolia (used here
+        // only as an arbitrary allowance spender, not actually called).
+        let usdc: Address = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
+            .parse()
+            .unwrap();
+        let router: Address = "0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E"
+            .parse()
+            .unwrap();
+        // An arbitrary address — this probe never needs it to hold a real
+        // balance or have granted a real allowance.
+        let sender: Address = "0x000000000000000000000000000000000000dEaD"
+            .parse()
+            .unwrap();
+
+        let adapter = EvmSimulated::new(rpc_url);
+        let block = adapter
+            .latest_block_number()
+            .await
+            .expect("real Sepolia RPC should answer eth_blockNumber");
+
+        let balance_index = adapter
+            .find_balance_slot(usdc, sender, block)
+            .await
+            .expect("balanceOf storage slot should be probeable on real USDC");
+        let allowance_index = adapter
+            .find_allowance_slot(usdc, sender, router, block)
+            .await
+            .expect("allowance storage slot should be probeable on real USDC");
+
+        eprintln!(
+            "real Sepolia USDC @ block {block}: balanceOf slot index {balance_index}, \
+             allowance slot index {allowance_index}"
+        );
+    }
+
+    /// Exploratory — not a permanent fixture — one real swap through a
+    /// real, currently-liquid Uniswap V3 pool (USDC/WETH, 0.3% fee,
+    /// verified on GeckoTerminal) via SwapRouter02's real
+    /// `exactInputSingle`, gated on `EVM_LIVE_RPC_URL` the same way.
+    #[tokio::test]
+    async fn against_real_sepolia_executes_a_real_swap_via_swaprouter02() {
+        let Ok(rpc_url) = std::env::var("EVM_LIVE_RPC_URL") else {
+            eprintln!("skipping: EVM_LIVE_RPC_URL is not set");
+            return;
+        };
+
+        let usdc: Address = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
+            .parse()
+            .unwrap();
+        let weth: Address = "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"
+            .parse()
+            .unwrap();
+        let router: Address = "0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E"
+            .parse()
+            .unwrap();
+        let sender: Address = "0x000000000000000000000000000000000000dEaD"
+            .parse()
+            .unwrap();
+
+        // SwapRouter02#exactInputSingle((address,address,uint24,address,uint256,uint256,uint160)) — 0x04e45aaf.
+        let mut calldata = vec![0x04, 0xe4, 0x5a, 0xaf];
+        calldata.extend_from_slice(&pad_address(usdc));
+        calldata.extend_from_slice(&pad_address(weth));
+        calldata.extend_from_slice(&U256::from(3_000u64).to_be_bytes::<32>()); // fee: 0.3%
+        calldata.extend_from_slice(&pad_address(sender)); // recipient
+        calldata.extend_from_slice(&U256::from(1_000_000u64).to_be_bytes::<32>()); // amountIn: 1 USDC
+        calldata.extend_from_slice(&U256::ZERO.to_be_bytes::<32>()); // amountOutMinimum
+        calldata.extend_from_slice(&U256::ZERO.to_be_bytes::<32>()); // sqrtPriceLimitX96
+
+        let mut payload = router.as_slice().to_vec();
+        payload.extend_from_slice(&calldata);
+
+        let route = RouteQuote {
+            chain_id: 11_155_111,
+            token_in: usdc.as_slice().to_vec(),
+            token_out: weth.as_slice().to_vec(),
+            amount_in: 1_000_000,
+            expected_amount_out: 0,
+            payload,
+        };
+        let request = SwapRequest {
+            sender: sender.as_slice().to_vec(),
+            recipient: sender.as_slice().to_vec(),
+            min_amount_out: 0,
+            deadline_unix_secs: 0,
+        };
+
+        let adapter = EvmSimulated::new(rpc_url);
+        let prepared = adapter.prepare(&route, &request).await.unwrap();
+        let realised = adapter.execute(&prepared, None).await.unwrap();
+        eprintln!("real swap result: {realised:?}");
     }
 }

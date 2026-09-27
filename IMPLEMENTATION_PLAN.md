@@ -28,23 +28,38 @@ failures for each `Outcome` variant. So far `EvmSimulated` has only been run aga
 RPC server (`wiremock`) — it has never touched a real chain. `EvmLive` (Phase 5) is explicitly gated on
 this bar being cleared first (§9.4): nothing signs or sends anything real before it is.
 
-**Resolved:** testnet-first confirmed — an Ethereum Sepolia RPC URL (Alchemy) is in hand, stored as
-`EVM_LIVE_RPC_URL` in a gitignored `.env.local`, never committed. Ethereum Sepolia rather than Base
-Sepolia is fine: `SPEC.md`'s types carry their own `chain_id`, nothing pins a specific chain.
+**Resolved — the mechanism is now proven against a real chain, not just a mock:**
+- Testnet-first confirmed — an Ethereum Sepolia RPC URL (Alchemy) is in hand, stored as
+  `EVM_LIVE_RPC_URL` in a gitignored `.env.local`, never committed. Ethereum Sepolia rather than Base
+  Sepolia is fine: `SPEC.md`'s types carry their own `chain_id`, nothing pins a specific chain.
+- This environment's network egress, initially blocking the RPC host, was opened by adding
+  `eth-sepolia.g.alchemy.com` (and `api-testnet.bybit.com`) as allowed custom domains — `eth_chainId`
+  and `eth_getCode` both confirmed real, working access.
+- Router + token pair chosen and verified deployed on-chain: Uniswap V3 `SwapRouter02`
+  (`0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E`) and its USDC/WETH 0.3%-fee pool (real but thin
+  liquidity, ~$3.8k — be mindful of running many real swaps against it) — USDC
+  (`0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238`) and canonical Sepolia WETH
+  (`0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14`).
+- Both flagged conventions confirmed correct against the real router: `RouteQuote.payload` as
+  `router_address ++ calldata`, and decoding the return data as a single `uint256`.
+- **A real bug was found and fixed by this real-network run**, not by any mock: `eth_call` never set
+  `"from"`, so `msg.sender` inside the router defaulted to the zero address — the sender's overridden
+  balance/allowance were never the address the router actually checked, and a real swap reverted with
+  Uniswap's `"STF"` (`SafeTransferFrom` failed). Fixed by passing the route's sender as `eth_call`'s
+  `from` for the router call (irrelevant, so omitted, for the two pure-view slot-probing calls). Two
+  new tests pin this against the real chain — gated on `EVM_LIVE_RPC_URL` being set, a no-op otherwise
+  (`src/dex/evm/simulated.rs`): one real `balanceOf`/`allowance` slot probe, one full real swap, both
+  currently green.
 
-**Still needed:**
-1. **This session's own outbound network access is currently blocked by this environment's egress
-   policy** — a direct test against that RPC URL, and against a public price aggregator, both got a
-   403 from the agent proxy (organization policy), independent of the URL or credentials being valid.
-   Clearing §9.2's 100-run bar from inside this environment needs that policy widened (environment
-   settings → Network access → broaden the access level or allowlist the specific RPC/aggregator
-   hosts) — it is not blocked on anything further from you.
-2. A concrete DEX router address and a token pair on Sepolia to run the 100 test swaps against.
-3. Confirmation of the two conventions this session picked in the absence of a real router to test
-   against (documented at the top of `src/dex/evm/simulated.rs`, flagged but never confirmed):
-   - `RouteQuote.payload` is read as `router_address (20 bytes) ++ calldata`.
-   - The router's return data is decoded as a single `uint256` (`amount_out`) — will not work if the
-     real router returns an array or tuple instead.
+**Still needed to fully clear §9.2's literal bar:**
+1. The 100-distinct-input, exact-reconciliation replication itself — one real swap has succeeded and
+   one real revert (this adapter's own bug, not an injected venue failure) has been observed and
+   handled correctly, but the bar wants 100 runs plus a deliberately injected failure per `Outcome`
+   variant, not one of each. Worth scripting as a real (rate-limited, liquidity-mindful) run rather
+   than by hand.
+2. `Outcome::TimedOut` still has no real-network path exercising it — `EvmSimulated::execute()`
+   currently only ever produces `Success` or `Reverted` against a real RPC; needs a deliberate way to
+   force a timeout (e.g. a request-timeout wrapper) to prove that shape too.
 
 ### Blocker 2 — `EvmLive` needs real signing credentials (blocks Phase 5, after Blocker 1)
 

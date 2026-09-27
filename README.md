@@ -16,9 +16,9 @@ stub), the test strategy that keeps the stub honest, and acceptance criteria. Se
 
 | port | `Stub` | `Simulated` | `Live` |
 |---|---|---|---|
-| DEX (EVM) | done (`EvmStub`) | done, mechanism only — §9.2's real-RPC acceptance bar not yet cleared | scaffolded (`EvmLive`), not yet run — needs a signer |
-| CEX — Binance | done (`CexStub`) | — (a CEX's `Simulated` is `Live` pointed at a sandbox, §3) | scaffolded (`BinanceLive`), unit-tested against a mocked server, not yet run against the real testnet |
-| CEX — Bybit | done (`CexStub`) | — (a CEX's `Simulated` is `Live` pointed at a sandbox, §3) | scaffolded (`BybitLive`), unit-tested against a mocked server, not yet run against the real testnet |
+| DEX (EVM) | done (`EvmStub`) | verified against a real Sepolia swap (Uniswap V3 `SwapRouter02`) — §9.2's full 100-run replication not yet done | scaffolded (`EvmLive`), not yet run — needs a signer |
+| CEX — Binance | done (`CexStub`) | testnet credentials in hand; blocked on Binance's own geo-eligibility check (HTTP 451) from this environment | scaffolded (`BinanceLive`), unit-tested against a mocked server, not yet run against the real testnet |
+| CEX — Bybit | done (`CexStub`) | blocked on Bybit's own CloudFront geo-restriction from this environment | scaffolded (`BybitLive`), unit-tested against a mocked server, not yet run against the real testnet |
 
 Both `Stub` implementations pass the shared contract-test suite (`src/testkit/contract.rs`) and are
 ready to build a trading system against today. See [`examples/basic_usage.rs`](examples/basic_usage.rs)
