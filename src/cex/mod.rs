@@ -7,8 +7,12 @@ use anyhow::Result;
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 
+mod binance;
+mod bybit;
 mod stub;
 
+pub use binance::{BinanceConfig, BinanceLive};
+pub use bybit::{BybitConfig, BybitLive};
 pub use stub::{CexStub, RecordedCall};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
