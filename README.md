@@ -16,8 +16,9 @@ stub), the test strategy that keeps the stub honest, and acceptance criteria. Se
 
 | port | `Stub` | `Simulated` | `Live` |
 |---|---|---|---|
-| DEX (EVM) | done (`EvmStub`) | done, mechanism only — §9.2's real-RPC acceptance bar not yet cleared | not started |
-| CEX | done (`CexStub`) | — (a CEX's `Simulated` is `Live` pointed at a sandbox, §3) | not started, no venue picked yet |
+| DEX (EVM) | done (`EvmStub`) | done, mechanism only — §9.2's real-RPC acceptance bar not yet cleared | scaffolded (`EvmLive`), not yet run — needs a signer |
+| CEX — Binance | done (`CexStub`) | — (a CEX's `Simulated` is `Live` pointed at a sandbox, §3) | scaffolded (`BinanceLive`), unit-tested against a mocked server, not yet run against the real testnet |
+| CEX — Bybit | done (`CexStub`) | — (a CEX's `Simulated` is `Live` pointed at a sandbox, §3) | scaffolded (`BybitLive`), unit-tested against a mocked server, not yet run against the real testnet |
 
 Both `Stub` implementations pass the shared contract-test suite (`src/testkit/contract.rs`) and are
 ready to build a trading system against today. See [`examples/basic_usage.rs`](examples/basic_usage.rs)
@@ -26,8 +27,10 @@ for a minimal sketch of calling both ports and handling what comes back.
 Neither `Live` adapter is exercised by an automated test or a schedule — per `SPEC.md` §3/§9, that is
 only ever a deliberate, human-triggered action.
 
-**Both `Live` adapters are currently blocked on input only a human can give — RPC access, a router/venue
-choice, and credentials.** See the "BLOCKED" section at the top of
+**Every `Live` adapter is testnet-first by default** — `EvmLive` against Ethereum Sepolia,
+`BinanceLive`/`BybitLive` against each venue's own testnet host — and is currently blocked on input
+only a human can give: real credentials, and (from inside this environment specifically) broader
+network egress. See the "BLOCKED" section at the top of
 [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md#blocked--everything-below-needs-input-only-you-can-give)
 for exactly what is needed and why nothing further can proceed without it.
 

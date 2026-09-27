@@ -14,10 +14,11 @@ Guiding constraints carried over from the spec (do not relitigate these while im
 
 ## BLOCKED — everything below needs input only you can give
 
-Phases 0, 1, 2, 3, 4, 6, and 9 are complete and require nothing further. **Phases 5 and 7 cannot start
-or continue without the items below.** Nothing here can be worked around, guessed, or defaulted —
-each one is either a credential Claude cannot generate, or a decision the spec deliberately leaves to
-whoever integrates a real venue.
+Phases 0, 1, 2, 3, 4, 6, and 9 are complete and require nothing further. **Phases 5 and 7 cannot go
+live without the items below**, though both now have real scaffolding in place (`src/cex/binance/`,
+`src/cex/bybit/`), unit-tested against mocked venue responses rather than a real sandbox. Decisions
+below marked resolved came from Mo directly; what's still open is real credentials and real network
+access, neither of which can be worked around, guessed, or defaulted.
 
 ### Blocker 1 — `EvmSimulated` has not cleared its real-world acceptance bar (blocks Phase 5)
 
@@ -27,10 +28,18 @@ failures for each `Outcome` variant. So far `EvmSimulated` has only been run aga
 RPC server (`wiremock`) — it has never touched a real chain. `EvmLive` (Phase 5) is explicitly gated on
 this bar being cleared first (§9.4): nothing signs or sends anything real before it is.
 
-**Needed from you, all three:**
-1. An RPC endpoint URL for an EVM chain (any public endpoint works — the state-override technique
-   `EvmSimulated` uses needs no forked node and no paid tier).
-2. A concrete DEX router address and a token pair on that chain to run the 100 test swaps against.
+**Resolved:** testnet-first confirmed — an Ethereum Sepolia RPC URL (Alchemy) is in hand, stored as
+`EVM_LIVE_RPC_URL` in a gitignored `.env.local`, never committed. Ethereum Sepolia rather than Base
+Sepolia is fine: `SPEC.md`'s types carry their own `chain_id`, nothing pins a specific chain.
+
+**Still needed:**
+1. **This session's own outbound network access is currently blocked by this environment's egress
+   policy** — a direct test against that RPC URL, and against a public price aggregator, both got a
+   403 from the agent proxy (organization policy), independent of the URL or credentials being valid.
+   Clearing §9.2's 100-run bar from inside this environment needs that policy widened (environment
+   settings → Network access → broaden the access level or allowlist the specific RPC/aggregator
+   hosts) — it is not blocked on anything further from you.
+2. A concrete DEX router address and a token pair on Sepolia to run the 100 test swaps against.
 3. Confirmation of the two conventions this session picked in the absence of a real router to test
    against (documented at the top of `src/dex/evm/simulated.rs`, flagged but never confirmed):
    - `RouteQuote.payload` is read as `router_address (20 bytes) ++ calldata`.
@@ -40,30 +49,48 @@ this bar being cleared first (§9.4): nothing signs or sends anything real befor
 ### Blocker 2 — `EvmLive` needs real signing credentials (blocks Phase 5, after Blocker 1)
 
 Once Blocker 1 clears, `EvmLive` (`src/dex/evm/live.rs`, `src/dex/evm/tx.rs` — currently empty
-placeholders) signs and broadcasts real transactions. This needs, from you, when you are ready to
-spend real funds testing it:
-- A private key or signer to hold the funds and sign with (never asked for or stored by Claude on its
-  own initiative — this is a human-triggered action per §3/§9.4, always).
-- The chain and the real router/tokens to trade, and the amount you're willing to risk on first runs.
+placeholders) signs and broadcasts real transactions. This needs, from you, when you are ready:
+- A disposable, faucet-funded Sepolia signer — never a mainnet key at this stage. Same discipline as
+  the RPC URL: straight into an env var, never a commit.
+- The router/tokens to trade, and the amount you're willing to risk on first runs.
 
-### Blocker 3 — No CEX venue has been chosen or credentialed (blocks Phase 7)
+### Blocker 3 — CEX venues: chosen, scaffolded, not yet credentialed (blocks Phase 7)
 
-`src/cex/<venue>/` does not exist yet because no venue has been picked. `SPEC.md`'s own example symbol
-(`"SOLUSDT"`) suggests Binance, but this is a guess, not a confirmed decision — every venue has its own
-signing scheme, rate limits, and symbol/step-size rules that are not swappable later without rework, so
-this needs deciding up front, not defaulted.
+**Resolved:** both Binance and Bybit, built side by side rather than one after the other — this is a
+genuinely multi-venue port, not "Binance now, a second venue later." `src/cex/binance/` and
+`src/cex/bybit/` both exist: a signed REST client (`rest.rs`) and a `CexExecutor` implementation
+(`live.rs`) per venue, defaulting to each venue's **testnet** host
+(`testnet.binance.vision`, `api-testnet.bybit.com`) — a production run opts in explicitly via
+`BINANCE_BASE_URL`/`BYBIT_BASE_URL`, never by default. Both venues' request signing is unit-tested
+(Binance against a docs-derived HMAC vector, Bybit against the documented signable-string
+construction) and both `execute()` flows are tested against `wiremock`-mocked venue responses.
 
-**Needed from you, both:**
-1. Which venue to build first (confirm Binance, or name a different one).
-2. Sandbox/testnet API credentials for that venue — required before `CexLive` can be pointed at the
-   sandbox host, which *is* "Simulated" for a CEX per §3 (no separate struct). Production credentials
-   are a separate, later ask, only needed once the sandbox run clears §9's bar.
+Two adapter conventions are flagged, not confirmed, in `src/cex/binance/live.rs` and
+`src/cex/bybit/live.rs` for the same reason `EvmSimulated`'s are: no sandbox account exists yet to
+check them against a real response.
+- Both: the `LOT_SIZE` step per symbol is supplied by the caller, not fetched from the venue's own
+  instrument-info endpoint.
+- Bybit only: the commission asset per symbol is also caller-supplied, since Bybit's order-status
+  response reports a fee amount but not its currency, and this adapter cannot see account-level fee
+  settings that would disambiguate it.
+
+**Still needed, per venue:**
+1. Sandbox/testnet API credentials (Binance Spot Testnet, Bybit's testnet) — required to run
+   `cex_executor_contract` against the real sandbox host, which *is* "Simulated" for a CEX per §3.
+   Same handling as the RPC URL: straight into env vars, gitignored, never committed.
+2. Once credentials land, the same network-access caveat as Blocker 1 applies: this environment's
+   egress policy will need `testnet.binance.vision` / `api-testnet.bybit.com` reachable before a real
+   sandbox run can happen from inside it.
+
+Production credentials are a separate, later ask, only needed once each venue's sandbox run clears
+§9's bar.
 
 ### What is NOT blocked
 
 `EvmStub` and `CexStub` are both done, pass the shared contract suite, and are safe to build a trading
 system against right now — see [`examples/basic_usage.rs`](examples/basic_usage.rs). Nothing above
-blocks writing or testing consumer code against the stubs.
+blocks writing or testing consumer code against the stubs, or against `BinanceLive`/`BybitLive` run
+against a mocked server in tests.
 
 ## Phase 0 — Scaffolding
 
@@ -145,21 +172,25 @@ blocks writing or testing consumer code against the stubs.
   assertions (`filled_qty`/`filled_price` presence rules, `order_ref.is_some() == Landed`).
 - Done when: `cex_executor_contract` passes against `CexStub` in CI, alongside the DEX one.
 
-## Phase 7 — First CEX venue: `<venue>/rest.rs` + `CexLive` (§6, first bullet)
+## Phase 7 — CEX venues: Binance + Bybit, in parallel (§6, first bullet)
 
-- Pick one venue (the spec's own example symbol format, `"SOLUSDT"`, suggests Binance — confirm before
-  starting, since REST signing and rate-limit rules are venue-specific and not swappable later without
-  rework).
-- `src/cex/<venue>/rest.rs`: a signed REST client for that venue's trading API.
-- `src/cex/<venue>/live.rs`: quantity rounded to the venue's step/notional size *before* sending, clock
-  sync against the venue's server time where required, base URL + credential set configurable so that
-  pointing it at the venue's sandbox host *is* "Simulated" for this leg (§3's asymmetry — no separate
-  struct), fills read from the placing call's own response first, falling back to a status query only
-  when that response was ambiguous.
-- CI: same pattern as Phase 4 — a scheduled/PR-gated job running `cex_executor_contract` against the
-  sandbox host, credentials permitting.
-- Done when: §9's four-point bar is met for this venue, same as Phase 5's DEX equivalent, with "Live"
-  meaning a real order against the venue's production API.
+Two venues from the start, not one followed by a second later — confirmed by Mo. Each gets its own
+`<venue>/rest.rs` + `<venue>/live.rs`; the trait doesn't change between them (§6, closing paragraph).
+
+- `src/cex/binance/rest.rs`, `src/cex/bybit/rest.rs`: a signed REST client per venue's trading API —
+  done, unit-tested against each venue's documented signing scheme.
+- `src/cex/binance/live.rs`, `src/cex/bybit/live.rs`: quantity rounded to the venue's step/notional
+  size *before* sending, base URL + credential set configurable so that pointing it at the venue's
+  sandbox/testnet host *is* "Simulated" for this leg (§3's asymmetry — no separate struct), fills read
+  from the placing call's own response first (Binance), falling back to a status query when that
+  response is always ambiguous (Bybit, whose order-create response never carries fill data) — done,
+  unit-tested against `wiremock`-mocked venue responses. See the BLOCKED section above for the two
+  flagged, unconfirmed conventions in each.
+- CI: same pattern as Phase 4 — a scheduled/PR-gated job running `cex_executor_contract` against each
+  venue's real sandbox host, credentials and network access permitting. Not yet wired up — no sandbox
+  credentials to gate it on yet.
+- Done when: §9's four-point bar is met for each venue, same as Phase 5's DEX equivalent, with "Live"
+  meaning a real order against that venue's production API.
 
 ## Phase 8 — Second chain family (optional, lower priority)
 
