@@ -1,0 +1,13 @@
+[package]
+name = "venue-ports"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A tested, reusable connection layer between an automated trading system and the DEX/CEX venues it trades on."
+repository = "https://github.com/dali1981/venue-ports"
+
+[dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+rust_decimal = "1.43.0"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "time", "macros"] }
