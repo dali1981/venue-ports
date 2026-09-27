@@ -90,9 +90,7 @@ mod tests {
             std::env::var("EVM_LIVE_SIGNER_KEY"),
             std::env::var("EVM_LIVE_SENDER_ADDRESS"),
         ) else {
-            eprintln!(
-                "skipping: EVM_LIVE_SIGNER_KEY / EVM_LIVE_SENDER_ADDRESS not set"
-            );
+            eprintln!("skipping: EVM_LIVE_SIGNER_KEY / EVM_LIVE_SENDER_ADDRESS not set");
             return;
         };
 

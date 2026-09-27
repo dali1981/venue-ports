@@ -147,7 +147,13 @@ impl EvmLive {
         })
     }
 
-    async fn eth_call(&self, to: Address, data: &[u8], from: Address, block: &str) -> Result<Vec<u8>> {
+    async fn eth_call(
+        &self,
+        to: Address,
+        data: &[u8],
+        from: Address,
+        block: &str,
+    ) -> Result<Vec<u8>> {
         let call = json!({
             "to": to.to_string(),
             "from": from.to_string(),
@@ -182,9 +188,14 @@ impl EvmLive {
         let block = self
             .rpc_call("eth_getBlockByNumber", json!(["latest", false]))
             .await?;
-        let base_fee = parse_hex_u128(block.get("baseFeePerGas").and_then(Value::as_str).ok_or_else(
-            || anyhow!("latest block has no baseFeePerGas — is this chain EIP-1559-enabled?"),
-        )?)?;
+        let base_fee = parse_hex_u128(
+            block
+                .get("baseFeePerGas")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    anyhow!("latest block has no baseFeePerGas — is this chain EIP-1559-enabled?")
+                })?,
+        )?;
 
         let priority_fee = match self.rpc_call("eth_maxPriorityFeePerGas", json!([])).await {
             Ok(v) => parse_hex_u128(v.as_str().unwrap_or("0x0"))?,
@@ -196,7 +207,13 @@ impl EvmLive {
         Ok((priority_fee, max_fee))
     }
 
-    async fn estimate_gas(&self, from: Address, to: Address, data: &[u8], value: U256) -> Result<u64> {
+    async fn estimate_gas(
+        &self,
+        from: Address,
+        to: Address,
+        data: &[u8],
+        value: U256,
+    ) -> Result<u64> {
         let call = json!({
             "from": from.to_string(),
             "to": to.to_string(),
@@ -204,11 +221,10 @@ impl EvmLive {
             "value": format!("0x{value:x}"),
         });
         let result = self.rpc_call("eth_estimateGas", json!([call])).await?;
-        let raw = parse_hex_u64(
-            result
-                .as_str()
-                .ok_or_else(|| anyhow!("eth_estimateGas result was not a hex string: {result}"))?,
-        )?;
+        let raw =
+            parse_hex_u64(result.as_str().ok_or_else(|| {
+                anyhow!("eth_estimateGas result was not a hex string: {result}")
+            })?)?;
         // 20% headroom: an estimate is a snapshot of current state, and
         // this transaction won't actually execute until it's mined
         // against whatever state exists by then.
@@ -220,7 +236,13 @@ impl EvmLive {
     /// never carries. Best-effort: if the replay itself can't produce a
     /// reason (state moved, or the node disagrees), says so rather than
     /// guessing.
-    async fn fetch_revert_reason(&self, from: Address, to: Address, data: &[u8], block: u64) -> String {
+    async fn fetch_revert_reason(
+        &self,
+        from: Address,
+        to: Address,
+        data: &[u8],
+        block: u64,
+    ) -> String {
         let call = json!({
             "from": from.to_string(),
             "to": to.to_string(),
@@ -231,8 +253,10 @@ impl EvmLive {
             .await
         {
             Err(err) => err.to_string(),
-            Ok(_) => "transaction reverted (replaying the call at its block did not reproduce a revert)"
-                .to_string(),
+            Ok(_) => {
+                "transaction reverted (replaying the call at its block did not reproduce a revert)"
+                    .to_string()
+            }
         }
     }
 
@@ -285,7 +309,10 @@ impl EvmLive {
                         )
                         .await?;
                     if !receipt.is_null() {
-                        let status = receipt.get("status").and_then(Value::as_str).unwrap_or("0x0");
+                        let status = receipt
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("0x0");
                         let block = parse_hex_u64(
                             receipt
                                 .get("blockNumber")
@@ -348,7 +375,9 @@ impl EvmLive {
             .await?
         {
             TxOutcome::Success { .. } => Ok(()),
-            TxOutcome::Reverted { reason, tx_hash, .. } => bail!(
+            TxOutcome::Reverted {
+                reason, tx_hash, ..
+            } => bail!(
                 "approve({router}, {}) reverted (tx {tx_hash}): {reason}",
                 ctx.amount_in
             ),
@@ -544,7 +573,11 @@ fn transfer_topic0() -> B256 {
 /// `Transfer`s (intermediate hops, fee transfers); filtering by both the
 /// token and the recipient is what picks out the one that's actually this
 /// swap's output, not an incidental one along the way.
-fn decode_transfer_amount(logs: &[Value], token: Address, recipient: Address) -> Option<ChainAmount> {
+fn decode_transfer_amount(
+    logs: &[Value],
+    token: Address,
+    recipient: Address,
+) -> Option<ChainAmount> {
     let topic0_hex = format!("0x{}", hex::encode(transfer_topic0()));
     for log in logs {
         let log_address: Address = log.get("address")?.as_str()?.parse().ok()?;
@@ -627,7 +660,12 @@ mod tests {
         "11".repeat(32)
     }
 
-    fn route(router: Address, token_in: Address, token_out: Address, calldata: &[u8]) -> RouteQuote {
+    fn route(
+        router: Address,
+        token_in: Address,
+        token_out: Address,
+        calldata: &[u8],
+    ) -> RouteQuote {
         let mut payload = router.as_slice().to_vec();
         payload.extend_from_slice(calldata);
         RouteQuote {
@@ -700,7 +738,9 @@ mod tests {
     /// how many times they're called.
     async fn mount_send_plumbing(server: &MockServer) {
         Mock::given(method("POST"))
-            .and(body_partial_json(json!({"method": "eth_getTransactionCount"})))
+            .and(body_partial_json(
+                json!({"method": "eth_getTransactionCount"}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "jsonrpc": "2.0", "id": 1, "result": "0x5",
             })))
@@ -714,7 +754,9 @@ mod tests {
             .mount(server)
             .await;
         Mock::given(method("POST"))
-            .and(body_partial_json(json!({"method": "eth_maxPriorityFeePerGas"})))
+            .and(body_partial_json(
+                json!({"method": "eth_maxPriorityFeePerGas"}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "jsonrpc": "2.0", "id": 1, "result": "0x59682f00",
             })))
@@ -728,7 +770,9 @@ mod tests {
             .mount(server)
             .await;
         Mock::given(method("POST"))
-            .and(body_partial_json(json!({"method": "eth_sendRawTransaction"})))
+            .and(body_partial_json(
+                json!({"method": "eth_sendRawTransaction"}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "jsonrpc": "2.0", "id": 1, "result": "0xdeadbeef",
             })))
@@ -800,7 +844,9 @@ mod tests {
             "data": format!("0x{}", hex::encode(U256::from(4_200u64).to_be_bytes::<32>())),
         });
         Mock::given(method("POST"))
-            .and(body_partial_json(json!({"method": "eth_getTransactionReceipt"})))
+            .and(body_partial_json(
+                json!({"method": "eth_getTransactionReceipt"}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -847,7 +893,9 @@ mod tests {
         let error_data_hex = format!("0x{}", hex::encode(&error_data));
 
         Mock::given(method("POST"))
-            .and(body_partial_json(json!({"method": "eth_getTransactionReceipt"})))
+            .and(body_partial_json(
+                json!({"method": "eth_getTransactionReceipt"}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "jsonrpc": "2.0", "id": 1,
                 "result": { "status": "0x0", "blockNumber": "0x2a", "logs": [] },
@@ -895,7 +943,9 @@ mod tests {
         mount_sufficient_allowance(&server).await;
 
         Mock::given(method("POST"))
-            .and(body_partial_json(json!({"method": "eth_getTransactionReceipt"})))
+            .and(body_partial_json(
+                json!({"method": "eth_getTransactionReceipt"}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "jsonrpc": "2.0", "id": 1, "result": null,
             })))
@@ -923,5 +973,176 @@ mod tests {
         assert_eq!(realised.provenance, Provenance::Landed);
         assert!(realised.tx_ref.is_some());
         assert!(matches!(realised.outcome, Outcome::TimedOut));
+    }
+
+    /// Real Sepolia, all three legs SPEC.md §3 describes for a DEX port,
+    /// same pool, same input size: **quoted** (Uniswap's own `QuoterV2` —
+    /// independent of this crate), **simulated** (`EvmSimulated`'s
+    /// `eth_call` + state overrides), and **executed** (`EvmLive`, this
+    /// module — a real signed swap). No-ops when the real-network env vars
+    /// aren't set, same as every other real-Sepolia test in this crate.
+    ///
+    /// The signer's wallet holds only Sepolia ETH going in, so step 0
+    /// wraps a small amount into WETH first (`WETH9.deposit()`) — outside
+    /// `DexExecutor` entirely, since funding an address is explicitly not
+    /// this crate's job (`SPEC.md` §2). That wrap, and the swap's own
+    /// `approve`, both go out through `EvmLive`'s own send pipeline
+    /// (`send_and_confirm`), not a reimplementation of it.
+    #[tokio::test]
+    async fn real_sepolia_quote_vs_simulated_vs_executed() {
+        let (Ok(rpc_url), Ok(signer_key)) = (
+            std::env::var("EVM_LIVE_RPC_URL"),
+            std::env::var("EVM_LIVE_SIGNER_KEY"),
+        ) else {
+            eprintln!("skipping: EVM_LIVE_RPC_URL / EVM_LIVE_SIGNER_KEY not set");
+            return;
+        };
+
+        let weth: Address = "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"
+            .parse()
+            .unwrap();
+        let usdc: Address = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
+            .parse()
+            .unwrap();
+        let router: Address = "0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E"
+            .parse()
+            .unwrap();
+        let quoter: Address = "0xEd1f6473345F45b75F8179591dd5bA1888cf2FB3"
+            .parse()
+            .unwrap();
+        const FEE: u64 = 3_000; // 0.3%
+        const AMOUNT_IN: u128 = 1_000_000_000_000_000; // 0.001 WETH
+        const CHAIN_ID: u64 = 11_155_111;
+
+        let live = EvmLive::new(rpc_url.clone(), &signer_key).unwrap();
+        let sender = live.address();
+
+        // Step 0: make sure there's real WETH to swap.
+        let mut balance_of = vec![0x70, 0xa0, 0x82, 0x31];
+        balance_of.extend_from_slice(&pad_address(sender));
+        let weth_balance = U256::from_be_slice(
+            &live
+                .eth_call(weth, &balance_of, sender, "latest")
+                .await
+                .expect("checking WETH balance"),
+        );
+        if weth_balance < U256::from(AMOUNT_IN) {
+            let deposit_calldata = vec![0xd0, 0xe3, 0x0d, 0xb0]; // WETH9.deposit()
+            match live
+                .send_and_confirm(
+                    weth,
+                    deposit_calldata,
+                    U256::from(AMOUNT_IN) * U256::from(4u64),
+                    CHAIN_ID,
+                )
+                .await
+                .expect("sending the wrap transaction")
+            {
+                TxOutcome::Success { tx_hash, .. } => {
+                    eprintln!("wrapped ETH -> WETH: tx 0x{}", hex::encode(tx_hash))
+                }
+                TxOutcome::Reverted { reason, .. } => panic!("WETH deposit() reverted: {reason}"),
+                TxOutcome::TimedOut { tx_hash } => {
+                    panic!("WETH deposit() timed out (tx 0x{})", hex::encode(tx_hash))
+                }
+            }
+        }
+
+        // Leg 1: quoted — Uniswap's own QuoterV2, not this crate.
+        let mut quote_calldata = vec![0xc6, 0xa5, 0x02, 0x6a];
+        quote_calldata.extend_from_slice(&pad_address(weth));
+        quote_calldata.extend_from_slice(&pad_address(usdc));
+        quote_calldata.extend_from_slice(&U256::from(AMOUNT_IN).to_be_bytes::<32>());
+        quote_calldata.extend_from_slice(&U256::from(FEE).to_be_bytes::<32>());
+        quote_calldata.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+        let quote_result = live
+            .rpc_call(
+                "eth_call",
+                json!([
+                    { "to": quoter.to_string(), "data": format!("0x{}", hex::encode(&quote_calldata)) },
+                    "latest",
+                ]),
+            )
+            .await
+            .expect("quoter call should succeed");
+        let quote_bytes = decode_hex(quote_result.as_str().unwrap()).unwrap();
+        let quoted_amount_out: u128 = U256::from_be_slice(&quote_bytes[0..32]).try_into().unwrap();
+
+        // The shared swap calldata both Simulated and Executed run —
+        // amountOutMinimum left at 0, same as this crate's other
+        // exploratory real-network tests, to avoid a slippage revert on a
+        // thin real pool.
+        let mut swap_calldata = vec![0x04, 0xe4, 0x5a, 0xaf]; // exactInputSingle
+        swap_calldata.extend_from_slice(&pad_address(weth));
+        swap_calldata.extend_from_slice(&pad_address(usdc));
+        swap_calldata.extend_from_slice(&U256::from(FEE).to_be_bytes::<32>());
+        swap_calldata.extend_from_slice(&pad_address(sender));
+        swap_calldata.extend_from_slice(&U256::from(AMOUNT_IN).to_be_bytes::<32>());
+        swap_calldata.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+        swap_calldata.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+        let mut payload = router.as_slice().to_vec();
+        payload.extend_from_slice(&swap_calldata);
+
+        let route = RouteQuote {
+            chain_id: CHAIN_ID,
+            token_in: weth.as_slice().to_vec(),
+            token_out: usdc.as_slice().to_vec(),
+            amount_in: AMOUNT_IN,
+            expected_amount_out: quoted_amount_out,
+            payload,
+        };
+
+        // Leg 2: simulated — this crate's EvmSimulated, eth_call + state
+        // overrides, nothing broadcast.
+        let simulated = crate::dex::evm::EvmSimulated::new(rpc_url.clone());
+        let sim_request = SwapRequest {
+            sender: sender.as_slice().to_vec(),
+            recipient: sender.as_slice().to_vec(),
+            min_amount_out: 0,
+            deadline_unix_secs: 0,
+        };
+        let sim_prepared = simulated.prepare(&route, &sim_request).await.unwrap();
+        let sim_realised = simulated.execute(&sim_prepared, None).await.unwrap();
+
+        // Leg 3: executed — this crate's EvmLive, a real signed swap
+        // through the real router.
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+        let live_request = SwapRequest {
+            sender: sender.as_slice().to_vec(),
+            recipient: sender.as_slice().to_vec(),
+            min_amount_out: 0,
+            deadline_unix_secs: deadline,
+        };
+        let live_prepared = live.prepare(&route, &live_request).await.unwrap();
+        let live_realised = live.execute(&live_prepared, None).await.unwrap();
+
+        eprintln!(
+            "\nWETH->USDC, amountIn = {AMOUNT_IN} wei WETH (0.001 WETH)\n\
+             {:>10} | {:>18} wei USDC\n\
+             {:>10} | {:?} (outcome {:?})\n\
+             {:>10} | {:?} (outcome {:?}, tx {})\n",
+            "quoted",
+            quoted_amount_out,
+            "simulated",
+            sim_realised.amount_out,
+            sim_realised.outcome,
+            "executed",
+            live_realised.amount_out,
+            live_realised.outcome,
+            live_realised
+                .tx_ref
+                .as_ref()
+                .map(|h| format!("0x{}", hex::encode(h)))
+                .unwrap_or_default(),
+        );
+
+        assert!(matches!(sim_realised.outcome, Outcome::Success));
+        assert!(matches!(live_realised.outcome, Outcome::Success));
+        assert_eq!(live_realised.provenance, Provenance::Landed);
+        assert!(live_realised.tx_ref.is_some());
     }
 }

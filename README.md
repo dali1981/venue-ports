@@ -16,7 +16,7 @@ stub), the test strategy that keeps the stub honest, and acceptance criteria. Se
 
 | port | `Stub` | `Simulated` | `Live` |
 |---|---|---|---|
-| DEX (EVM) | done (`EvmStub`) | verified against a real Sepolia swap (Uniswap V3 `SwapRouter02`) — §9.2's full 100-run replication not yet done | scaffolded (`EvmLive`), not yet run — needs a signer |
+| DEX (EVM) | done (`EvmStub`) | verified against a real Sepolia swap (Uniswap V3 `SwapRouter02`) — §9.2's full 100-run replication not yet done | verified against a real, successful Sepolia swap — quote/simulated/executed agree to the wei; §9.2's full 100-run replication not yet done |
 | CEX — Binance | done (`CexStub`) | testnet credentials in hand; blocked on Binance's own geo-eligibility check (HTTP 451) from this environment | scaffolded (`BinanceLive`), unit-tested against a mocked server, not yet run against the real testnet |
 | CEX — Bybit | done (`CexStub`) | blocked on Bybit's own CloudFront geo-restriction from this environment | scaffolded (`BybitLive`), unit-tested against a mocked server, not yet run against the real testnet |
 
@@ -28,9 +28,10 @@ Neither `Live` adapter is exercised by an automated test or a schedule — per `
 only ever a deliberate, human-triggered action.
 
 **Every `Live` adapter is testnet-first by default** — `EvmLive` against Ethereum Sepolia,
-`BinanceLive`/`BybitLive` against each venue's own testnet host — and is currently blocked on input
-only a human can give: real credentials, and (from inside this environment specifically) broader
-network egress. See the "BLOCKED" section at the top of
+`BinanceLive`/`BybitLive` against each venue's own testnet host. `EvmLive` has now run a real,
+successful, human-triggered swap on Sepolia (see the Status table above); `BinanceLive`/`BybitLive`
+remain blocked on input only a human can give: real testnet credentials, and (from inside this
+environment specifically) each venue's own geo-restriction. See the "BLOCKED" section at the top of
 [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md#blocked--everything-below-needs-input-only-you-can-give)
 for exactly what is needed and why nothing further can proceed without it.
 

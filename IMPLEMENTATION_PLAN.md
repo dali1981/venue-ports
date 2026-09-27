@@ -66,9 +66,22 @@ own `QuoterV2`, not this crate) vs. this crate's `EvmSimulated`, same real pool,
 
 This is a single point-in-time snapshot (one block, back-to-back calls), not a repeated-over-time
 benchmark, and covers 5 of the 100 distinct inputs §9.2 wants — real incremental progress, not the bar
-cleared. There is still no third leg: no real order has ever been executed on testnet (`EvmLive` is an
-empty stub, blocked on Blocker 2's signer) — "quote vs. simulation vs. executed" is currently "quote vs.
-simulation" only.
+cleared.
+
+**The third leg now exists too — quote vs. simulation vs. executed, all three, real** (Blocker 2 below):
+`real_sepolia_quote_vs_simulated_vs_executed` in `src/dex/evm/live.rs`, gated the same way. WETH→USDC,
+0.001 WETH in, same pool, same block region:
+
+| leg | amount_out (wei USDC) |
+|---|---:|
+| quoted (`QuoterV2`, independent of this crate) | 31,847,966 |
+| simulated (`EvmSimulated`) | 31,847,966 |
+| executed (`EvmLive`, real signed swap) | 31,847,966 |
+
+Exact match across all three. Real Sepolia transactions: wrap (`WETH9.deposit()`)
+`0xd3a5a3584b4cdead63d3f6fd99b7cd2d07e4340c5ccc127cdae6c8b62559990a`, swap
+`0x5bb2b59b61850dac3be56fc04e0b90f3fa3c531882b4e892324b547f17fda2d8`. Same single-point-in-time caveat
+as above — one input size, one moment, not the repeated/many-sizes bar §9.2 wants.
 
 **Still needed to fully clear §9.2's literal bar:**
 1. The remaining ~95 distinct-input runs, plus at least one deliberately injected failure per
@@ -81,11 +94,34 @@ simulation" only.
 
 ### Blocker 2 — `EvmLive` needs real signing credentials (blocks Phase 5, after Blocker 1)
 
-Once Blocker 1 clears, `EvmLive` (`src/dex/evm/live.rs`, `src/dex/evm/tx.rs` — currently empty
-placeholders) signs and broadcasts real transactions. This needs, from you, when you are ready:
-- A disposable, faucet-funded Sepolia signer — never a mainnet key at this stage. Same discipline as
-  the RPC URL: straight into an env var, never a commit.
-- The router/tokens to trade, and the amount you're willing to risk on first runs.
+**Resolved — `EvmLive` is implemented and has executed a real, successful swap on Sepolia:**
+- A disposable, faucet-funded Sepolia signer was provided (address and key straight into
+  `EVM_LIVE_SIGNER_KEY`/`EVM_LIVE_SENDER_ADDRESS` in the gitignored `.env.local`, never committed —
+  same discipline as the RPC URL). `src/dex/evm/tx.rs`'s `Signer` derives the address from the key via
+  `k256`/`alloy-consensus` EIP-1559 signing; a self-check test (gated on those same env vars, a no-op
+  otherwise) confirms the derived address matches the one the wallet reports for its own key.
+- `src/dex/evm/live.rs`'s `EvmLive` is implemented per `SPEC.md` §5: real sender/recipient/deadline
+  enforcement (never zero/omitted — `SwapRequest.deadline_unix_secs` is checked both at `prepare()` and
+  again at broadcast time, since this adapter's calldata convention can't embed a deadline the caller
+  didn't already bake in), the router allowance capped to the exact swap amount via a checked `approve`
+  (never `U256::MAX`), one nonce in flight at a time (a send lock held for the whole
+  build-sign-broadcast-poll sequence of every transaction, including `approve`), the landed amount
+  decoded from the swap's own ERC-20 `Transfer` log (never assumed equal to the quote), and revert
+  reasons recovered by replaying a reverted call via `eth_call` at its block (a receipt alone never
+  carries one). Covered by 6 `wiremock`-backed tests (success, revert, timeout) before ever touching a
+  real network.
+- **A real three-way run — quote vs. simulated vs. executed — landed on Sepolia**, all three in exact
+  agreement; see the benchmark table under Blocker 1 above for the numbers and both real transaction
+  hashes.
+- The network-egress caveat from Blocker 1 didn't recur: the signer's sends went out over the same
+  already-allowed `eth-sepolia.g.alchemy.com` host, just with a real (non-shared) API key instead of the
+  heavily-rate-limited public `/v2/demo` endpoint, which 429'd on nearly every call under this adapter's
+  real send-and-poll volume.
+
+**Not yet done:** §9.2's full 100-distinct-input/per-outcome-variant bar (same gap as `EvmSimulated`,
+now inherited by the executed leg too) — this was one input size, one run, not the repeated bar. No
+`Outcome::Reverted`/`Outcome::TimedOut` path has been exercised against a real broadcast yet either
+(only against `wiremock`).
 
 ### Blocker 3 — CEX venues: chosen, scaffolded, not yet credentialed (blocks Phase 7)
 
