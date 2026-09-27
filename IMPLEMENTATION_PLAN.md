@@ -51,11 +51,29 @@ this bar being cleared first (§9.4): nothing signs or sends anything real befor
   (`src/dex/evm/simulated.rs`): one real `balanceOf`/`allowance` slot probe, one full real swap, both
   currently green.
 
+**Real quote-vs-simulation benchmark (`benchmarks_real_quote_against_real_simulation_across_several_sizes`
+in `src/dex/evm/simulated.rs`, gated on `EVM_LIVE_RPC_URL`):** an independent on-chain source (Uniswap's
+own `QuoterV2`, not this crate) vs. this crate's `EvmSimulated`, same real pool, 5 distinct input sizes
+(0.1–10 USDC). Exact wei match on all 5, every run `Success`:
+
+| amountIn (USDC) | quoted (wei WETH) | simulated (wei WETH) | diff |
+|---:|---:|---:|---:|
+| 100,000 | 3,121,061,108,743 | 3,121,061,108,743 | 0 |
+| 500,000 | 15,605,302,702,413 | 15,605,302,702,413 | 0 |
+| 1,000,000 | 31,210,598,301,571 | 31,210,598,301,571 | 0 |
+| 5,000,000 | 156,052,707,378,200 | 156,052,707,378,200 | 0 |
+| 10,000,000 | 312,104,704,435,172 | 312,104,704,435,172 | 0 |
+
+This is a single point-in-time snapshot (one block, back-to-back calls), not a repeated-over-time
+benchmark, and covers 5 of the 100 distinct inputs §9.2 wants — real incremental progress, not the bar
+cleared. There is still no third leg: no real order has ever been executed on testnet (`EvmLive` is an
+empty stub, blocked on Blocker 2's signer) — "quote vs. simulation vs. executed" is currently "quote vs.
+simulation" only.
+
 **Still needed to fully clear §9.2's literal bar:**
-1. The 100-distinct-input, exact-reconciliation replication itself — one real swap has succeeded and
-   one real revert (this adapter's own bug, not an injected venue failure) has been observed and
-   handled correctly, but the bar wants 100 runs plus a deliberately injected failure per `Outcome`
-   variant, not one of each. Worth scripting as a real (rate-limited, liquidity-mindful) run rather
+1. The remaining ~95 distinct-input runs, plus at least one deliberately injected failure per
+   `Outcome` variant (one real revert has been observed already — this adapter's own now-fixed bug, not
+   a deliberately injected one). Worth scripting as a real (rate-limited, liquidity-mindful) run rather
    than by hand.
 2. `Outcome::TimedOut` still has no real-network path exercising it — `EvmSimulated::execute()`
    currently only ever produces `Success` or `Reverted` against a real RPC; needs a deliberate way to

@@ -798,4 +798,123 @@ mod tests {
         let realised = adapter.execute(&prepared, None).await.unwrap();
         eprintln!("real swap result: {realised:?}");
     }
+
+    /// Exploratory — a small real benchmark, not a permanent fixture:
+    /// quote (Uniswap's own `QuoterV2`, an independent on-chain source —
+    /// not this crate) vs. simulation (`EvmSimulated`, this crate) across
+    /// several distinct input sizes on the same real USDC/WETH pool.
+    /// Incremental progress toward §9.2's 100-distinct-input bar, not a
+    /// claim of having cleared it. Both calls are `eth_call`s — read-only,
+    /// nothing broadcast, no risk to the pool's thin real liquidity.
+    #[tokio::test]
+    async fn benchmarks_real_quote_against_real_simulation_across_several_sizes() {
+        let Ok(rpc_url) = std::env::var("EVM_LIVE_RPC_URL") else {
+            eprintln!("skipping: EVM_LIVE_RPC_URL is not set");
+            return;
+        };
+
+        let usdc: Address = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
+            .parse()
+            .unwrap();
+        let weth: Address = "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"
+            .parse()
+            .unwrap();
+        let router: Address = "0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E"
+            .parse()
+            .unwrap();
+        // Uniswap's QuoterV2 on Sepolia — verified against the alternative
+        // address a search initially turned up, which returned empty data
+        // (not a real Quoter); this one returns a real quote.
+        let quoter: Address = "0xEd1f6473345F45b75F8179591dd5bA1888cf2FB3"
+            .parse()
+            .unwrap();
+        let sender: Address = "0x000000000000000000000000000000000000dEaD"
+            .parse()
+            .unwrap();
+        const FEE: u64 = 3_000; // 0.3%
+
+        let adapter = EvmSimulated::new(rpc_url);
+
+        // 0.1, 0.5, 1, 5, 10 USDC (6 decimals).
+        let amounts_in: [u64; 5] = [100_000, 500_000, 1_000_000, 5_000_000, 10_000_000];
+        let mut rows = Vec::new();
+
+        for amount_in in amounts_in {
+            // Real quote: QuoterV2.quoteExactInputSingle((tokenIn, tokenOut,
+            // amountIn, fee, sqrtPriceLimitX96)) — selector 0xc6a5026a.
+            let mut quote_calldata = vec![0xc6, 0xa5, 0x02, 0x6a];
+            quote_calldata.extend_from_slice(&pad_address(usdc));
+            quote_calldata.extend_from_slice(&pad_address(weth));
+            quote_calldata.extend_from_slice(&U256::from(amount_in).to_be_bytes::<32>());
+            quote_calldata.extend_from_slice(&U256::from(FEE).to_be_bytes::<32>());
+            quote_calldata.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+            let quote_result = adapter
+                .rpc_call(
+                    "eth_call",
+                    json!([
+                        { "to": quoter.to_string(), "data": format!("0x{}", hex::encode(&quote_calldata)) },
+                        "latest",
+                    ]),
+                )
+                .await
+                .expect("quoter call should succeed");
+            let quote_hex = quote_result.as_str().expect("quoter result should be hex");
+            let quote_bytes = decode_hex(quote_hex).unwrap();
+            let quoted_amount_out: u128 =
+                U256::from_be_slice(&quote_bytes[0..32]).try_into().unwrap();
+
+            // Real simulation: this crate's own EvmSimulated, through the
+            // real router, exactly as a consumer would call it.
+            let mut swap_calldata = vec![0x04, 0xe4, 0x5a, 0xaf];
+            swap_calldata.extend_from_slice(&pad_address(usdc));
+            swap_calldata.extend_from_slice(&pad_address(weth));
+            swap_calldata.extend_from_slice(&U256::from(FEE).to_be_bytes::<32>());
+            swap_calldata.extend_from_slice(&pad_address(sender));
+            swap_calldata.extend_from_slice(&U256::from(amount_in).to_be_bytes::<32>());
+            swap_calldata.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+            swap_calldata.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+            let mut payload = router.as_slice().to_vec();
+            payload.extend_from_slice(&swap_calldata);
+
+            let route = RouteQuote {
+                chain_id: 11_155_111,
+                token_in: usdc.as_slice().to_vec(),
+                token_out: weth.as_slice().to_vec(),
+                amount_in: amount_in as ChainAmount,
+                expected_amount_out: quoted_amount_out,
+                payload,
+            };
+            let request = SwapRequest {
+                sender: sender.as_slice().to_vec(),
+                recipient: sender.as_slice().to_vec(),
+                min_amount_out: 0,
+                deadline_unix_secs: 0,
+            };
+            let prepared = adapter.prepare(&route, &request).await.unwrap();
+            let realised = adapter.execute(&prepared, None).await.unwrap();
+
+            rows.push((amount_in, quoted_amount_out, realised));
+        }
+
+        eprintln!(
+            "\n{:>14} | {:>18} | {:>18} | {:>10} | outcome",
+            "amountIn(USDC)", "quoted(wei WETH)", "simulated(wei WETH)", "diff(wei)"
+        );
+        for (amount_in, quoted, realised) in &rows {
+            let simulated = realised.amount_out.unwrap_or(0);
+            let diff = simulated as i128 - *quoted as i128;
+            eprintln!(
+                "{:>14} | {:>18} | {:>18} | {:>10} | {:?}",
+                amount_in, quoted, simulated, diff, realised.outcome
+            );
+        }
+
+        for (amount_in, quoted, realised) in &rows {
+            assert_eq!(
+                realised.amount_out,
+                Some(*quoted),
+                "quote and simulation disagreed for amountIn={amount_in}"
+            );
+        }
+    }
 }
