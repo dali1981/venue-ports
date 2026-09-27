@@ -1,16 +1,30 @@
 # venue-ports
 
-A specification for a Rust crate that provides a **tested, reusable connection layer** between an
-automated trading system and the venues it trades on — decentralized exchange (DEX) routers on EVM
-and Solana-style chains, and centralized exchange (CEX) trading APIs.
+A Rust crate that provides a **tested, reusable connection layer** between an automated trading
+system and the venues it trades on — decentralized exchange (DEX) routers on EVM and Solana-style
+chains, and centralized exchange (CEX) trading APIs.
 
-**This repository is a specification only. There is no implementation here yet.** It exists so the
-crate can be built once, correctly, and reused by more than one trading project, instead of every
-project re-deriving its own signing, order-rounding, and fill-handling code.
+It exists so the crate can be built once, correctly, and reused by more than one trading project,
+instead of every project re-deriving its own signing, order-rounding, and fill-handling code.
 
 Read [`SPEC.md`](SPEC.md) for the full technical specification — architecture, the exact Rust trait
 and type signatures to implement, module layout, the three-mode execution model (live / simulated /
-stub), the test strategy that keeps the stub honest, and acceptance criteria.
+stub), the test strategy that keeps the stub honest, and acceptance criteria. See
+[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) for the phased build-out and current status.
+
+## Status
+
+| port | `Stub` | `Simulated` | `Live` |
+|---|---|---|---|
+| DEX (EVM) | done (`EvmStub`) | done, mechanism only — §9.2's real-RPC acceptance bar not yet cleared | not started |
+| CEX | done (`CexStub`) | — (a CEX's `Simulated` is `Live` pointed at a sandbox, §3) | not started, no venue picked yet |
+
+Both `Stub` implementations pass the shared contract-test suite (`src/testkit/contract.rs`) and are
+ready to build a trading system against today. See [`examples/basic_usage.rs`](examples/basic_usage.rs)
+for a minimal sketch of calling both ports and handling what comes back.
+
+Neither `Live` adapter is exercised by an automated test or a schedule — per `SPEC.md` §3/§9, that is
+only ever a deliberate, human-triggered action.
 
 ## Scope, in one paragraph
 
