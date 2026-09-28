@@ -3,6 +3,10 @@ name: CI
 on:
   push:
   pull_request:
+  # SPEC.md §7: the Simulated run also recurs without a code change, so a
+  # stub that drifts from the real thing is caught by the schedule.
+  schedule:
+    - cron: "17 4 * * *"
 
 env:
   CARGO_TERM_COLOR: always
@@ -25,3 +29,26 @@ jobs:
         run: cargo test --all-targets
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  anvil:
+    # The EVM sender and the liquidity port against a real node: anvil
+    # running Uniswap's published v3 bytecode (scripts/anvil-uniswap-v3.py).
+    # Needs no secrets and sends nothing anywhere real.
+    name: EVM sender and liquidity port on anvil
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: foundry-rs/foundry-toolchain@v1
+      - name: cargo test against anvil
+        run: |
+          anvil --disable-code-size-limit --silent &
+          for _ in $(seq 1 30); do
+            curl -sf -X POST -H 'content-type: application/json' \
+              --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
+              http://127.0.0.1:8545 && break
+            sleep 1
+          done
+          eval "$(python3 scripts/anvil-uniswap-v3.py)"
+          cargo test --lib against_anvil -- --nocapture
