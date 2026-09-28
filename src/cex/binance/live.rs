@@ -40,14 +40,9 @@
 //! market order that ran out of book as `EXPIRED` with its partial `fills`
 //! (README defect 4 asks for this check).
 
-use crate::cex::binance::client::ApiError;
-use crate::cex::binance::order::{
-    is_terminal, refused, single_commission, track, trade_lines, Tracked,
-};
+use crate::cex::binance::order::{settled, single_commission, trade_lines, unreadable_fill};
 use crate::cex::binance::rest::{BinanceOrderResponse, BinanceRest, MY_TRADES_PATH, ORDER_PATH};
-use crate::cex::{
-    new_client_order_id, CexExecutor, CexFill, OrderRequest, OrderSide, OrderStateUnknown,
-};
+use crate::cex::{new_client_order_id, CexExecutor, CexFill, OrderRequest, OrderSide};
 use crate::Provenance;
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
@@ -89,16 +84,14 @@ impl BinanceLive {
                 order.status
             );
         }
-        let unknown = |why: anyhow::Error| {
-            OrderStateUnknown {
-                symbol: req.symbol.clone(),
-                client_order_id: client_order_id.to_string(),
-                order_ref: Some(order.order_id),
-            }
-            .because(why.context(format!(
-                "order {} filled {} but the fill could not be read",
-                order.order_id, order.executed_qty
-            )))
+        let unknown = |why| {
+            unreadable_fill(
+                &req.symbol,
+                client_order_id,
+                order.order_id,
+                order.executed_qty,
+                why,
+            )
         };
 
         let listed: Decimal = order.fills.iter().map(|fill| fill.qty).sum();
@@ -158,62 +151,16 @@ impl CexExecutor for BinanceLive {
             .rest
             .place_market_order(&req.symbol, side, quantity, &client_order_id)
             .await;
-        let (tracked, lost) = match placed {
-            Ok(order) if is_terminal(&order.status) => {
-                return self.settle(req, &client_order_id, order).await
-            }
-            Ok(order) => (
-                track(
-                    self.rest.client(),
-                    ORDER_PATH,
-                    &req.symbol,
-                    &client_order_id,
-                    Some(order.order_id),
-                    None,
-                )
-                .await,
-                None,
-            ),
-            Err(ApiError::Lost { signed_at, cause }) => (
-                track(
-                    self.rest.client(),
-                    ORDER_PATH,
-                    &req.symbol,
-                    &client_order_id,
-                    None,
-                    Some(signed_at),
-                )
-                .await,
-                Some(cause),
-            ),
-            Err(err) => return Err(refused(err, what)),
-        };
-
-        match tracked {
-            Tracked::Terminal(order) => self.settle(req, &client_order_id, order).await,
-            Tracked::NeverAccepted => bail!(
-                "{what}: the answer to the placing call was lost, and Binance still had no such \
-                 order once recvWindow had passed, so it never accepted it; nothing filled"
-            ),
-            Tracked::Unknown { order_ref, cause } => {
-                let why = match lost {
-                    Some(lost) => format!(
-                        "{what}: the answer to the placing call was lost ({lost:#}), and what \
-                         became of the order could not be read: {cause:#}"
-                    ),
-                    None => format!(
-                        "{what}: Binance accepted the order, but what became of it could not \
-                         be read: {cause:#}"
-                    ),
-                };
-                Err(OrderStateUnknown {
-                    symbol: req.symbol.clone(),
-                    client_order_id,
-                    order_ref,
-                }
-                .because(why))
-            }
-        }
+        let order = settled(
+            self.rest.client(),
+            ORDER_PATH,
+            &req.symbol,
+            &client_order_id,
+            &what,
+            placed,
+        )
+        .await?;
+        self.settle(req, &client_order_id, order).await
     }
 
     fn label(&self) -> &'static str {
@@ -226,7 +173,7 @@ mod tests {
     use super::*;
     use crate::cex::binance::clock::local_now_ms;
     use crate::cex::binance::rest::BinanceConfig;
-    use crate::cex::CexTimings;
+    use crate::cex::{CexTimings, OrderStateUnknown};
     use std::str::FromStr;
     use std::time::Duration;
     use wiremock::matchers::{method, path};

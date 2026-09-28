@@ -141,8 +141,39 @@ impl BinanceClient {
         }
     }
 
+    /// The same client — connections, keys and clock — with other timings.
+    /// For a test that must lose the answer to a request the venue has
+    /// already acted on.
+    #[cfg(test)]
+    pub(crate) fn with_timings(&self, timings: CexTimings) -> Self {
+        Self {
+            http: self.http.clone(),
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
+            api_secret: self.api_secret.clone(),
+            time_path: self.time_path,
+            clock: Arc::clone(&self.clock),
+            timings,
+        }
+    }
+
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     pub(crate) fn timings(&self) -> &CexTimings {
         &self.timings
+    }
+
+    /// An unsigned GET, for public endpoints.
+    pub(crate) async fn public_get<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        params: &[(&str, String)],
+    ) -> Result<T, ApiError> {
+        let query = sign::encode_query(params);
+        self.send(Method::GET, path, &query, false, Instant::now())
+            .await
     }
 
     /// Reads the venue's clock now, refusing a round trip that does not fit

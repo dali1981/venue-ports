@@ -10,10 +10,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod binance;
+mod binance_futures;
 mod bybit;
 mod stub;
 
 pub use binance::{BinanceConfig, BinanceLive, BinanceRest};
+pub use binance_futures::{BinanceFuturesConfig, BinanceFuturesLive, BinanceFuturesRest};
 pub use bybit::{BybitConfig, BybitLive, BybitRest};
 pub use stub::{CexStub, RecordedCall};
 

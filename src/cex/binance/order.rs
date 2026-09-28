@@ -4,11 +4,13 @@
 //! `commissionAsset`, and both use the same order statuses.
 //!
 //! Nothing here returns a plain error for an order the venue may have
-//! accepted. What cannot be read becomes [`Tracked::Unknown`] or an
-//! explanation for the caller to wrap in `OrderStateUnknown`
-//! (`SPEC.md` §6).
+//! accepted: what cannot be read becomes an `OrderStateUnknown` whose
+//! context says why ([`settled`], [`unreadable_fill`]), or an explanation
+//! for the caller to wrap in one ([`trade_lines`], [`single_commission`]).
+//! See `SPEC.md` §6.
 
 use crate::cex::binance::client::{ApiError, BinanceClient, NO_SUCH_ORDER};
+use crate::cex::OrderStateUnknown;
 use anyhow::{anyhow, bail};
 use reqwest::Method;
 use rust_decimal::Decimal;
@@ -37,7 +39,7 @@ pub(crate) trait VenueOrder: DeserializeOwned {
 }
 
 /// What asking the venue about an order came to.
-pub(crate) enum Tracked<T> {
+enum Tracked<T> {
     /// The venue reports the order in a terminal state.
     Terminal(T),
     /// The venue still had no such order once `recvWindow` had passed for
@@ -62,7 +64,7 @@ pub(crate) enum Tracked<T> {
 ///
 /// A query that fails is tried again until the deadline; only then does
 /// the order become [`Tracked::Unknown`].
-pub(crate) async fn track<T: VenueOrder>(
+async fn track<T: VenueOrder>(
     client: &BinanceClient,
     order_path: &str,
     symbol: &str,
@@ -213,11 +215,101 @@ pub(crate) fn single_commission(lines: &[TradeLine]) -> anyhow::Result<(Decimal,
     Ok((commission, asset))
 }
 
-/// Converts an [`ApiError`] from a placing call that the venue refused, or
-/// that never left this process, into the plain error `execute` returns:
-/// nothing filled.
-pub(crate) fn refused(err: ApiError, what: String) -> anyhow::Error {
-    anyhow!("{what} was not placed, nothing filled: {err}")
+/// Follows the answer to a placing call (`placed`) to the order in a
+/// terminal state, or to the error `execute` returns:
+///
+/// - answered with a terminal status: that order;
+/// - answered with a status that is still working: tracked by client order
+///   id until it settles;
+/// - answer lost: tracked by client order id, with "no such order"
+///   conclusive only once `recvWindow` has passed ([`track`]);
+/// - refused, or never sent: a plain error carrying the venue's code and
+///   message. Nothing filled.
+///
+/// Anything that cannot be read once the venue accepted the order, or may
+/// have, is an `OrderStateUnknown` whose context says why. `what` names the
+/// order in every message.
+pub(crate) async fn settled<T: VenueOrder>(
+    client: &BinanceClient,
+    order_path: &str,
+    symbol: &str,
+    client_order_id: &str,
+    what: &str,
+    placed: Result<T, ApiError>,
+) -> anyhow::Result<T> {
+    let (tracked, lost) = match placed {
+        Ok(order) if is_terminal(order.status()) => return Ok(order),
+        Ok(order) => {
+            let tracked = track(
+                client,
+                order_path,
+                symbol,
+                client_order_id,
+                Some(order.order_id()),
+                None,
+            )
+            .await;
+            (tracked, None)
+        }
+        Err(ApiError::Lost { signed_at, cause }) => {
+            let tracked = track(
+                client,
+                order_path,
+                symbol,
+                client_order_id,
+                None,
+                Some(signed_at),
+            )
+            .await;
+            (tracked, Some(cause))
+        }
+        Err(err) => bail!("{what} was not placed, nothing filled: {err}"),
+    };
+
+    match tracked {
+        Tracked::Terminal(order) => Ok(order),
+        Tracked::NeverAccepted => bail!(
+            "{what}: the answer to the placing call was lost, and the venue still had no such \
+             order once recvWindow had passed, so it never accepted it; nothing filled"
+        ),
+        Tracked::Unknown { order_ref, cause } => {
+            let why = match lost {
+                Some(lost) => format!(
+                    "{what}: the answer to the placing call was lost ({lost:#}), and what became \
+                     of the order could not be read: {cause:#}"
+                ),
+                None => format!(
+                    "{what}: the venue accepted the order, but what became of it could not be \
+                     read: {cause:#}"
+                ),
+            };
+            Err(OrderStateUnknown {
+                symbol: symbol.to_string(),
+                client_order_id: client_order_id.to_string(),
+                order_ref,
+            }
+            .because(why))
+        }
+    }
+}
+
+/// The error for an order that filled `executed_qty` as order `order_ref`
+/// but whose fill could not be read, for the reason in `why`.
+pub(crate) fn unreadable_fill(
+    symbol: &str,
+    client_order_id: &str,
+    order_ref: u64,
+    executed_qty: Decimal,
+    why: anyhow::Error,
+) -> anyhow::Error {
+    OrderStateUnknown {
+        symbol: symbol.to_string(),
+        client_order_id: client_order_id.to_string(),
+        order_ref: Some(order_ref),
+    }
+    .because(why.context(format!(
+        "order {order_ref} filled {executed_qty} but the fill could not be read"
+    )))
 }
 
 #[cfg(test)]
