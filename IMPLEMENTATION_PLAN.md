@@ -290,10 +290,11 @@ Phase 0 → Phase 1 → Phase 2 → Phase 3 (EvmStub) → Phase 6 (CexStub)
 
 everything else can trail behind without blocking downstream consumers.
 
-## Phases 10–14 — proposed, specified in [`specs/`](specs/README.md)
+## Phases 10–14 — specified in [`specs/`](specs/README.md), accepted into `SPEC.md`
 
-Five changes requested on 28 September 2026. Each has its own spec. Accepting a spec means copying its
-signatures into `SPEC.md` first, and then the phase starts.
+Five changes requested on 28 September 2026. Each has its own spec; accepting one meant copying its
+signatures into `SPEC.md` (§2, §5, §5b, §6, §6b, §7, §8), which is done. The specs remain the detailed
+reference for each phase; what follows is the order of work and each phase's exit criterion.
 
 | Phase | Spec | Needs | Days |
 | --- | --- | --- | --- |
@@ -301,10 +302,84 @@ signatures into `SPEC.md` first, and then the phase starts.
 | 11 | [V1](specs/V1-order-contract.md): `OrderRequest.reduce_only`; `OrderStateUnknown` | nothing | 1 |
 | 12 | [V2](specs/V2-binance-usdm-futures.md): `BinanceFuturesLive` | futures testnet keys | 3 |
 | 13 | [V3](specs/V3-liquidity-port.md): `LiquidityExecutor`, `LiquidityStub`, `EvmLiquidity` over a signing or fork sender | anvil fork; funded testnet key | 6.5 |
-| 14 | [V4](specs/V4-cex-account-reads.md): `CexAccount` (awaiting the decision on whether reads belong here) | futures testnet keys | 1.5 |
+| 14 | [V4](specs/V4-cex-account-reads.md): `CexAccount` | futures testnet keys | 1.5 |
 
 Phases 10 and 11, and phase 13's stub, need nothing external and go first. Phases 12 and 14 share
-keys and a client, so they are built together.
+keys and a client, so they are built together. Everything that needs no credentials is built and
+tested against `wiremock` or a local anvil node; what needs credentials is written as a test gated on
+the relevant environment variables, a no-op when they are unset, like the Sepolia tests.
+
+### Phase 10 — one EVM sender per wallet (V0)
+
+- `src/evm/`: `rpc.rs` (`EvmRpc` and the hex/ABI/revert helpers `EvmSimulated` and `EvmLive` each
+  carried a copy of), `erc20.rs` (selectors, reads, storage-slot probing moved out of
+  `EvmSimulated`), `tx.rs` (`Signer`, moved from `dex/evm/tx.rs`, and `EvmSender`).
+- `EvmSender::connect` checks `eth_chainId` and refuses a second sender for the same (address,
+  chain_id) in one process; `send_and_confirm` and `ensure_allowance` move out of `EvmLive`; a
+  `TimedOut` send blocks every later send until `resolve` clears it; fees follow a `FeePolicy`.
+- `EvmLive::new(sender)`; `prepare` refuses a route for another chain.
+- `EvmSimulated` reads `amount_out` from the first return word (README defect 1).
+- Done when: two adapters sharing a sender get consecutive nonces (`wiremock`); a second `connect`
+  for the same pair is an error and a different chain id is not; a forced `TimedOut` blocks the next
+  send until `resolve` sees a receipt; a 64-byte return yields its first word and a 31-byte one an
+  error; the existing tests pass apart from construction; `dex_executor_contract` still passes.
+
+### Phase 11 — reduce-only and "this may have filled" (V1)
+
+- `OrderRequest.reduce_only`; `OrderStateUnknown`; the rule that an `Err` from `execute` means
+  nothing filled unless it is an `OrderStateUnknown`.
+- `CexStub` records `reduce_only`, gains `program_state_unknown` and a reduce-only mode over a
+  test-set signed position (rejecting a reduce-only order larger than the position until Phase 12's
+  testnet run shows what Binance does).
+- `BinanceLive` and `BybitLive` reject `reduce_only: true` before sending, and keep to the error rule:
+  each order carries a client order id, a lost placing response is recovered by a status query, and
+  anything the adapter cannot read after the venue accepted the order is `OrderStateUnknown`. For
+  `BinanceLive` this also fixes README defects 2 (commission in a second asset is no longer dropped),
+  3 (clock offset against `GET /api/v3/time`, and a status query to fall back on) and 4 (a market order
+  that partly filled and then expired is a fill, not an error).
+- Done when: `cex_executor_contract` runs with `reduce_only: false`; `cex_spot_rejects_reduce_only`
+  passes against both spot adapters with nothing reaching the mock server; the stub's reduce-only
+  cases (position −5: buy 3 fills, sell 1 rejected, buy 8 rejected) pass; `examples/basic_usage.rs`
+  sets the field.
+
+### Phase 12 — Binance USDⓈ-M futures (V2)
+
+- **Before relying on it in production:** confirm the production account is eligible for USDⓈ-M
+  futures in its jurisdiction. The testnet does not check.
+- `src/cex/binance/sign.rs` shared by spot and futures; `src/cex/binance_futures/` with `rest.rs`
+  (signed `fapi` client, server-clock offset refreshed every 10 minutes and on `-1021`, with one retry),
+  `filters.rs`, `live.rs`.
+- `BinanceFuturesLive::connect` runs the account checks in `SPEC.md` §6; `execute` follows V2's five
+  steps (validate, place, read, commission from `userTrades`, lost-response recovery).
+- Done when: the `wiremock` cases listed in V2 pass; `cex_executor_contract` against the testnet,
+  gated on `BINANCE_FUTURES_API_KEY`; then **§9.2 on the testnet** — 100 orders of distinct sizes
+  reconciled to the cent against `userTrades`, plus a rejected reduce-only order, a notional refusal,
+  and a forced `OrderStateUnknown`. The module docs record the testnet host, the reduce-only notional
+  exemption, and what the venue does with a reduce-only order larger than the position (which
+  `CexStub` then copies).
+
+### Phase 13 — the liquidity port (V3)
+
+- `src/liquidity/`: the §5b contract, `LiquidityStub`, and `EvmLiquidity` (`evm/abi.rs` with `sol!`
+  definitions for the Uniswap v3 and Slipstream managers, `evm/executor.rs`).
+- `EvmSender::fork` (anvil only, impersonating the owner), `provenance`, `ensure_balance`.
+- `liquidity_executor_contract` in `src/testkit/contract.rs`; `examples/` gains a lifecycle against
+  `LiquidityStub`.
+- Done when: the suite passes against the stub, and against `EvmLiquidity` over a fork sender; the
+  **§9.2 bar on a fork** — 100 lives with distinct ranges and amounts, each reconciled to the wei against
+  `positions(id).liquidity` and the owner's `balanceOf`, plus `Reverted("Price slippage check")`,
+  `Reverted("Not cleared")` and a `TimedOut` forced with `evm_setAutomine(false)` — is met for the
+  Uniswap v3 ABI and for Slipstream's; one live testnet life has been reconciled by a person.
+
+### Phase 14 — reading a perp account (V4)
+
+- V4 was written to be accepted as it stands while the owner decides whether account reads belong in
+  this crate at all. It is accepted here: `SPEC.md` §2 carries the amended sentence and §6b the
+  contract. If the answer is no, this phase is removed whole — nothing else depends on it.
+- `src/cex/account.rs`, `CexAccountStub`, `BinanceFuturesAccount` sharing Phase 12's client.
+- Done when: `cex_account_contract` passes against the stub; the `wiremock` cases in V4 pass; on the
+  testnet, gated, a short opened with Phase 12 reads back here with the fill's quantity and entry price,
+  and reads `qty == 0` after a reduce-only close.
 
 ## Tracking
 
