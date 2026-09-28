@@ -58,12 +58,13 @@ enum Tracked<T> {
 /// `known_order_id` is set when the venue acknowledged the order (its
 /// placing call answered, with a status that is not terminal yet).
 /// `lost_signed_at` is set instead when the placing call's answer was lost:
-/// then "no such order" is only conclusive once `recvWindow` has passed for
-/// that request, since until then the venue could still accept it, and the
-/// query keeps going at least that long.
+/// then "no such order" is conclusive only from a query *sent* after
+/// `recvWindow` has passed for that request — until then the venue could
+/// still accept it — and querying goes on until one such query has been
+/// answered, however long `poll_timeout` is.
 ///
-/// A query that fails is tried again until the deadline; only then does
-/// the order become [`Tracked::Unknown`].
+/// A query that fails is tried again until then; only after that does the
+/// order become [`Tracked::Unknown`].
 async fn track<T: VenueOrder>(
     client: &BinanceClient,
     order_path: &str,
@@ -73,12 +74,8 @@ async fn track<T: VenueOrder>(
     lost_signed_at: Option<Instant>,
 ) -> Tracked<T> {
     let timings = client.timings().clone();
-    let mut deadline = Instant::now() + timings.poll_timeout;
-    if let Some(signed_at) = lost_signed_at {
-        // Leave room for one last query after the window has passed.
-        let window_passes = client.recv_window_ends(signed_at) + timings.poll_interval * 2;
-        deadline = deadline.max(window_passes);
-    }
+    let deadline = Instant::now() + timings.poll_timeout;
+    let window_ends = lost_signed_at.map(|signed_at| client.recv_window_ends(signed_at));
     let params = [
         ("symbol", symbol.to_string()),
         ("origClientOrderId", client_order_id.to_string()),
@@ -87,6 +84,10 @@ async fn track<T: VenueOrder>(
     let mut problem = anyhow!("the venue has not answered yet");
 
     loop {
+        // Taken before the query is signed and sent, so a query counted as
+        // asked after the window was certainly sent after it.
+        let asked_at = Instant::now();
+        let asked_after_window = window_ends.is_none_or(|ends| asked_at > ends);
         match client.signed::<T>(Method::GET, order_path, &params).await {
             Ok(order) => {
                 order_ref = Some(order.order_id());
@@ -100,10 +101,8 @@ async fn track<T: VenueOrder>(
                 );
             }
             Err(err) if err.code() == Some(NO_SUCH_ORDER) && order_ref.is_none() => {
-                if let Some(signed_at) = lost_signed_at {
-                    if client.recv_window_passed(signed_at) {
-                        return Tracked::NeverAccepted;
-                    }
+                if window_ends.is_some() && asked_after_window {
+                    return Tracked::NeverAccepted;
                 }
                 problem = anyhow::Error::new(err)
                     .context("the venue had no such order yet, and recvWindow had not passed");
@@ -112,7 +111,7 @@ async fn track<T: VenueOrder>(
                 problem = anyhow::Error::new(err).context("the order-status query failed");
             }
         }
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline && asked_after_window {
             return Tracked::Unknown {
                 order_ref,
                 cause: problem,

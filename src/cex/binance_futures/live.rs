@@ -943,6 +943,52 @@ pub(super) mod tests {
         assert!(started.elapsed() >= fast().recv_window);
     }
 
+    /// "No such order" counts only from a query *sent* after recvWindow:
+    /// one sent inside the window and answered after it proves nothing, and
+    /// here the order turns up on the next query.
+    #[tokio::test]
+    async fn no_such_order_asked_inside_recv_window_is_not_conclusive() {
+        let server = venue().await;
+        on(&server, "POST", ORDER_PATH, ResponseTemplate::new(502)).await;
+        Mock::given(method("GET"))
+            .and(path(ORDER_PATH))
+            .respond_with(
+                venue_error(-2013, "Order does not exist.").set_delay(Duration::from_millis(500)),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        on(
+            &server,
+            "GET",
+            ORDER_PATH,
+            ok(order("FILLED", "0.006", "60000")),
+        )
+        .await;
+        on(
+            &server,
+            "GET",
+            USER_TRADES_PATH,
+            ok(trades(&[("0.006", "0.144", "USDT")])),
+        )
+        .await;
+        let timings = CexTimings {
+            request_timeout: Duration::from_secs(2),
+            ..fast()
+        };
+        let live = BinanceFuturesLive::connect_with(rest(&server, timings), &["BTCUSDT"])
+            .await
+            .unwrap();
+
+        let fill = live
+            .execute(&buy("0.006"))
+            .await
+            .expect("the late order is found, not reported as never accepted");
+
+        assert_eq!(fill.order_ref, Some(1001));
+        assert_eq!(requests_to(&server, "GET", ORDER_PATH).await.len(), 2);
+    }
+
     #[tokio::test]
     async fn a_minus_1021_on_the_order_retries_it_once_with_a_fresh_clock() {
         let server = venue().await;

@@ -203,10 +203,6 @@ impl BinanceClient {
         signed_at + self.timings.recv_window + self.clock.error_bound()
     }
 
-    pub(crate) fn recv_window_passed(&self, signed_at: Instant) -> bool {
-        Instant::now() > self.recv_window_ends(signed_at)
-    }
-
     /// A signed call, with `params` in the query string in the order given.
     /// Answered with `-1021`, it reads the clock again and is retried once.
     pub(crate) async fn signed<T: DeserializeOwned>(
