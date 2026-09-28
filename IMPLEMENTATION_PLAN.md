@@ -290,6 +290,22 @@ Phase 0 → Phase 1 → Phase 2 → Phase 3 (EvmStub) → Phase 6 (CexStub)
 
 everything else can trail behind without blocking downstream consumers.
 
+## Phases 10–14 — proposed, specified in [`specs/`](specs/README.md)
+
+Five changes requested on 28 September 2026. Each has its own spec. Accepting a spec means copying its
+signatures into `SPEC.md` first, and then the phase starts.
+
+| Phase | Spec | Needs | Days |
+| --- | --- | --- | --- |
+| 10 | [V0](specs/V0-evm-shared-sender.md): one `EvmSender` per wallet and chain; router return read from its first word | nothing | 1 |
+| 11 | [V1](specs/V1-order-contract.md): `OrderRequest.reduce_only`; `OrderStateUnknown` | nothing | 1 |
+| 12 | [V2](specs/V2-binance-usdm-futures.md): `BinanceFuturesLive` | futures testnet keys | 3 |
+| 13 | [V3](specs/V3-liquidity-port.md): `LiquidityExecutor`, `LiquidityStub`, `EvmLiquidity` over a signing or fork sender | anvil fork; funded testnet key | 6.5 |
+| 14 | [V4](specs/V4-cex-account-reads.md): `CexAccount` (awaiting the decision on whether reads belong here) | futures testnet keys | 1.5 |
+
+Phases 10 and 11, and phase 13's stub, need nothing external and go first. Phases 12 and 14 share
+keys and a client, so they are built together.
+
 ## Tracking
 
 Each phase's "Done when" line is its exit criterion. Treat §9 of `SPEC.md` as the authoritative

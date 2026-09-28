@@ -35,6 +35,10 @@ environment specifically) each venue's own geo-restriction. See the "BLOCKED" se
 [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md#blocked--everything-below-needs-input-only-you-can-give)
 for exactly what is needed and why nothing further can proceed without it.
 
+**Proposed next** ([`specs/`](specs/README.md)): a liquidity port for concentrated-liquidity position
+managers, a Binance USDⓈ-M futures adapter with reduce-only orders, read-only perp account queries,
+and one shared EVM sender per wallet.
+
 ## Scope, in one paragraph
 
 Given a route or an order that something else has already decided to send, this crate is responsible
