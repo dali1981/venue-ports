@@ -323,6 +323,14 @@ the relevant environment variables, a no-op when they are unset, like the Sepoli
   for the same pair is an error and a different chain id is not; a forced `TimedOut` blocks the next
   send until `resolve` sees a receipt; a 64-byte return yields its first word and a 31-byte one an
   error; the existing tests pass apart from construction; `dex_executor_contract` still passes.
+- **Status: done**, except that the Sepolia-gated tests have not been re-run since the refactor (they
+  need `EVM_LIVE_RPC_URL`/`EVM_LIVE_SIGNER_KEY`, which this environment does not have). Every
+  `wiremock` case above passes, and `dex_executor_contract` now runs against all three DEX adapters.
+  The timeout rule was also run against a real node: with anvil's automine off, a signed send times
+  out, the next send is refused, and `resolve` returns the receipt once a block is mined
+  (`against_anvil_a_timed_out_send_is_resolved_once_mined`, gated on `EVM_ANVIL_RPC_URL`). Beyond the
+  spec: a lost broadcast response is polled for rather than returned as an `Err` (the transaction may
+  be out), and a failed receipt poll is retried until the timeout.
 
 ### Phase 11 — reduce-only and "this may have filled" (V1)
 
@@ -370,6 +378,22 @@ the relevant environment variables, a no-op when they are unset, like the Sepoli
   `positions(id).liquidity` and the owner's `balanceOf`, plus `Reverted("Price slippage check")`,
   `Reverted("Not cleared")` and a `TimedOut` forced with `evm_setAutomine(false)` — is met for the
   Uniswap v3 ABI and for Slipstream's; one live testnet life has been reconciled by a person.
+- **Status: built; the §9.2 bar is met for the Uniswap v3 ABI; Slipstream and the live life remain.**
+  - The suite passes against `LiquidityStub` on every test run.
+  - On anvil running Uniswap's published v3 bytecode (`@uniswap/v3-core` 1.0.1 and
+    `@uniswap/v3-periphery` 1.4.4 from npm, deployed by `scripts/anvil-uniswap-v3.py`; the pool's init
+    code hash matches the one the manager computes addresses with), `EvmLiquidity` over a fork sender
+    passes the suite, and **100 lives reconcile to the wei** against `balanceOf` and `positions(id)`,
+    27 of them with a swap through `EvmLive` on the same sender between increase and decrease (so
+    collect returns principal plus fees), plus the three injected failures with the reasons above.
+    This is a local chain carrying the real manager, not a fork of a public one: no fork RPC was
+    reachable from this environment. The same tests run against any anvil fork by pointing the
+    `LIQUIDITY_FORK_*` variables at the deployed contracts (`src/liquidity/evm/fork_tests.rs`), and
+    CI's `anvil` job runs them on every push and nightly.
+  - **Slipstream's ABI is encoded but unrun**: its fork bar needs an anvil fork of Base, with
+    `LIQUIDITY_FORK_POOL_KEY=tick_spacing:<n>`. Its `mint` layout is from its published source; the
+    other calls are assumed to match Uniswap v3's, which that run will confirm.
+  - **The live testnet life** (§9.4) is a person's to take, with a funded testnet key.
 
 ### Phase 14 — reading a perp account (V4)
 
