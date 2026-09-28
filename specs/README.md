@@ -1,5 +1,9 @@
 # Proposed changes
 
+**Status: all five are accepted into `SPEC.md` and built** (phases 10–14 of
+`IMPLEMENTATION_PLAN.md`, which records what each still needs before it counts as done — mostly
+testnet keys and a Base fork).
+
 Each file here specifies one change to the crate, to be built in this repository. `SPEC.md` stays
 the single contract. Accepting a spec means copying its signatures into `SPEC.md` and adding its
 phase to `IMPLEMENTATION_PLAN.md`. That is the first step of implementing it, before any code.
@@ -38,7 +42,9 @@ The crate has no tag. Consumers pin a tag, never a branch, so:
 
 ## Defects found while reading for these specs
 
-These belong to no spec. Each is small and can be fixed on its own.
+These belong to no spec. Each is small and can be fixed on its own. **All four are fixed** (1 by V0,
+2–4 alongside V1's error rule for the spot adapters); defect 4's venue check on the Spot Testnet is
+still to be made.
 
 1. **`EvmSimulated` panics on any router that returns more than one word.** `execute` decodes the
    whole return with `U256::from_be_slice`, which panics when the value exceeds 256 bits. KyberSwap's

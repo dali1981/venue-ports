@@ -668,6 +668,12 @@ no fill is ever returned with a guessed commission.
   `CexFill`, reads commission from the order's trades (exactly one asset, or `OrderStateUnknown`), and
   recovers a lost placing response by its client order id. `provenance` is `Landed`, on the testnet
   too.
+
+  Every wait a live CEX adapter makes (request timeout, `recvWindow`, clock refresh, status polling,
+  how long trade lines may lag a fill) is one `CexTimings` value, so a test can make them short. A
+  failed call is sorted by whether the venue may have acted on it: a connection never opened is not
+  sent; a 4xx is a refusal (nothing filled); a timeout, a dropped connection, a 5xx or a 408 is lost,
+  and is followed by a status query by client order id rather than a blind resend.
 - **`CexStub`** — an in-process fake, same shape and same call-recording requirement as `EvmStub`:
   programmable fills, rejections, partial fills and `OrderStateUnknown`, no network. It records
   `reduce_only`, and has a reduce-only mode: given a signed position set by the test, it rejects any
@@ -827,8 +833,13 @@ venue-ports/
     │   ├── account.rs        # § 6b: CexAccount, PerpPosition, MarginState, FundingPayment
     │   ├── stub.rs           # CexStub
     │   ├── account_stub.rs   # CexAccountStub
-    │   ├── binance/
-    │   │   ├── sign.rs       # HMAC-SHA256 query signing, shared by spot and futures
+    │   ├── binance/          # shared by spot and futures:
+    │   │   ├── sign.rs       #   HMAC-SHA256 query signing
+    │   │   ├── clock.rs      #   the venue-clock offset
+    │   │   ├── client.rs     #   the signed client; -1021 retry; each failure sorted into
+    │   │   │                 #   not sent / refused / lost
+    │   │   ├── order.rs      #   finding an order by client order id, trade lines, the
+    │   │   │                 #   one-commission-asset rule
     │   │   ├── rest.rs       # spot REST client
     │   │   └── live.rs       # BinanceLive (spot)
     │   ├── binance_futures/

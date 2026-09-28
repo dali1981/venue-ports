@@ -14,8 +14,9 @@ Guiding constraints carried over from the spec (do not relitigate these while im
 
 ## BLOCKED — everything below needs input only you can give
 
-Phases 0, 1, 2, 3, 4, 6, and 9 are complete and require nothing further. **Phases 5 and 7 cannot go
-live without the items below**, though both now have real scaffolding in place (`src/cex/binance/`,
+Phases 0, 1, 2, 3, 4, 6, 9, 10 and 11 are complete and require nothing further. Phases 12–14 are
+built; what each still needs is in its own section below (Blocker 4 sums it up). **Phases 5 and 7
+cannot go live without the items below**, though both now have real scaffolding in place (`src/cex/binance/`,
 `src/cex/bybit/`), unit-tested against mocked venue responses rather than a real sandbox. Decisions
 below marked resolved came from Mo directly; what's still open is real credentials and real network
 access, neither of which can be worked around, guessed, or defaulted.
@@ -154,12 +155,27 @@ check them against a real response.
 Production credentials are a separate, later ask, only needed once each venue's sandbox run clears
 §9's bar.
 
+### Blocker 4 — phases 12–14 need keys, a Base fork, and one decision
+
+- **USDⓈ-M futures testnet keys** (separate from the spot testnet keys) as
+  `BINANCE_FUTURES_API_KEY`/`BINANCE_FUTURES_API_SECRET`, and network access to the futures testnet
+  host. Every `BinanceFuturesLive`/`BinanceFuturesAccount` convention in phase 12 and 14's status
+  notes is unconfirmed until then; the gated runs are written and print what they find.
+- **Whether the production account may trade USDⓈ-M futures** in its jurisdiction (V2's first
+  question). The testnet does not check.
+- **An anvil fork of Base** (an RPC URL for Base) for Slipstream's §9.2 fork run (phase 13).
+- **A funded testnet key** for the one live liquidity life a person takes (phase 13, §9.4).
+- **The owner's answer to V4's question** — do account reads belong in this crate? — which phase 14
+  assumes is yes.
+
 ### What is NOT blocked
 
-`EvmStub` and `CexStub` are both done, pass the shared contract suite, and are safe to build a trading
-system against right now — see [`examples/basic_usage.rs`](examples/basic_usage.rs). Nothing above
-blocks writing or testing consumer code against the stubs, or against `BinanceLive`/`BybitLive` run
-against a mocked server in tests.
+`EvmStub`, `CexStub`, `LiquidityStub` and `CexAccountStub` are all done, pass the shared contract
+suites, and are safe to build a trading system against right now — see
+[`examples/basic_usage.rs`](examples/basic_usage.rs) and
+[`examples/liquidity_lifecycle.rs`](examples/liquidity_lifecycle.rs). Nothing above blocks writing or
+testing consumer code against the stubs, against `BinanceLive`/`BybitLive`/`BinanceFuturesLive` run
+against a mocked server in tests, or against `EvmLiquidity` on a local anvil node.
 
 ## Phase 0 — Scaffolding
 
@@ -349,6 +365,17 @@ the relevant environment variables, a no-op when they are unset, like the Sepoli
   passes against both spot adapters with nothing reaching the mock server; the stub's reduce-only
   cases (position −5: buy 3 fills, sell 1 rejected, buy 8 rejected) pass; `examples/basic_usage.rs`
   sets the field.
+- **Status: done.** Beyond the list above, both spot adapters now keep to the error rule: each order
+  carries a client order id, a lost answer (a timeout, a dropped connection, a 5xx) is followed by a
+  status query, and "no such order" counts as "never accepted" only from a query *sent* after
+  `recvWindow` has passed for the lost request. Everything the adapter cannot read once the venue may
+  have acted is `OrderStateUnknown`. README defects 2, 3 and 4 are fixed for `BinanceLive`, which also
+  reads `GET /api/v3/time` before its first signed call and retries once on `-1021`. `BybitLive` now
+  refuses, before sending, a symbol with no commission asset configured. All of this is tested
+  against `wiremock` only. Still open on spot, outside these specs: `BybitLive` signs with the local
+  clock (§6 asks for venue clock sync) and takes its commission asset from the caller; and whether
+  Binance's Spot Testnet reports a market order that ran out of book as `EXPIRED` with its partial
+  `fills` (defect 4's check).
 
 ### Phase 12 — Binance USDⓈ-M futures (V2)
 
@@ -365,6 +392,19 @@ the relevant environment variables, a no-op when they are unset, like the Sepoli
   and a forced `OrderStateUnknown`. The module docs record the testnet host, the reduce-only notional
   exemption, and what the venue does with a reduce-only order larger than the position (which
   `CexStub` then copies).
+- **Status: built and tested against `wiremock`; nothing has run against the testnet** (no keys, and
+  no Binance host is reachable from this environment). `src/cex/binance/` now shares `sign.rs`,
+  `clock.rs`, `client.rs` and `order.rs` between spot and futures; `src/cex/binance_futures/` has
+  `rest.rs`, `filters.rs` and `live.rs`. Every `wiremock` case V2 lists passes. The gated runs are
+  written: `cex_executor_contract` on the testnet (`BINANCE_FUTURES_API_KEY`/`_SECRET`), and — with
+  `BINANCE_FUTURES_RUN_ACCEPTANCE=1` as well — the §9.2 run of 100 orders reconciled against
+  `userTrades` with its injected failures, and a step that prints how the venue treats a reduce-only
+  order larger than the position (`RECORD:` lines, for `CexStub` to copy). Unconfirmed until then: the
+  testnet host (default `https://demo-fapi.binance.com`, the older one being
+  `https://testnet.binancefuture.com`), the reduce-only notional exemption, the sign of `userTrades`
+  commission, and the boolean shape of `positionSide/dual`, `multiAssetsMargin` and `feeBurn`. Beyond
+  the spec: a failed status query is retried until `poll_timeout` before the order becomes
+  `OrderStateUnknown`, and the `-1021` resync covers every signed call.
 
 ### Phase 13 — the liquidity port (V3)
 
@@ -404,6 +444,14 @@ the relevant environment variables, a no-op when they are unset, like the Sepoli
 - Done when: `cex_account_contract` passes against the stub; the `wiremock` cases in V4 pass; on the
   testnet, gated, a short opened with Phase 12 reads back here with the fill's quantity and entry price,
   and reads `qty == 0` after a reduce-only close.
+- **Status: built; the stub and `wiremock` criteria are met; the testnet run is written and gated, not
+  yet run.** `BinanceFuturesAccount` shares `BinanceFuturesRest` with `BinanceFuturesLive` (or comes
+  from `BinanceFuturesLive::account()`). Unconfirmed until the testnet run: `positionRisk` v3 carries
+  no margin type or leverage, so they come from `symbolConfig`; v3 may leave out a flat symbol, which
+  is then read as `qty == 0` with the mark price from `premiumIndex`; account v3 carries no timestamp,
+  so `MarginState.as_of_ms` is the venue clock as this client estimates it; funding is paged in
+  windows of at most 7 days and refused for a `since_ms` older than 89 days, since Binance keeps three
+  months of income and an older start could only be answered short.
 
 ## Tracking
 
