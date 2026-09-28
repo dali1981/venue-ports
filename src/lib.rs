@@ -9,4 +9,5 @@ pub use provenance::Provenance;
 
 pub mod cex;
 pub mod dex;
+pub mod evm;
 pub mod testkit;

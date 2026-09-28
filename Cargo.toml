@@ -9,6 +9,7 @@ repository = "https://github.com/dali1981/venue-ports"
 [dependencies]
 alloy-consensus = "2.5.0"
 alloy-primitives = { version = "1.7.3", features = ["std", "k256"] }
+alloy-sol-types = { version = "1.7.3", features = ["std"] }
 anyhow = "1.0.104"
 async-trait = "0.1.92"
 hex = "0.4.3"
@@ -26,4 +27,7 @@ sha2 = "0.10.9"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "time", "macros"] }
 
 [dev-dependencies]
+# Already in the graph through `alloy-consensus`; the tests use it to decode
+# the raw transactions a mock node receives.
+alloy-eips = "2.5.0"
 wiremock = "0.6.5"
