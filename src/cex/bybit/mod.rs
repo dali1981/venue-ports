@@ -8,4 +8,4 @@ mod live;
 mod rest;
 
 pub use live::BybitLive;
-pub use rest::BybitConfig;
+pub use rest::{BybitConfig, BybitRest};

@@ -3,9 +3,18 @@
 //! (`https://testnet.binance.vision`) by default; a production run needs
 //! `BINANCE_BASE_URL=https://api.binance.com` set explicitly, never the
 //! other way around.
+//!
+//! Signing ([`sign`]), the server clock ([`clock`]), the signed HTTP client
+//! and its error rule ([`client`]) and order tracking ([`order`]) are shared
+//! with Binance USDⓈ-M futures (`crate::cex::binance_futures`), which speaks
+//! the same conventions on another host.
 
+pub(crate) mod client;
+pub(crate) mod clock;
 mod live;
+pub(crate) mod order;
 mod rest;
+pub(crate) mod sign;
 
 pub use live::BinanceLive;
-pub use rest::BinanceConfig;
+pub use rest::{BinanceConfig, BinanceRest};
