@@ -282,8 +282,19 @@ impl EvmSender {
     /// it, it was replaced or dropped: that is reported as an error naming the
     /// hash, and the hash is cleared.
     pub async fn resolve(&self) -> Result<Option<TxOutcome>>;
+
+    /// The node this sender talks to, for reads alongside its sends.
+    pub fn rpc(&self) -> &EvmRpc;
+    /// How often, and for how long, a receipt is polled for before a send
+    /// ends `TimedOut` (default: every 4 s, for 3 minutes).
+    pub fn set_poll_settings(&self, poll: PollSettings);
 }
 ```
+
+A send whose broadcast response is lost may still have reached the node, so it is polled for like any
+other and ends `TimedOut` (and unresolved) if no receipt appears; only a broadcast the node answered and
+refused is an `Err`. A failed receipt poll is retried until the timeout, never returned as an `Err`
+after the transaction is out.
 
 Rules:
 
@@ -535,7 +546,11 @@ impl EvmSender {
 
 On a fork, `send_and_confirm` calls `anvil_impersonateAccount` and then `eth_sendTransaction` from the
 owner, and follows the same receipt polling, revert-reason replay, timeout path and unresolved-timeout
-rule as signing.
+rule as signing. One difference is deliberate: when the node's gas estimate says a transaction will
+revert, a signing sender refuses to spend gas on it (an `Err`, nothing sent), while a fork sender
+sends it anyway with a fixed gas limit, so a fork run observes the revert — `"Price slippage check"`,
+`"Not cleared"` — as an `Outcome::Reverted` with its reason. A fork sender is not in the process-wide
+registry: a fork is its own node, and anvil assigns an impersonated account's nonces itself.
 
 ## 6. The CEX port
 

@@ -25,17 +25,41 @@
 //! sender for the same pair; the entry is removed when the sender drops.
 //! Nothing can enforce this across processes: run one process per wallet
 //! per chain.
+//!
+//! **Two backends, one send path** (`SPEC.md` §5b). A signing sender signs
+//! with its own key and is `Landed`. A fork sender ([`EvmSender::fork`])
+//! impersonates an owner on an anvil fork with `anvil_impersonateAccount`
+//! and `eth_sendTransaction`, and is `Simulated`: the same operation as a
+//! live send, to a chain that is thrown away afterwards. Both follow the
+//! same receipt polling, revert-reason replay, timeout path and
+//! unresolved-timeout rule. One difference is deliberate: when the node's
+//! gas estimate says a transaction will revert, a signing sender refuses to
+//! spend gas on it (an `Err`, nothing sent), while a fork sender sends it
+//! anyway with a fixed gas limit, so a fork run observes the revert as an
+//! outcome with its reason. Fork senders are not in the registry: a fork is
+//! its own node, and anvil assigns an impersonated account's nonces itself.
 
-use crate::evm::erc20;
-use crate::evm::rpc::{BlockTag, EvmRpc, Receipt, RpcError, RpcLog};
+use crate::evm::erc20::{self, SlotCache};
+use crate::evm::rpc::{format_u256, BlockTag, EvmRpc, Receipt, RpcError, RpcLog};
 use crate::Provenance;
 use alloy_consensus::{SignableTransaction, TxEip1559};
 use alloy_primitives::{keccak256, Address, Signature, TxKind, B256, U256};
 use anyhow::{bail, Context, Result};
 use k256::ecdsa::SigningKey;
+use serde_json::json;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+
+/// The gas limit a fork sender uses when the node's estimate says the
+/// transaction will revert — enough for any position-manager call, and free
+/// on a fork.
+const FORK_REVERT_GAS_LIMIT: u64 = 3_000_000;
+
+/// The ETH a fork sender gives its owner for gas when it holds less than
+/// [`FORK_MIN_GAS_BALANCE`]: an impersonated account still pays for gas.
+const FORK_GAS_BALANCE: u128 = 100_000_000_000_000_000_000; // 100 ETH
+const FORK_MIN_GAS_BALANCE: u128 = 1_000_000_000_000_000_000; // 1 ETH
 
 /// One secp256k1 signing key and the address it controls. It signs; it
 /// does not send — sending, and the nonce that goes with it, belong to the
@@ -152,6 +176,8 @@ pub enum TxOutcome {
 
 enum Backend {
     Signing(Signer),
+    /// Impersonates the sender's address on an anvil node.
+    Fork,
 }
 
 /// A send that ended `TimedOut`, kept until [`EvmSender::resolve`] clears
@@ -178,6 +204,8 @@ pub struct EvmSender {
     poll: Mutex<PollSettings>,
     send_lock: tokio::sync::Mutex<()>,
     unresolved: Mutex<Option<Unresolved>>,
+    /// Balance-slot indices found by `ensure_balance` on a fork.
+    slots: SlotCache,
     registered: bool,
 }
 
@@ -222,7 +250,58 @@ impl EvmSender {
             poll: Mutex::new(PollSettings::default()),
             send_lock: tokio::sync::Mutex::new(()),
             unresolved: Mutex::new(None),
+            slots: SlotCache::default(),
             registered: true,
+        }))
+    }
+
+    /// A sender that impersonates `owner` on an anvil fork. It refuses any
+    /// node whose `web3_clientVersion` does not start with "anvil": this
+    /// backend sends transactions, and must never send them anywhere real.
+    /// Gives the owner gas money if it holds less than 1 ETH.
+    pub async fn fork(rpc: EvmRpc, owner: Address, chain_id: u64) -> Result<Arc<Self>> {
+        let version = rpc
+            .client_version()
+            .await
+            .context("reading the node's web3_clientVersion")?;
+        if !version.starts_with("anvil") {
+            bail!(
+                "a fork sender only sends to an anvil node, and {} reports {version:?}",
+                rpc.url()
+            );
+        }
+        let node_chain_id = rpc
+            .chain_id()
+            .await
+            .context("reading the node's eth_chainId")?;
+        if node_chain_id != chain_id {
+            bail!(
+                "the fork at {} is on chain {node_chain_id}, not the expected chain {chain_id}",
+                rpc.url()
+            );
+        }
+        if rpc.balance(owner).await? < U256::from(FORK_MIN_GAS_BALANCE) {
+            rpc.call(
+                "anvil_setBalance",
+                json!([owner.to_string(), format!("0x{FORK_GAS_BALANCE:x}")]),
+            )
+            .await
+            .context("funding the impersonated owner's gas")?;
+        }
+        Ok(Arc::new(Self {
+            rpc,
+            backend: Backend::Fork,
+            address: owner,
+            chain_id,
+            fees: FeePolicy::default(),
+            poll: Mutex::new(PollSettings {
+                interval: Duration::from_millis(100),
+                timeout: Duration::from_secs(30),
+            }),
+            send_lock: tokio::sync::Mutex::new(()),
+            unresolved: Mutex::new(None),
+            slots: SlotCache::default(),
+            registered: false,
         }))
     }
 
@@ -238,10 +317,13 @@ impl EvmSender {
         &self.rpc
     }
 
-    /// `Landed` for a signing sender: what it sends is real.
+    /// `Simulated` for a fork sender, `Landed` for a signing one. Adapters
+    /// take their provenance from this, and set `tx_ref` only when it is
+    /// `Landed`.
     pub fn provenance(&self) -> Provenance {
         match self.backend {
             Backend::Signing(_) => Provenance::Landed,
+            Backend::Fork => Provenance::Simulated,
         }
     }
 
@@ -284,6 +366,7 @@ impl EvmSender {
                 self.sign_and_broadcast(signer, to, &calldata, value)
                     .await?
             }
+            Backend::Fork => self.impersonate_and_send(to, &calldata, value).await?,
         };
 
         let poll = *self.poll.lock().unwrap();
@@ -331,6 +414,55 @@ impl EvmSender {
                 "approve({spender}, {amount}) on {token} timed out waiting for a receipt \
                  (tx {tx_hash}) — it may still land; resolve() it before sending again"
             ),
+        }
+    }
+
+    /// Checks that the owner holds at least `amount` of `token`. A signing
+    /// sender returns an error when it does not, so a transaction that would
+    /// revert with STF is never sent. A fork sender instead writes the
+    /// balance slot with `anvil_setStorageAt` (the slot comes from
+    /// [`erc20`]'s probing), exactly as `EvmSimulated` overrides state.
+    pub async fn ensure_balance(&self, token: Address, amount: U256) -> Result<()> {
+        let current = erc20::balance_of(&self.rpc, token, self.address, BlockTag::Latest)
+            .await
+            .with_context(|| format!("reading {}'s balance of {token}", self.address))?;
+        if current >= amount {
+            return Ok(());
+        }
+        match self.backend {
+            Backend::Signing(_) => bail!(
+                "{} holds {current} of {token}, less than the {amount} this needs — refusing to \
+                 send a transaction that would revert",
+                self.address
+            ),
+            Backend::Fork => {
+                let index = erc20::find_balance_slot(
+                    &self.rpc,
+                    &self.slots,
+                    token,
+                    self.address,
+                    BlockTag::Latest,
+                )
+                .await?;
+                let slot = erc20::mapping_slot(self.address, index);
+                self.rpc
+                    .call(
+                        "anvil_setStorageAt",
+                        json!([token.to_string(), slot.to_string(), format_u256(amount)]),
+                    )
+                    .await
+                    .context("writing the balance slot on the fork")?;
+                let written =
+                    erc20::balance_of(&self.rpc, token, self.address, BlockTag::Latest).await?;
+                if written != amount {
+                    bail!(
+                        "wrote {amount} into {token}'s balance slot for {} but balanceOf reads \
+                         {written} — the token does not keep balances in a plain mapping",
+                        self.address
+                    );
+                }
+                Ok(())
+            }
         }
     }
 
@@ -422,6 +554,43 @@ impl EvmSender {
                 return Err(err.context(format!("broadcasting transaction {tx_hash}")));
             }
         }
+        Ok((tx_hash, nonce))
+    }
+
+    /// Sends from the impersonated owner on an anvil fork. A transaction the
+    /// node's estimate says will revert is sent anyway (see the module docs),
+    /// so the fork records the revert and its reason as an outcome.
+    async fn impersonate_and_send(
+        &self,
+        to: Address,
+        calldata: &[u8],
+        value: U256,
+    ) -> Result<(B256, u64)> {
+        self.rpc
+            .call(
+                "anvil_impersonateAccount",
+                json!([self.address.to_string()]),
+            )
+            .await
+            .context("impersonating the owner on the fork")?;
+        let nonce = self
+            .rpc
+            .transaction_count(self.address, BlockTag::Pending)
+            .await?;
+        let gas = match self
+            .rpc
+            .estimate_gas(self.address, to, calldata, value)
+            .await
+        {
+            Ok(estimate) => estimate + estimate / 5,
+            Err(err) if err.downcast_ref::<RpcError>().is_some() => FORK_REVERT_GAS_LIMIT,
+            Err(err) => return Err(err),
+        };
+        let tx_hash = self
+            .rpc
+            .send_transaction(self.address, to, calldata, value, gas)
+            .await
+            .context("sending from the impersonated owner")?;
         Ok((tx_hash, nonce))
     }
 
@@ -962,23 +1131,27 @@ pub(crate) mod tests {
         );
     }
 
-    /// The URL of a local anvil node, when a contributor has one running,
-    /// for tests that need a real node rather than a mock. They change its
-    /// state (they send transactions, mine blocks, toggle automine), so the
-    /// node is checked to be anvil before anything is sent. A no-op when
+    /// The URL of a local anvil node (plain, or a fork), when a contributor
+    /// has one running, for tests that need a real node rather than a mock.
+    /// They change its state (they send transactions, mine blocks, toggle
+    /// automine), so the node is checked to be anvil before anything is
+    /// sent, and the returned guard keeps every such test in this process
+    /// from running at the same time as another. A no-op when
     /// `EVM_ANVIL_RPC_URL` is unset.
-    pub(crate) async fn anvil() -> Option<EvmRpc> {
+    pub(crate) async fn anvil() -> Option<(EvmRpc, tokio::sync::MutexGuard<'static, ()>)> {
+        static ANVIL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         let Ok(url) = std::env::var("EVM_ANVIL_RPC_URL") else {
             eprintln!("skipping: EVM_ANVIL_RPC_URL is not set");
             return None;
         };
+        let guard = ANVIL.lock().await;
         let rpc = EvmRpc::new(url);
         let version = rpc.client_version().await.expect("web3_clientVersion");
         assert!(
             version.starts_with("anvil"),
             "EVM_ANVIL_RPC_URL must point at an anvil node, not {version}"
         );
-        Some(rpc)
+        Some((rpc, guard))
     }
 
     /// Anvil's first well-known dev account, funded on every anvil node and
@@ -992,7 +1165,9 @@ pub(crate) mod tests {
     /// mined, then returns its receipt and clears it.
     #[tokio::test]
     async fn against_anvil_a_timed_out_send_is_resolved_once_mined() {
-        let Some(rpc) = anvil().await else { return };
+        let Some((rpc, _anvil)) = anvil().await else {
+            return;
+        };
         let chain_id = rpc.chain_id().await.unwrap();
         let sender = EvmSender::connect(
             rpc.clone(),
@@ -1040,5 +1215,66 @@ pub(crate) mod tests {
             other => panic!("expected the mined transaction's receipt, got {other:?}"),
         }
         assert_eq!(sender.unresolved(), None);
+    }
+
+    #[tokio::test]
+    async fn fork_refuses_a_node_that_is_not_anvil() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "web3_clientVersion"})))
+            .respond_with(ok(json!("Geth/v1.14.0-stable/linux-amd64/go1.22")))
+            .mount(&server)
+            .await;
+
+        let err = EvmSender::fork(EvmRpc::new(server.uri()), Address::from([0xCC; 20]), 1)
+            .await
+            .err()
+            .expect("a fork sender must refuse a real node");
+        assert!(err.to_string().contains("only sends to an anvil node"));
+    }
+
+    /// A fork sender against a real anvil node: it is `Simulated`, it
+    /// writes a token balance the owner does not hold, and it records a
+    /// revert the node's estimate predicted as an outcome, reason included.
+    #[tokio::test]
+    async fn against_anvil_a_fork_sender_funds_and_sends_as_the_owner() {
+        let Some((rpc, _anvil)) = anvil().await else {
+            return;
+        };
+        let Ok(token) = std::env::var("LIQUIDITY_FORK_TOKEN0") else {
+            eprintln!("skipping: LIQUIDITY_FORK_TOKEN0 is not set");
+            return;
+        };
+        let token: Address = token.parse().unwrap();
+        let chain_id = rpc.chain_id().await.unwrap();
+        let owner = Address::from([0x5e; 20]);
+        let sender = EvmSender::fork(rpc.clone(), owner, chain_id).await.unwrap();
+        assert_eq!(sender.provenance(), Provenance::Simulated);
+
+        let amount = U256::from(123_456_789u64)
+            + erc20::balance_of(&rpc, token, owner, BlockTag::Latest)
+                .await
+                .unwrap();
+        sender.ensure_balance(token, amount).await.unwrap();
+        assert_eq!(
+            erc20::balance_of(&rpc, token, owner, BlockTag::Latest)
+                .await
+                .unwrap(),
+            amount
+        );
+
+        // Transferring more than the owner holds reverts in the token; the
+        // estimate says so, and the fork sender sends it anyway.
+        let mut transfer = vec![0xa9, 0x05, 0x9c, 0xbb]; // transfer(address,uint256)
+        transfer.extend_from_slice(&crate::evm::rpc::pad_address(Address::from([0x01; 20])));
+        transfer.extend_from_slice(&(amount + U256::from(1u64)).to_be_bytes::<32>());
+        match sender
+            .send_and_confirm(token, transfer, U256::ZERO)
+            .await
+            .unwrap()
+        {
+            TxOutcome::Reverted { reason, .. } => assert!(!reason.is_empty()),
+            other => panic!("expected the over-transfer to revert, got {other:?}"),
+        }
     }
 }
