@@ -50,6 +50,7 @@
 use crate::cex::binance::order::{
     settled, single_commission, trade_lines, unreadable_fill, VenueOrder,
 };
+use crate::cex::binance_futures::account::BinanceFuturesAccount;
 use crate::cex::binance_futures::filters::{symbol_filters, ExchangeInfo, SymbolFilters};
 use crate::cex::binance_futures::rest::{BinanceFuturesConfig, BinanceFuturesRest};
 use crate::cex::{new_client_order_id, CexExecutor, CexFill, OrderRequest, OrderSide};
@@ -123,6 +124,13 @@ impl BinanceFuturesLive {
     /// `BinanceFuturesAccount`.
     pub fn rest(&self) -> &Arc<BinanceFuturesRest> {
         &self.rest
+    }
+
+    /// A `BinanceFuturesAccount` reading the account this adapter trades,
+    /// over the same client — keys, connections and clock. `connect`
+    /// already checked what the reads rely on.
+    pub fn account(&self) -> BinanceFuturesAccount {
+        BinanceFuturesAccount::over(Arc::clone(&self.rest))
     }
 
     /// Reads an order the venue reports in a terminal state into a fill.
@@ -226,7 +234,7 @@ impl CexExecutor for BinanceFuturesLive {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::cex::binance::clock::local_now_ms;
     use crate::cex::binance::sign::sign;
@@ -1016,12 +1024,17 @@ mod tests {
     // existing position: each refuses to start unless the symbol is flat,
     // and closes what it opened.
 
-    fn testnet() -> Option<BinanceFuturesConfig> {
+    pub(crate) fn testnet() -> Option<BinanceFuturesConfig> {
         BinanceFuturesConfig::from_env().ok()
     }
 
-    fn acceptance_opted_in() -> bool {
+    pub(crate) fn acceptance_opted_in() -> bool {
         std::env::var("BINANCE_FUTURES_RUN_ACCEPTANCE").as_deref() == Ok("1")
+    }
+
+    /// The filters `connect` read for `symbol`.
+    pub(crate) fn tradable_for(live: &BinanceFuturesLive, symbol: &str) -> SymbolFilters {
+        live.filters[symbol].clone()
     }
 
     pub(crate) fn testnet_symbol() -> String {

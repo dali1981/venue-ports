@@ -44,9 +44,11 @@
 //! check. Confirm the production account is eligible before relying on
 //! this.
 
+mod account;
 mod filters;
 mod live;
 mod rest;
 
+pub use account::BinanceFuturesAccount;
 pub use live::BinanceFuturesLive;
 pub use rest::{BinanceFuturesConfig, BinanceFuturesRest};

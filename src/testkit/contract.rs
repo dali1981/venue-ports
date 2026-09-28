@@ -5,12 +5,14 @@
 //! ships and on a recurring schedule, and against `Live` only as a
 //! deliberate, human-triggered run (`SPEC.md` §7's table).
 
+use crate::cex::{CexAccount, MarginMode};
 use crate::cex::{CexExecutor, OrderRequest, OrderStateUnknown};
 use crate::dex::{ChainAmount, DexExecutor, Outcome, RouteQuote, SwapRequest};
 use crate::liquidity::{
     LiquidityAction, LiquidityExecutor, LiquidityRealised, LiquidityRequest, PositionRef, RangeSpec,
 };
 use crate::Provenance;
+use std::collections::HashSet;
 
 /// Inputs for one run of [`dex_executor_contract`] against a given
 /// executor.
@@ -226,6 +228,60 @@ pub async fn cex_spot_rejects_reduce_only(executor: &dyn CexExecutor, fixture: C
     );
 }
 
+/// Inputs for one run of [`cex_account_contract`] against a given account.
+#[derive(Debug, Clone)]
+pub struct CexAccountContractFixture {
+    pub symbol: String,
+    /// Where `funding_since` starts.
+    pub since_ms: i64,
+}
+
+/// Shape assertions every `CexAccount` implementation must satisfy,
+/// whatever the account holds (`SPEC.md` §7): the isolated margin is there
+/// exactly when the position is isolated; a flat position has no
+/// liquidation price; funding is sorted by time, none before `since_ms`,
+/// no `venue_ref` twice; and no asset is ever empty.
+pub async fn cex_account_contract(account: &dyn CexAccount, fixture: CexAccountContractFixture) {
+    let position = account.position(&fixture.symbol).await.unwrap();
+    assert_eq!(
+        position.isolated_margin.is_some(),
+        position.margin_mode == MarginMode::Isolated,
+        "isolated_margin must be set exactly when the position is isolated: {position:?}"
+    );
+    if position.qty.is_zero() {
+        assert!(
+            position.liquidation_price.is_none(),
+            "a flat position has no liquidation price: {position:?}"
+        );
+    }
+
+    let margin = account.margin().await.unwrap();
+    assert!(!margin.asset.is_empty(), "margin with no asset: {margin:?}");
+
+    let funding = account
+        .funding_since(&fixture.symbol, fixture.since_ms)
+        .await
+        .unwrap();
+    assert!(
+        funding
+            .windows(2)
+            .all(|pair| pair[0].ts_ms <= pair[1].ts_ms),
+        "funding must be oldest first"
+    );
+    assert!(
+        funding
+            .iter()
+            .all(|payment| payment.ts_ms >= fixture.since_ms),
+        "funding from before since_ms"
+    );
+    let refs: HashSet<u64> = funding.iter().map(|payment| payment.venue_ref).collect();
+    assert_eq!(refs.len(), funding.len(), "a venue_ref appears twice");
+    assert!(
+        funding.iter().all(|payment| !payment.asset.is_empty()),
+        "a funding payment with no asset"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +376,65 @@ mod tests {
     #[tokio::test]
     async fn cex_stub_satisfies_the_contract() {
         cex_executor_contract(&CexStub::new(), cex_fixture()).await;
+    }
+
+    /// Runs against a flat cross position and an isolated short, with
+    /// funding pushed out of order and partly before `since_ms`, which the
+    /// stub must filter and sort as a venue adapter does.
+    #[tokio::test]
+    async fn cex_account_stub_satisfies_the_contract() {
+        use crate::cex::{CexAccountStub, FundingPayment, MarginState, PerpPosition};
+        use rust_decimal::Decimal;
+
+        let flat = PerpPosition {
+            symbol: "BTCUSDT".to_string(),
+            qty: Decimal::ZERO,
+            entry_price: Decimal::ZERO,
+            mark_price: Decimal::from(60_000),
+            liquidation_price: None,
+            margin_mode: MarginMode::Cross,
+            leverage: 20,
+            isolated_margin: None,
+            as_of_ms: 1_000,
+        };
+        let isolated_short = PerpPosition {
+            qty: Decimal::new(-5, 3),
+            entry_price: Decimal::from(60_000),
+            liquidation_price: Some(Decimal::from(95_000)),
+            margin_mode: MarginMode::Isolated,
+            leverage: 5,
+            isolated_margin: Some(Decimal::from(60)),
+            ..flat.clone()
+        };
+
+        for position in [flat, isolated_short] {
+            let stub = CexAccountStub::new();
+            stub.set_position(position);
+            stub.set_margin(MarginState {
+                asset: "USDT".to_string(),
+                margin_balance: Decimal::from(1_000),
+                maint_margin: Decimal::from(2),
+                available: Decimal::from(900),
+                as_of_ms: 1_000,
+            });
+            for (venue_ref, ts_ms) in [(3, 300), (1, 100), (2, 200), (0, 50)] {
+                stub.push_funding(FundingPayment {
+                    symbol: "BTCUSDT".to_string(),
+                    ts_ms,
+                    amount: Decimal::new(-12, 2),
+                    asset: "USDT".to_string(),
+                    venue_ref,
+                });
+            }
+
+            cex_account_contract(
+                &stub,
+                CexAccountContractFixture {
+                    symbol: "BTCUSDT".to_string(),
+                    since_ms: 100,
+                },
+            )
+            .await;
+        }
     }
 }

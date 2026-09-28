@@ -165,6 +165,11 @@ impl BinanceClient {
         &self.timings
     }
 
+    /// The best estimate of the venue's time now, in Unix ms.
+    pub(crate) fn venue_now_ms(&self) -> i64 {
+        self.clock.estimate_now_ms()
+    }
+
     /// An unsigned GET, for public endpoints.
     pub(crate) async fn public_get<T: DeserializeOwned>(
         &self,

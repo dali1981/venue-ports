@@ -1,6 +1,7 @@
 //! The CEX port. See `SPEC.md` §6. Types and the `CexExecutor` trait land
 //! in Phase 6, `CexStub` alongside them, a venue's `Live` adapter in Phase 7
-//! (`IMPLEMENTATION_PLAN.md`).
+//! (`IMPLEMENTATION_PLAN.md`). Reading a perp account (`CexAccount`, §6b)
+//! lives in `account`.
 
 use crate::Provenance;
 use anyhow::Result;
@@ -9,13 +10,19 @@ use rust_decimal::Decimal;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod account;
+mod account_stub;
 mod binance;
 mod binance_futures;
 mod bybit;
 mod stub;
 
+pub use account::{CexAccount, FundingPayment, MarginMode, MarginState, PerpPosition};
+pub use account_stub::{AccountCall, AccountRead, CexAccountStub};
 pub use binance::{BinanceConfig, BinanceLive, BinanceRest};
-pub use binance_futures::{BinanceFuturesConfig, BinanceFuturesLive, BinanceFuturesRest};
+pub use binance_futures::{
+    BinanceFuturesAccount, BinanceFuturesConfig, BinanceFuturesLive, BinanceFuturesRest,
+};
 pub use bybit::{BybitConfig, BybitLive, BybitRest};
 pub use stub::{CexStub, RecordedCall};
 
