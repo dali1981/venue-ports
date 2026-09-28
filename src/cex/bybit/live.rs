@@ -86,6 +86,13 @@ fn is_terminal(status: &str) -> bool {
 #[async_trait]
 impl CexExecutor for BybitLive {
     async fn execute(&self, req: &OrderRequest) -> Result<CexFill> {
+        if req.reduce_only {
+            bail!(
+                "reduce_only is not supported on Bybit spot, which holds no positions — \
+                 refusing to send {} as an unguarded order",
+                req.symbol
+            );
+        }
         let side = match req.side {
             OrderSide::Buy => "Buy",
             OrderSide::Sell => "Sell",
@@ -164,6 +171,7 @@ mod tests {
             side: OrderSide::Buy,
             quantity: decimal("10.037"),
             quoted_price: decimal("150"),
+            reduce_only: false,
         }
     }
 
@@ -248,5 +256,23 @@ mod tests {
         let adapter = live(&server);
         let err = adapter.execute(&request()).await.unwrap_err();
         assert!(err.to_string().contains("Rejected"));
+    }
+
+    #[tokio::test]
+    async fn reduce_only_is_refused_before_anything_is_sent() {
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let adapter = live(&server);
+        crate::testkit::contract::cex_spot_rejects_reduce_only(
+            &adapter,
+            crate::testkit::contract::CexContractFixture { request: request() },
+        )
+        .await;
+        // `expect(0)` is verified when `server` drops.
     }
 }

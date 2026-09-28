@@ -4,7 +4,7 @@
 //! ships and on a recurring schedule, and against `Live` only as a
 //! deliberate, human-triggered run (`SPEC.md` §7's table).
 
-use crate::cex::{CexExecutor, OrderRequest};
+use crate::cex::{CexExecutor, OrderRequest, OrderStateUnknown};
 use crate::dex::{DexExecutor, Outcome, RouteQuote, SwapRequest};
 use crate::Provenance;
 
@@ -43,13 +43,40 @@ pub struct CexContractFixture {
 }
 
 /// Shape assertions every `CexExecutor` implementation must satisfy,
-/// regardless of mode (`SPEC.md` §7).
+/// regardless of mode (`SPEC.md` §7). Runs the fixture's order with
+/// `reduce_only: false`, whatever the fixture says, so it means the same
+/// thing on a spot venue and a perp one.
 pub async fn cex_executor_contract(executor: &dyn CexExecutor, fixture: CexContractFixture) {
-    let fill = executor.execute(&fixture.request).await.unwrap();
+    let request = OrderRequest {
+        reduce_only: false,
+        ..fixture.request
+    };
+    let fill = executor.execute(&request).await.unwrap();
 
     assert_eq!(
         fill.order_ref.is_some(),
         fill.provenance == Provenance::Landed
+    );
+}
+
+/// Every spot `CexExecutor` must refuse `reduce_only: true` with a plain
+/// error — nothing filled, so never an [`OrderStateUnknown`] — rather than
+/// send an order it cannot guard (`SPEC.md` §6). That nothing reached the
+/// venue is the caller's to assert, e.g. with a mock server that expects no
+/// request.
+pub async fn cex_spot_rejects_reduce_only(executor: &dyn CexExecutor, fixture: CexContractFixture) {
+    let request = OrderRequest {
+        reduce_only: true,
+        ..fixture.request
+    };
+    let err = executor
+        .execute(&request)
+        .await
+        .expect_err("a spot venue must reject reduce_only: true");
+
+    assert!(
+        err.downcast_ref::<OrderStateUnknown>().is_none(),
+        "a refusal before sending is not an unknown order state: {err}"
     );
 }
 
@@ -86,6 +113,7 @@ mod tests {
                 side: OrderSide::Buy,
                 quantity: rust_decimal::Decimal::from_str("10").unwrap(),
                 quoted_price: rust_decimal::Decimal::from_str("150").unwrap(),
+                reduce_only: false,
             },
         }
     }

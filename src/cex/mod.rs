@@ -34,7 +34,47 @@ pub struct OrderRequest {
     /// build the order itself — a market order carries no price, and
     /// treating this as one would be a fabricated quote, not a real order.
     pub quoted_price: Decimal,
+    /// The venue must refuse any part of this order that would increase or
+    /// flip the position instead of reducing it. A venue with no positions
+    /// (spot) must reject `true` with an error before sending, never ignore
+    /// it: an ignored reduce-only is an unguarded order.
+    pub reduce_only: bool,
 }
+
+/// Returned (inside `anyhow::Error`, found with `downcast_ref`) when an
+/// order may have reached the venue but its outcome could not be read: the
+/// placing call's response was lost, and the status query that should
+/// follow it also failed. The venue may have filled some, all or none of
+/// it. The caller must find out before it acts on this symbol again, for
+/// example by reading its position.
+///
+/// This is the one exception to the port's error rule: **an `Err` from
+/// [`CexExecutor::execute`] means nothing filled, unless it is an
+/// `OrderStateUnknown`.**
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderStateUnknown {
+    pub symbol: String,
+    /// The id this crate gave the order, which the venue can be asked about.
+    pub client_order_id: String,
+    /// `Some` if the venue acknowledged the order before contact was lost.
+    pub order_ref: Option<u64>,
+}
+
+impl std::fmt::Display for OrderStateUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the state of order {} on {} is unknown: it may have filled in part, in full or not at all",
+            self.client_order_id, self.symbol
+        )?;
+        if let Some(order_ref) = self.order_ref {
+            write!(f, " (venue order id {order_ref})")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for OrderStateUnknown {}
 
 #[derive(Debug, Clone)]
 pub struct CexFill {
@@ -55,6 +95,11 @@ pub trait CexExecutor: Send + Sync {
     /// than polling unnecessarily; fall back to a status query only when
     /// the placing call's own response is ambiguous (e.g. the connection
     /// was lost after the order was sent but before the response arrived).
+    ///
+    /// An `Err` means nothing filled, unless it is an [`OrderStateUnknown`].
+    /// After a venue accepts an order, a lost response, a failed status
+    /// query, or a fill whose details cannot be read all become
+    /// `OrderStateUnknown`, never a plain error.
     async fn execute(&self, req: &OrderRequest) -> Result<CexFill>;
 
     fn label(&self) -> &'static str;
