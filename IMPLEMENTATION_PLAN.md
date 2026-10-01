@@ -513,6 +513,21 @@ Order of work, each step compiled and tested before the next (V5 §11):
     `effectiveGasPrice` and `l1Fee` from the receipt into its cost; `EvmSimulated` reports none, and
     refuses a Solana route. 173 unit tests pass (167 before, 6 new); the five anvil tests pass with
     the same output as before the change, 100 lives reconciled to the wei.
+  - **Step 3 done.** `liquidity/mod.rs` is the contract: `LiquidityCommand`, `LiquidityEvent`,
+    `LiquidityReport`, `LiquidityCapabilities` (with `UNISWAP_V3` and `WHIRLPOOL`), and
+    `check_command`, the chain-free checks every venue makes, a paper model included. `EvmLiquidity`
+    (now `liquidity/uniswap_v3/`, built with its manager and `ManagerAbi`) reads the pool's tokens and
+    key from the pool and refuses a pool from another factory; it reads `positions(id)` and refuses a
+    `Remove` above the liquidity and a `Close` on a position that holds liquidity or owes tokens,
+    before sending. `LiquidityStub` keeps the position state its own events imply, so it refuses the
+    same. `liquidity_executor_contract` runs V5 §8's sequence (its rounding bound: one unit per token
+    per deposit). `Prepared::offline` gives a venue that runs nothing real its family's placeholder.
+    181 unit tests pass; on anvil the suite, the 100 lives (27 with a swap) and the injected failures
+    pass — the "Not cleared" burn is now an `Err` before sending, with no block mined. The consumer's
+    LP runner and paper model moved at the same time: its workspace tests (715 passed, 0 failed),
+    the replay goldens and `lp_golden` pass, and `lp_fork` on an Ethereum fork pinned at block
+    26,096,526 gives the same figures before and after (L 177916823714679017, minted
+    (13913933153331884, 1441119065980946), fee 1801218710 token1 units).
 
 ## Tracking
 
