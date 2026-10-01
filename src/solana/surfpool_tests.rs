@@ -12,7 +12,9 @@
 //! the public endpoints.
 
 use crate::dex::SolanaTransaction;
-use crate::solana::token::{associated_token_account, token_account_amount, MEMO_PROGRAM, TOKEN_PROGRAM};
+use crate::solana::token::{
+    associated_token_account, token_account_amount, MEMO_PROGRAM, TOKEN_PROGRAM,
+};
 use crate::solana::{SolanaRpc, SolanaSender, SolanaTxOutcome};
 use crate::{Network, Provenance};
 use solana_address::Address;

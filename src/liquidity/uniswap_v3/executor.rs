@@ -183,13 +183,21 @@ impl EvmLiquidity {
             }
         };
         let pool_factory = address(
-            self.read(pool_address, &pool::factoryCall {}.abi_encode(), "factory()")
-                .await?,
+            self.read(
+                pool_address,
+                &pool::factoryCall {}.abi_encode(),
+                "factory()",
+            )
+            .await?,
             "factory()",
         )?;
         let manager_factory = address(
-            self.read(self.manager, &manager::factoryCall {}.abi_encode(), "factory()")
-                .await?,
+            self.read(
+                self.manager,
+                &manager::factoryCall {}.abi_encode(),
+                "factory()",
+            )
+            .await?,
             "factory()",
         )?;
         if pool_factory != manager_factory {
@@ -254,7 +262,13 @@ impl EvmLiquidity {
         (self.sender.provenance() == Provenance::Landed).then(|| tx_hash.as_slice().to_vec())
     }
 
-    fn unsettled(&self, outcome: Outcome, cost: EvmCost, at: u64, tx_hash: B256) -> LiquidityReport {
+    fn unsettled(
+        &self,
+        outcome: Outcome,
+        cost: EvmCost,
+        at: u64,
+        tx_hash: B256,
+    ) -> LiquidityReport {
         LiquidityReport {
             outcome,
             event: None,
@@ -815,7 +829,11 @@ mod tests {
                     }
                     hex_data(&words)
                 } else if starts(pool::factoryCall::SELECTOR) {
-                    address_word(if to == POOL { chain.pool_factory } else { FACTORY })
+                    address_word(if to == POOL {
+                        chain.pool_factory
+                    } else {
+                        FACTORY
+                    })
                 } else if starts(pool::token0Call::SELECTOR) {
                     address_word(TOKEN0)
                 } else if starts(pool::token1Call::SELECTOR) {

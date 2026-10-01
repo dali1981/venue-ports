@@ -3,10 +3,14 @@
 /// one network and refuses a command for any other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Network {
-    Evm { chain_id: u64 },
+    Evm {
+        chain_id: u64,
+    },
     /// Identified by its genesis hash, which the adapter checks against its
     /// node at construction.
-    Solana { genesis_hash: [u8; 32] },
+    Solana {
+        genesis_hash: [u8; 32],
+    },
 }
 
 impl Network {
@@ -59,7 +63,10 @@ mod tests {
         let solana = Network::Solana {
             genesis_hash: mainnet.to_bytes(),
         };
-        assert_eq!(solana.to_string(), "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp");
+        assert_eq!(
+            solana.to_string(),
+            "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+        );
         assert_eq!(solana.chain_id(), None);
         assert_eq!(solana.address_len(), 32);
     }

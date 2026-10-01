@@ -267,7 +267,9 @@ impl LiquidityExecutor for LiquidityStub {
             command: command.clone(),
         });
         let Some(command) = command else {
-            bail!("LiquidityStub has no programmed outcome for a Prepared value it did not prepare");
+            bail!(
+                "LiquidityStub has no programmed outcome for a Prepared value it did not prepare"
+            );
         };
         let report = match self.programmed.lock().unwrap().pop_front() {
             Some(Programmed::Exact(result)) => result?,
@@ -428,8 +430,14 @@ mod tests {
             1,
         );
         run(&stub, &open()).await;
-        assert!(stub.prepare(&close, &req).await.is_err(), "it holds liquidity");
-        assert!(stub.prepare(&remove(501), &req).await.is_err(), "above its liquidity");
+        assert!(
+            stub.prepare(&close, &req).await.is_err(),
+            "it holds liquidity"
+        );
+        assert!(
+            stub.prepare(&remove(501), &req).await.is_err(),
+            "above its liquidity"
+        );
 
         stub.program_event(
             LiquidityEvent::Removed {
@@ -440,7 +448,10 @@ mod tests {
             2,
         );
         run(&stub, &remove(500)).await;
-        assert!(stub.prepare(&close, &req).await.is_err(), "it owes what it released");
+        assert!(
+            stub.prepare(&close, &req).await.is_err(),
+            "it owes what it released"
+        );
 
         stub.program_event(
             LiquidityEvent::Collected {
@@ -451,7 +462,10 @@ mod tests {
         run(&stub, &collect).await;
         stub.program_event(LiquidityEvent::Closed, 4);
         run(&stub, &close).await;
-        assert!(stub.prepare(&close, &req).await.is_err(), "closed, so no longer held");
+        assert!(
+            stub.prepare(&close, &req).await.is_err(),
+            "closed, so no longer held"
+        );
     }
 
     #[tokio::test]

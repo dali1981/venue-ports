@@ -12,8 +12,7 @@
 //! ([`TxCost::none_for`]); [`DexStub::program_execute`] sets one exactly.
 
 use crate::dex::{
-    ChainAmount, DexExecutor, EvmCall, Outcome, Prepared, Realised, RouteQuote, SwapRequest,
-    TxCost,
+    ChainAmount, DexExecutor, EvmCall, Outcome, Prepared, Realised, RouteQuote, SwapRequest, TxCost,
 };
 use crate::{Network, Provenance};
 use anyhow::{anyhow, Result};
@@ -67,11 +66,14 @@ impl DexStub {
     }
 
     fn program_shaped(&self, amount_out: Option<ChainAmount>, outcome: Outcome, at: u64) {
-        self.programmed.lock().unwrap().push_back(Programmed::Shaped {
-            amount_out,
-            outcome,
-            at,
-        });
+        self.programmed
+            .lock()
+            .unwrap()
+            .push_back(Programmed::Shaped {
+                amount_out,
+                outcome,
+                at,
+            });
     }
 
     /// Program a successful swap.

@@ -41,13 +41,13 @@
 //! [`EvmSender::ensure_balance`] writes it there.
 
 use crate::dex::{
-    ChainAmount, DexExecutor, EvmCall, EvmCost, Outcome, Prepared, Realised, RouteQuote, SwapRequest,
-    TxCost,
+    ChainAmount, DexExecutor, EvmCall, EvmCost, Outcome, Prepared, Realised, RouteQuote,
+    SwapRequest, TxCost,
 };
-use crate::Network;
 use crate::evm::erc20;
 use crate::evm::rpc::address_from_slice;
 use crate::evm::{prepared_key, EvmSender, RpcLog, TxOutcome};
+use crate::Network;
 use crate::Provenance;
 use alloy_primitives::{Address, B256, U256};
 use anyhow::{anyhow, bail, Context, Result};

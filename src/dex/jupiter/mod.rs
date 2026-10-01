@@ -98,8 +98,8 @@ struct Quote {
 }
 
 fn read_quote(route: &RouteQuote) -> Result<Quote> {
-    let mut body: Value =
-        serde_json::from_slice(&route.payload).context("the route's payload is not Jupiter's quote")?;
+    let mut body: Value = serde_json::from_slice(&route.payload)
+        .context("the route's payload is not Jupiter's quote")?;
     let text = |name: &str| -> Result<String> {
         body.get(name)
             .and_then(Value::as_str)
@@ -113,11 +113,15 @@ fn read_quote(route: &RouteQuote) -> Result<Quote> {
     };
     let input_mint = crate::solana::rpc::parse_address(&text("inputMint")?)?;
     let output_mint = crate::solana::rpc::parse_address(&text("outputMint")?)?;
-    if input_mint.as_ref() != route.token_in.as_slice() || output_mint.as_ref() != route.token_out.as_slice() {
+    if input_mint.as_ref() != route.token_in.as_slice()
+        || output_mint.as_ref() != route.token_out.as_slice()
+    {
         bail!("the route's tokens are not its quote's ({input_mint} to {output_mint})");
     }
     let (in_amount, out_amount) = (number("inAmount")?, number("outAmount")?);
-    if u128::from(in_amount) != route.amount_in || u128::from(out_amount) != route.expected_amount_out {
+    if u128::from(in_amount) != route.amount_in
+        || u128::from(out_amount) != route.expected_amount_out
+    {
         bail!(
             "the route's amounts ({} in, {} out) are not its quote's ({in_amount}, {out_amount})",
             route.amount_in,
@@ -152,7 +156,11 @@ struct Built {
     destination: Destination,
 }
 
-fn check_request(network: Network, route: &RouteQuote, req: &SwapRequest) -> Result<(Address, Address)> {
+fn check_request(
+    network: Network,
+    route: &RouteQuote,
+    req: &SwapRequest,
+) -> Result<(Address, Address)> {
     if route.network != network {
         bail!(
             "the route is for network {}, but this Jupiter adapter's node is on {network}",
@@ -189,8 +197,10 @@ async fn build(
         .map_err(|_| anyhow!("a Solana amount is a u64; {} is not", req.min_amount_out))?;
     let bps = slippage_bps_for(quote.out_amount, min_out)?;
     quote.body["slippageBps"] = json!(bps);
-    quote.body["otherAmountThreshold"] =
-        json!((u128::from(quote.out_amount) * u128::from(10_000 - u64::from(bps)) / 10_000).to_string());
+    quote.body["otherAmountThreshold"] = json!((u128::from(quote.out_amount)
+        * u128::from(10_000 - u64::from(bps))
+        / 10_000)
+        .to_string());
 
     let program = token_program_of(rpc, &quote.output_mint).await?;
     let account = associated_token_account(&recipient, &quote.output_mint, &program);
@@ -278,10 +288,17 @@ mod tests {
         // Rounding toward safety on a small quote: 1 177 574 × 9 950 / 10 000
         // = 1 171 686.13 → 1 171 686, below 1 171 687; so 49 bps, not 50.
         assert_eq!(slippage_bps_for(1_177_574, 1_171_687).unwrap(), 49);
-        for (quoted, min) in [(1_177_574u64, 1_171_687u64), (7, 3), (u64::MAX, u64::MAX / 3)] {
+        for (quoted, min) in [
+            (1_177_574u64, 1_171_687u64),
+            (7, 3),
+            (u64::MAX, u64::MAX / 3),
+        ] {
             let bps = u64::from(slippage_bps_for(quoted, min).unwrap());
             let at = |b: u64| (u128::from(quoted) * u128::from(10_000 - b) / 10_000) as u64;
-            assert!(at(bps) >= min && (bps == 10_000 || at(bps + 1) < min), "{quoted} {min} {bps}");
+            assert!(
+                at(bps) >= min && (bps == 10_000 || at(bps + 1) < min),
+                "{quoted} {min} {bps}"
+            );
         }
         assert!(slippage_bps_for(10, 11).is_err());
     }

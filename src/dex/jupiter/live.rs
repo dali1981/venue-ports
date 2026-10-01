@@ -11,10 +11,12 @@
 //! transaction's meta: the destination token account's balance after, less
 //! before.
 
-use crate::dex::jupiter::{build, check_request, http_client, message_key, Destination, JupiterConfig};
+use crate::dex::jupiter::{
+    build, check_request, http_client, message_key, Destination, JupiterConfig,
+};
 use crate::dex::{
-    DexExecutor, Outcome, Prepared, Realised, RouteQuote, SolanaCost, SolanaTransaction, SwapRequest,
-    TxCost,
+    DexExecutor, Outcome, Prepared, Realised, RouteQuote, SolanaCost, SolanaTransaction,
+    SwapRequest, TxCost,
 };
 use crate::solana::{SolanaSender, SolanaTxOutcome};
 use crate::Provenance;
@@ -49,7 +51,13 @@ impl JupiterLive {
         (self.sender.provenance() == Provenance::Landed).then(|| signature.to_vec())
     }
 
-    fn unsettled(&self, outcome: Outcome, cost: SolanaCost, at: u64, signature: [u8; 64]) -> Realised {
+    fn unsettled(
+        &self,
+        outcome: Outcome,
+        cost: SolanaCost,
+        at: u64,
+        signature: [u8; 64],
+    ) -> Realised {
         Realised {
             amount_out: None,
             outcome,

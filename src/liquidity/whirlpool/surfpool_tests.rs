@@ -27,7 +27,13 @@ fn surfpool() -> Option<SolanaRpc> {
 /// The pool's current tick and sqrt price (Q64.64), read from its account.
 async fn pool_now(rpc: &SolanaRpc) -> (i32, u128) {
     let pool: Address = POOL.parse().unwrap();
-    let account = rpc.multiple_accounts(&[pool]).await.unwrap().pop().flatten().unwrap();
+    let account = rpc
+        .multiple_accounts(&[pool])
+        .await
+        .unwrap()
+        .pop()
+        .flatten()
+        .unwrap();
     let state = orca_whirlpools_client::Whirlpool::from_bytes(&account.data).unwrap();
     (state.tick_current_index, state.sqrt_price)
 }
@@ -91,7 +97,10 @@ async fn against_surfpool_whirlpool_rent_is_deposited_on_open_and_returned_on_cl
             let TxCost::Solana(cost) = report.cost else {
                 panic!("{:?}", report.cost)
             };
-            assert!(cost.fee_lamports >= 5_000 && cost.units_consumed > 0, "{cost:?}");
+            assert!(
+                cost.fee_lamports >= 5_000 && cost.units_consumed > 0,
+                "{cost:?}"
+            );
             (report.event.expect("a success"), cost)
         }
     };
@@ -100,7 +109,12 @@ async fn against_surfpool_whirlpool_rent_is_deposited_on_open_and_returned_on_cl
         deposit: Deposit { max: f.open, guard },
     })
     .await;
-    let LiquidityEvent::Opened { position, liquidity, paid } = opened else {
+    let LiquidityEvent::Opened {
+        position,
+        liquidity,
+        paid,
+    } = opened
+    else {
         panic!("{opened:?}")
     };
     assert!(open_cost.rent_deposited_lamports > 0, "{open_cost:?}");
@@ -110,7 +124,10 @@ async fn against_surfpool_whirlpool_rent_is_deposited_on_open_and_returned_on_cl
         min_out: TokenPair::default(),
     })
     .await;
-    let (collected, _) = run(LiquidityCommand::Collect { position: position.clone() }).await;
+    let (collected, _) = run(LiquidityCommand::Collect {
+        position: position.clone(),
+    })
+    .await;
     let (closed, close_cost) = run(LiquidityCommand::Close { position }).await;
     assert_eq!(closed, LiquidityEvent::Closed);
     assert_eq!(
@@ -143,7 +160,8 @@ async fn against_surfpool_whirlpool_open_creates_a_missing_tick_array_and_spends
     let mut start = tick.div_euclid(88) * 88 + 20 * 88;
     loop {
         let (array, _) =
-            orca_whirlpools_client::get_tick_array_address(&pool, start, Some(WHIRLPOOL_PROGRAM)).unwrap();
+            orca_whirlpools_client::get_tick_array_address(&pool, start, Some(WHIRLPOOL_PROGRAM))
+                .unwrap();
         if rpc.multiple_accounts(&[array]).await.unwrap()[0].is_none() {
             break;
         }
@@ -164,15 +182,29 @@ async fn against_surfpool_whirlpool_open_creates_a_missing_tick_array_and_spends
             guard,
         },
     };
-    let report = venue.execute(&venue.prepare(&open, &f.request).await.unwrap()).await.unwrap();
-    let Some(LiquidityEvent::Opened { position, liquidity, paid }) = report.event.clone() else {
+    let report = venue
+        .execute(&venue.prepare(&open, &f.request).await.unwrap())
+        .await
+        .unwrap();
+    let Some(LiquidityEvent::Opened {
+        position,
+        liquidity,
+        paid,
+    }) = report.event.clone()
+    else {
         panic!("{report:?}")
     };
     let TxCost::Solana(open_cost) = report.cost else {
         panic!("{:?}", report.cost)
     };
-    assert!(open_cost.rent_spent_lamports > 0, "the new tick array's rent: {open_cost:?}");
-    assert!(paid.token0 > 0 && paid.token1 == 0, "above the price, only token A: {paid:?}");
+    assert!(
+        open_cost.rent_spent_lamports > 0,
+        "the new tick array's rent: {open_cost:?}"
+    );
+    assert!(
+        paid.token0 > 0 && paid.token1 == 0,
+        "above the price, only token A: {paid:?}"
+    );
     let mut costs = vec![open_cost];
     for cmd in [
         LiquidityCommand::Remove {
@@ -180,10 +212,15 @@ async fn against_surfpool_whirlpool_open_creates_a_missing_tick_array_and_spends
             liquidity,
             min_out: TokenPair::default(),
         },
-        LiquidityCommand::Collect { position: position.clone() },
+        LiquidityCommand::Collect {
+            position: position.clone(),
+        },
         LiquidityCommand::Close { position },
     ] {
-        let report = venue.execute(&venue.prepare(&cmd, &f.request).await.unwrap()).await.unwrap();
+        let report = venue
+            .execute(&venue.prepare(&cmd, &f.request).await.unwrap())
+            .await
+            .unwrap();
         let TxCost::Solana(cost) = report.cost else {
             panic!("{:?}", report.cost)
         };
@@ -192,8 +229,12 @@ async fn against_surfpool_whirlpool_open_creates_a_missing_tick_array_and_spends
     // Out of pocket over the life: exactly what the tick array the Open
     // created still holds (the ticks' rent came back through the position).
     let (array, _) =
-        orca_whirlpools_client::get_tick_array_address(&pool, start, Some(WHIRLPOOL_PROGRAM)).unwrap();
-    let held = rpc.multiple_accounts(&[array]).await.unwrap()[0].clone().unwrap().lamports;
+        orca_whirlpools_client::get_tick_array_address(&pool, start, Some(WHIRLPOOL_PROGRAM))
+            .unwrap();
+    let held = rpc.multiple_accounts(&[array]).await.unwrap()[0]
+        .clone()
+        .unwrap()
+        .lamports;
     let net: i128 = costs
         .iter()
         .map(|c| {

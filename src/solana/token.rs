@@ -18,7 +18,11 @@ pub const MEMO_PROGRAM: Address =
     Address::from_str_const("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 
 /// `owner`'s associated token account for `mint` under `token_program`.
-pub fn associated_token_account(owner: &Address, mint: &Address, token_program: &Address) -> Address {
+pub fn associated_token_account(
+    owner: &Address,
+    mint: &Address,
+    token_program: &Address,
+) -> Address {
     Address::find_program_address(
         &[owner.as_ref(), token_program.as_ref(), mint.as_ref()],
         &ASSOCIATED_TOKEN_PROGRAM,
@@ -60,8 +64,12 @@ mod tests {
     /// `spl-associated-token-account` derives it.
     #[test]
     fn derives_the_associated_token_account() {
-        let owner: Address = "DzuFuBM9JeCZiDZ3NFF5DktduNKVSwdMdbeb1MJFRRov".parse().unwrap();
-        let usdc: Address = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".parse().unwrap();
+        let owner: Address = "DzuFuBM9JeCZiDZ3NFF5DktduNKVSwdMdbeb1MJFRRov"
+            .parse()
+            .unwrap();
+        let usdc: Address = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+            .parse()
+            .unwrap();
         assert_eq!(
             associated_token_account(&owner, &usdc, &TOKEN_PROGRAM).to_string(),
             "85BzAkMpW4bCL7w4zZDKWXsaM7mPdDdwrPpp6px7H1So"

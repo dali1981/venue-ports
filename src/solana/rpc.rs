@@ -185,7 +185,10 @@ impl SolanaRpc {
 
     pub async fn genesis_hash(&self) -> Result<[u8; 32]> {
         let hash = self.call("getGenesisHash", json!([])).await?;
-        decode_32(hash.as_str().ok_or_else(|| anyhow!("getGenesisHash: {hash}"))?)
+        decode_32(
+            hash.as_str()
+                .ok_or_else(|| anyhow!("getGenesisHash: {hash}"))?,
+        )
     }
 
     /// A blockhash at `confirmed`, and the last block height it is valid at.
@@ -215,7 +218,9 @@ impl SolanaRpc {
 
     /// The current slot at `confirmed`.
     pub async fn slot(&self) -> Result<u64> {
-        let slot = self.call("getSlot", json!([{ "commitment": "confirmed" }])).await?;
+        let slot = self
+            .call("getSlot", json!([{ "commitment": "confirmed" }]))
+            .await?;
         slot.as_u64().ok_or_else(|| anyhow!("getSlot: {slot}"))
     }
 
@@ -242,7 +247,10 @@ impl SolanaRpc {
     }
 
     /// The statuses of `signatures`, `None` for one the node has not seen.
-    pub async fn signature_statuses(&self, signatures: &[String]) -> Result<Vec<Option<SignatureStatus>>> {
+    pub async fn signature_statuses(
+        &self,
+        signatures: &[String],
+    ) -> Result<Vec<Option<SignatureStatus>>> {
         let result = self
             .call(
                 "getSignatureStatuses",
@@ -322,13 +330,20 @@ impl SolanaRpc {
             post_token_balances: token_balances(&meta["postTokenBalances"])?,
             log_messages: meta["logMessages"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|l| l.as_str().map(str::to_string)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|l| l.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default(),
         }))
     }
 
     /// `accounts` at `confirmed`, `None` for one that does not exist.
-    pub async fn multiple_accounts(&self, accounts: &[Address]) -> Result<Vec<Option<AccountData>>> {
+    pub async fn multiple_accounts(
+        &self,
+        accounts: &[Address],
+    ) -> Result<Vec<Option<AccountData>>> {
         let keys: Vec<String> = accounts.iter().map(|a| a.to_string()).collect();
         let mut out = Vec::with_capacity(keys.len());
         // The node's limit is 100 keys a call.
@@ -385,7 +400,11 @@ impl SolanaRpc {
             units_consumed: value["unitsConsumed"].as_u64().unwrap_or(0),
             logs: value["logs"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|l| l.as_str().map(str::to_string)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|l| l.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default(),
             accounts,
         })

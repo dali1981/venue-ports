@@ -127,7 +127,9 @@ impl Prepared {
         match self {
             Prepared::Solana(tx) => Ok(tx),
             Prepared::Evm(_) => {
-                bail!("an EVM call was handed to a Solana adapter: it runs Solana transactions only")
+                bail!(
+                    "an EVM call was handed to a Solana adapter: it runs Solana transactions only"
+                )
             }
         }
     }
@@ -307,7 +309,10 @@ mod tests {
                 ..NativeCost::default()
             }
         );
-        assert_eq!(TxCost::Evm(EvmCost::default()).native(), NativeCost::default());
+        assert_eq!(
+            TxCost::Evm(EvmCost::default()).native(),
+            NativeCost::default()
+        );
     }
 
     #[test]
@@ -339,6 +344,9 @@ mod tests {
         });
         assert!(evm.evm_call().is_ok());
         let err = evm.solana_transaction().unwrap_err().to_string();
-        assert!(err.contains("EVM call") && err.contains("Solana adapter"), "{err}");
+        assert!(
+            err.contains("EVM call") && err.contains("Solana adapter"),
+            "{err}"
+        );
     }
 }

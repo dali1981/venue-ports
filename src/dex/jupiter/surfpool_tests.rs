@@ -47,7 +47,10 @@ async fn quote(config: &JupiterConfig) -> Value {
         request = request.header("x-api-key", key);
     }
     let quote: Value = request.send().await.unwrap().json().await.unwrap();
-    assert!(quote.get("outAmount").is_some(), "Jupiter quoted nothing: {quote}");
+    assert!(
+        quote.get("outAmount").is_some(),
+        "Jupiter quoted nothing: {quote}"
+    );
     tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
     quote
 }
@@ -104,7 +107,9 @@ async fn against_surfpool_jupiter_simulated_satisfies_the_dex_contract() {
         .ensure_balance(usdc.to_bytes(), TOKEN_PROGRAM.to_bytes(), AMOUNT_IN)
         .await
         .unwrap();
-    let adapter = JupiterSimulated::connect(rpc, config.clone()).await.unwrap();
+    let adapter = JupiterSimulated::connect(rpc, config.clone())
+        .await
+        .unwrap();
     assert_eq!(adapter.label(), "jupiter-simulated");
 
     let q = quote(&config).await;
@@ -123,7 +128,10 @@ async fn against_surfpool_jupiter_simulated_satisfies_the_dex_contract() {
     let q = quote(&config).await;
     let r = route(funded.network(), &q);
     let min = r.expected_amount_out * 99 / 100;
-    let prepared = adapter.prepare(&r, &request(&funded.pubkey(), min)).await.unwrap();
+    let prepared = adapter
+        .prepare(&r, &request(&funded.pubkey(), min))
+        .await
+        .unwrap();
     let (quoted, bps) = instruction_bps(&prepared);
     assert_eq!(u128::from(quoted), r.expected_amount_out);
     assert_eq!(bps, slippage_bps_for(quoted, min as u64).unwrap());
@@ -134,7 +142,10 @@ async fn against_surfpool_jupiter_simulated_satisfies_the_dex_contract() {
     let TxCost::Solana(cost) = &realised.cost else {
         panic!("{:?}", realised.cost)
     };
-    assert!(cost.units_consumed > 0 && cost.fee_lamports >= 5_000, "{cost:?}");
+    assert!(
+        cost.units_consumed > 0 && cost.fee_lamports >= 5_000,
+        "{cost:?}"
+    );
     assert_eq!(realised.provenance, Provenance::Simulated);
     eprintln!(
         "jupiter-simulated: {AMOUNT_IN} USDC units quoted {} wSOL units, simulated {out}, \

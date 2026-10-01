@@ -194,8 +194,13 @@ impl WhirlpoolLiquidity {
             .pop()
             .flatten()
             .ok_or_else(|| anyhow!("pool {address} does not exist"))?;
-        if account.owner != self.program || !account.data.starts_with(&orca::WHIRLPOOL_DISCRIMINATOR) {
-            bail!("{address} is not a pool of the Whirlpool program {}", self.program);
+        if account.owner != self.program
+            || !account.data.starts_with(&orca::WHIRLPOOL_DISCRIMINATOR)
+        {
+            bail!(
+                "{address} is not a pool of the Whirlpool program {}",
+                self.program
+            );
         }
         let pool = orca::Whirlpool::from_bytes(&account.data)
             .with_context(|| format!("decoding pool {address}"))?;
@@ -211,7 +216,10 @@ impl WhirlpoolLiquidity {
                 .flatten()
                 .ok_or_else(|| anyhow!("pool {address}'s mint {i} does not exist"))?;
             if mint.owner != TOKEN_PROGRAM && mint.owner != TOKEN_2022_PROGRAM {
-                bail!("pool {address}'s mint {i} is owned by {}, not by a token program", mint.owner);
+                bail!(
+                    "pool {address}'s mint {i} is owned by {}, not by a token program",
+                    mint.owner
+                );
             }
             Ok(mint.owner)
         };
@@ -236,14 +244,23 @@ impl WhirlpoolLiquidity {
                 self.network()
             );
         }
-        let mint = address_from_slice(&id.bytes).context("a Whirlpool position is its 32-byte mint")?;
+        let mint =
+            address_from_slice(&id.bytes).context("a Whirlpool position is its 32-byte mint")?;
         let address = position_address(&mint, &self.program)?;
-        let accounts = self.sender.rpc().multiple_accounts(&[address, mint]).await?;
+        let accounts = self
+            .sender
+            .rpc()
+            .multiple_accounts(&[address, mint])
+            .await?;
         let account = accounts[0]
             .clone()
             .ok_or_else(|| anyhow!("position {mint} does not exist (no account at {address})"))?;
-        if account.owner != self.program || !account.data.starts_with(&orca::POSITION_DISCRIMINATOR) {
-            bail!("{address} is not a position of the Whirlpool program {}", self.program);
+        if account.owner != self.program || !account.data.starts_with(&orca::POSITION_DISCRIMINATOR)
+        {
+            bail!(
+                "{address} is not a position of the Whirlpool program {}",
+                self.program
+            );
         }
         let state = orca::Position::from_bytes(&account.data)
             .with_context(|| format!("decoding position {address}"))?;
@@ -252,7 +269,14 @@ impl WhirlpoolLiquidity {
             .map(|m| m.owner)
             .ok_or_else(|| anyhow!("position mint {mint} does not exist"))?;
         let token_account = associated_token_account(&owner, &mint, &token_program);
-        let held = match self.sender.rpc().multiple_accounts(&[token_account]).await?.pop().flatten() {
+        let held = match self
+            .sender
+            .rpc()
+            .multiple_accounts(&[token_account])
+            .await?
+            .pop()
+            .flatten()
+        {
             Some(data) => token_account_amount(&data)?,
             None => 0,
         };
@@ -276,17 +300,15 @@ impl WhirlpoolLiquidity {
     fn tick_arrays(&self, pool: &Pool, lower: i32, upper: i32) -> Result<[(i32, Address); 2]> {
         let at = |tick: i32| -> Result<(i32, Address)> {
             let start = tick_array_start(tick, pool.tick_spacing);
-            Ok((start, tick_array_address(&pool.address, start, &self.program)?))
+            Ok((
+                start,
+                tick_array_address(&pool.address, start, &self.program)?,
+            ))
         };
         Ok([at(lower)?, at(upper)?])
     }
 
-    fn increase(
-        &self,
-        ctx: &PendingCommand,
-        max: (u64, u64),
-        band: (u128, u128),
-    ) -> Instruction {
+    fn increase(&self, ctx: &PendingCommand, max: (u64, u64), band: (u128, u128)) -> Instruction {
         let (owner_a, owner_b) = ctx.owner_accounts();
         orca::IncreaseLiquidityByTokenAmountsV2 {
             whirlpool: ctx.pool.address,
@@ -338,11 +360,16 @@ impl WhirlpoolLiquidity {
             let slot = message.static_account_keys()[..required]
                 .iter()
                 .position(|k| *k == key.pubkey())
-                .ok_or_else(|| anyhow!("the transaction needs no signature from {}", key.pubkey()))?;
+                .ok_or_else(|| {
+                    anyhow!("the transaction needs no signature from {}", key.pubkey())
+                })?;
             signatures[slot] = key.sign_message(&message.serialize());
         }
         Ok(SolanaTransaction {
-            transaction: VersionedTransaction { signatures, message },
+            transaction: VersionedTransaction {
+                signatures,
+                message,
+            },
             last_valid_block_height,
         })
     }
@@ -351,7 +378,13 @@ impl WhirlpoolLiquidity {
         (self.sender.provenance() == Provenance::Landed).then(|| signature.to_vec())
     }
 
-    fn unsettled(&self, outcome: Outcome, cost: SolanaCost, at: u64, signature: [u8; 64]) -> LiquidityReport {
+    fn unsettled(
+        &self,
+        outcome: Outcome,
+        cost: SolanaCost,
+        at: u64,
+        signature: [u8; 64],
+    ) -> LiquidityReport {
         LiquidityReport {
             outcome,
             event: None,
@@ -470,7 +503,9 @@ fn read_event(
                 .and_then(|i| meta.post_balances.get(i))
                 .ok_or("the position's account is not in the transaction")?;
             if *left != 0 {
-                return Err(format!("the position's account still holds {left} lamports"));
+                return Err(format!(
+                    "the position's account still holds {left} lamports"
+                ));
             }
             Ok(LiquidityEvent::Closed)
         }
@@ -519,9 +554,16 @@ fn rent(ctx: &PendingCommand, meta: &TxMeta) -> (u64, u64, u64) {
 /// The owner paid the fee and the rent, and received what was returned,
 /// and nothing else moved its lamports: otherwise an account this adapter
 /// does not know of took or gave rent, and the figures are not to be trusted.
-fn check_lamports(ctx: &PendingCommand, meta: &TxMeta, rent: (u64, u64, u64)) -> std::result::Result<(), String> {
+fn check_lamports(
+    ctx: &PendingCommand,
+    meta: &TxMeta,
+    rent: (u64, u64, u64),
+) -> std::result::Result<(), String> {
     let (deposited, spent, returned) = rent;
-    let expected = i128::from(returned) - i128::from(meta.fee_lamports) - i128::from(deposited) - i128::from(spent);
+    let expected = i128::from(returned)
+        - i128::from(meta.fee_lamports)
+        - i128::from(deposited)
+        - i128::from(spent);
     let moved = meta
         .lamports_delta(&ctx.owner)
         .ok_or("the owner is not in the transaction")?;
@@ -667,23 +709,29 @@ impl LiquidityExecutor for WhirlpoolLiquidity {
                 self.network()
             );
         }
-        let pending = |kind, pool, position: &Position, arrays: [(i32, Address); 2], max| PendingCommand {
-            kind,
-            deadline_unix_secs: req.deadline_unix_secs,
-            pool,
-            owner,
-            position: position.address,
-            position_mint: position.mint,
-            position_token_account: position.token_account,
-            tick_arrays: [arrays[0].1, arrays[1].1],
-            max,
-        };
+        let pending =
+            |kind, pool, position: &Position, arrays: [(i32, Address); 2], max| PendingCommand {
+                kind,
+                deadline_unix_secs: req.deadline_unix_secs,
+                pool,
+                owner,
+                position: position.address,
+                position_mint: position.mint,
+                position_token_account: position.token_account,
+                tick_arrays: [arrays[0].1, arrays[1].1],
+                max,
+            };
 
         let (instructions, co_signer, ctx) = match cmd {
             LiquidityCommand::Open { range, deposit } => {
-                let pool = self.pool(address_from_slice(&range.pool).context("Range.pool")?).await?;
+                let pool = self
+                    .pool(address_from_slice(&range.pool).context("Range.pool")?)
+                    .await?;
                 let spacing = i32::from(pool.tick_spacing);
-                for (name, tick) in [("tick_lower", range.tick_lower), ("tick_upper", range.tick_upper)] {
+                for (name, tick) in [
+                    ("tick_lower", range.tick_lower),
+                    ("tick_upper", range.tick_upper),
+                ] {
                     if tick % spacing != 0 || !(MIN_TICK..=MAX_TICK).contains(&tick) {
                         bail!(
                             "{name} {tick} is not a tick of pool {}: a multiple of its spacing ({spacing}) \
@@ -700,7 +748,11 @@ impl LiquidityExecutor for WhirlpoolLiquidity {
                 let position = Position {
                     address: position_address(&mint.pubkey(), &self.program)?,
                     mint: mint.pubkey(),
-                    token_account: associated_token_account(&owner, &mint.pubkey(), &TOKEN_2022_PROGRAM),
+                    token_account: associated_token_account(
+                        &owner,
+                        &mint.pubkey(),
+                        &TOKEN_2022_PROGRAM,
+                    ),
                     token_program: TOKEN_2022_PROGRAM,
                     whirlpool: pool.address,
                     tick_lower: range.tick_lower,
@@ -727,10 +779,12 @@ impl LiquidityExecutor for WhirlpoolLiquidity {
                                 tick_array: *address,
                                 system_program: SYSTEM_PROGRAM,
                             }
-                            .instruction(orca::InitializeDynamicTickArrayInstructionArgs {
-                                start_tick_index: *start,
-                                idempotent: true,
-                            }),
+                            .instruction(
+                                orca::InitializeDynamicTickArrayInstructionArgs {
+                                    start_tick_index: *start,
+                                    idempotent: true,
+                                },
+                            ),
                         );
                     }
                 }
@@ -747,11 +801,13 @@ impl LiquidityExecutor for WhirlpoolLiquidity {
                         associated_token_program: ASSOCIATED_TOKEN_PROGRAM,
                         metadata_update_auth: METADATA_UPDATE_AUTH,
                     }
-                    .instruction(orca::OpenPositionWithTokenExtensionsInstructionArgs {
-                        tick_lower_index: range.tick_lower,
-                        tick_upper_index: range.tick_upper,
-                        with_token_metadata_extension: false,
-                    }),
+                    .instruction(
+                        orca::OpenPositionWithTokenExtensionsInstructionArgs {
+                            tick_lower_index: range.tick_lower,
+                            tick_upper_index: range.tick_upper,
+                            with_token_metadata_extension: false,
+                        },
+                    ),
                 );
                 instructions.push(self.increase(&ctx, max, band(deposit)));
                 (instructions, Some(mint), ctx)
@@ -984,7 +1040,9 @@ mod tests {
     use super::*;
     use crate::solana::rpc::TokenBalance;
 
-    const NETWORK: Network = Network::Solana { genesis_hash: [1; 32] };
+    const NETWORK: Network = Network::Solana {
+        genesis_hash: [1; 32],
+    };
 
     #[test]
     fn a_tick_array_starts_at_the_multiple_of_its_span_at_or_below_the_tick() {
@@ -1003,13 +1061,19 @@ mod tests {
     fn the_event_discriminator_is_the_one_the_program_logs() {
         // The first eight bytes of a `Traded` event a Whirlpool swap logged
         // on mainnet, 1 October 2026.
-        assert_eq!(event_discriminator("Traded"), [0xe1, 0xca, 0x49, 0xaf, 0x93, 0x2b, 0xa0, 0x96]);
+        assert_eq!(
+            event_discriminator("Traded"),
+            [0xe1, 0xca, 0x49, 0xaf, 0x93, 0x2b, 0xa0, 0x96]
+        );
     }
 
     fn logged(name: &str, body: impl borsh::BorshSerialize) -> String {
         let mut bytes = event_discriminator(name).to_vec();
         bytes.extend(borsh::to_vec(&body).unwrap());
-        format!("Program data: {}", base64::engine::general_purpose::STANDARD.encode(bytes))
+        format!(
+            "Program data: {}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )
     }
 
     #[test]
@@ -1073,7 +1137,12 @@ mod tests {
 
     /// A meta whose accounts are `keys`, with these lamports and these
     /// token amounts before and after.
-    fn meta(keys: Vec<Address>, lamports: Vec<(u64, u64)>, tokens: Vec<(usize, u64, u64)>, logs: Vec<String>) -> TxMeta {
+    fn meta(
+        keys: Vec<Address>,
+        lamports: Vec<(u64, u64)>,
+        tokens: Vec<(usize, u64, u64)>,
+        logs: Vec<String>,
+    ) -> TxMeta {
         let balance = |i: usize, amount: u64| TokenBalance {
             account_index: i,
             mint: Address::new_unique(),
@@ -1134,9 +1203,23 @@ mod tests {
             ctx.tick_arrays[1],
         ];
         // The owner pays the fee (10,000), the deposit and the new tick array.
-        let lamports = vec![(20_000_000, 11_595_760), (1, 1), (1, 1), (0, 2_394_240), (0, 3_000_000), (0, 2_000_000), (100, 100), (0, 1_000_000)];
+        let lamports = vec![
+            (20_000_000, 11_595_760),
+            (1, 1),
+            (1, 1),
+            (0, 2_394_240),
+            (0, 3_000_000),
+            (0, 2_000_000),
+            (100, 100),
+            (0, 1_000_000),
+        ];
         let tokens = vec![(1, 100, 90), (2, 50, 43)];
-        let m = meta(keys.clone(), lamports.clone(), tokens.clone(), vec![opened.clone(), increased(10)]);
+        let m = meta(
+            keys.clone(),
+            lamports.clone(),
+            tokens.clone(),
+            vec![opened.clone(), increased(10)],
+        );
         let liquidity = read_event(NETWORK, &ctx, &m).unwrap();
         assert_eq!(
             liquidity,
@@ -1150,19 +1233,33 @@ mod tests {
             }
         );
         // Position accounts gained a deposit; one tick array was created.
-        assert_eq!(rent(&ctx, &m), (2_394_240 + 3_000_000 + 2_000_000, 1_000_000, 0));
+        assert_eq!(
+            rent(&ctx, &m),
+            (2_394_240 + 3_000_000 + 2_000_000, 1_000_000, 0)
+        );
         check_lamports(&ctx, &m, rent(&ctx, &m)).unwrap();
         // A lamport the figures do not account for.
         let mut off = m.clone();
         off.post_balances[0] -= 1;
-        assert!(check_lamports(&ctx, &off, rent(&ctx, &off)).unwrap_err().contains("moved by"));
+        assert!(check_lamports(&ctx, &off, rent(&ctx, &off))
+            .unwrap_err()
+            .contains("moved by"));
 
         // The program says 11 went in, the owner sent 10: not a number to trust.
-        let m = meta(keys.clone(), lamports.clone(), tokens.clone(), vec![opened, increased(11)]);
-        assert!(read_event(NETWORK, &ctx, &m).unwrap_err().contains("sent 10"));
+        let m = meta(
+            keys.clone(),
+            lamports.clone(),
+            tokens.clone(),
+            vec![opened, increased(11)],
+        );
+        assert!(read_event(NETWORK, &ctx, &m)
+            .unwrap_err()
+            .contains("sent 10"));
         // No PositionOpened: the new position is not shown to exist.
         let m = meta(keys, lamports, tokens, vec![increased(10)]);
-        assert!(read_event(NETWORK, &ctx, &m).unwrap_err().contains("PositionOpened"));
+        assert!(read_event(NETWORK, &ctx, &m)
+            .unwrap_err()
+            .contains("PositionOpened"));
     }
 
     #[test]
@@ -1183,7 +1280,12 @@ mod tests {
                 token_b_transfer_fee: 0,
             },
         );
-        let m = meta(vec![ctx.owner, owner_a, owner_b], vec![(1, 1); 3], vec![(1, 90, 99), (2, 43, 49)], vec![decreased]);
+        let m = meta(
+            vec![ctx.owner, owner_a, owner_b],
+            vec![(1, 1); 3],
+            vec![(1, 90, 99), (2, 43, 49)],
+            vec![decreased],
+        );
         assert_eq!(
             read_event(NETWORK, &ctx, &m).unwrap(),
             LiquidityEvent::Removed {
@@ -1197,14 +1299,44 @@ mod tests {
         // position: returned by one, deposited into the other, and the owner
         // pays only the fee.
         let keys = vec![ctx.owner, ctx.position, ctx.tick_arrays[0]];
-        let m = meta(keys, vec![(20_000, 10_000), (2_394_240, 3_953_280), (3_480_000, 1_920_960)], vec![], vec![]);
+        let m = meta(
+            keys,
+            vec![
+                (20_000, 10_000),
+                (2_394_240, 3_953_280),
+                (3_480_000, 1_920_960),
+            ],
+            vec![],
+            vec![],
+        );
         assert_eq!(rent(&ctx, &m), (1_559_040, 0, 1_559_040));
         check_lamports(&ctx, &m, rent(&ctx, &m)).unwrap();
 
-        let ctx = PendingCommand { kind: Kind::Close, ..ctx };
-        let keys = vec![ctx.owner, ctx.position, ctx.position_mint, ctx.position_token_account];
-        let m = meta(keys, vec![(1, 7_384_241), (2_394_240, 0), (3_000_000, 0), (2_000_000, 0)], vec![], vec![]);
-        assert_eq!(read_event(NETWORK, &ctx, &m).unwrap(), LiquidityEvent::Closed);
+        let ctx = PendingCommand {
+            kind: Kind::Close,
+            ..ctx
+        };
+        let keys = vec![
+            ctx.owner,
+            ctx.position,
+            ctx.position_mint,
+            ctx.position_token_account,
+        ];
+        let m = meta(
+            keys,
+            vec![
+                (1, 7_384_241),
+                (2_394_240, 0),
+                (3_000_000, 0),
+                (2_000_000, 0),
+            ],
+            vec![],
+            vec![],
+        );
+        assert_eq!(
+            read_event(NETWORK, &ctx, &m).unwrap(),
+            LiquidityEvent::Closed
+        );
         assert_eq!(rent(&ctx, &m), (0, 0, 7_394_240));
         check_lamports(&ctx, &m, rent(&ctx, &m)).unwrap();
     }
@@ -1213,8 +1345,19 @@ mod tests {
     fn a_collect_is_what_the_owner_received_from_the_vaults() {
         let ctx = pending(Kind::Collect);
         let (owner_a, owner_b) = ctx.owner_accounts();
-        let keys = vec![ctx.owner, owner_a, owner_b, ctx.pool.vault_a, ctx.pool.vault_b];
-        let m = meta(keys.clone(), vec![(1, 1); 5], vec![(1, 0, 3), (2, 0, 0), (3, 100, 97), (4, 50, 50)], vec![]);
+        let keys = vec![
+            ctx.owner,
+            owner_a,
+            owner_b,
+            ctx.pool.vault_a,
+            ctx.pool.vault_b,
+        ];
+        let m = meta(
+            keys.clone(),
+            vec![(1, 1); 5],
+            vec![(1, 0, 3), (2, 0, 0), (3, 100, 97), (4, 50, 50)],
+            vec![],
+        );
         assert_eq!(
             read_event(NETWORK, &ctx, &m).unwrap(),
             LiquidityEvent::Collected {
@@ -1222,7 +1365,12 @@ mod tests {
             }
         );
         // The owner received more than the vault gave.
-        let m = meta(keys, vec![(1, 1); 5], vec![(1, 0, 3), (2, 0, 0), (3, 100, 98), (4, 50, 50)], vec![]);
+        let m = meta(
+            keys,
+            vec![(1, 1); 5],
+            vec![(1, 0, 3), (2, 0, 0), (3, 100, 98), (4, 50, 50)],
+            vec![],
+        );
         assert!(read_event(NETWORK, &ctx, &m).is_err());
     }
 }

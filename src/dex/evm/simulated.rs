@@ -35,8 +35,8 @@
 //! word needs its own adapter.
 
 use crate::dex::{
-    ChainAmount, DexExecutor, EvmCall, EvmCost, Outcome, Prepared, Realised, RouteQuote, SwapRequest,
-    TxCost,
+    ChainAmount, DexExecutor, EvmCall, EvmCost, Outcome, Prepared, Realised, RouteQuote,
+    SwapRequest, TxCost,
 };
 use crate::evm::erc20::{self, SlotCache};
 use crate::evm::prepared_key;

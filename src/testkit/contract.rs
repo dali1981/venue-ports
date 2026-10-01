@@ -94,7 +94,11 @@ async fn succeed(
 
 /// A command the position cannot take is an `Err` from `prepare`, with
 /// nothing sent.
-async fn refused(executor: &dyn LiquidityExecutor, cmd: LiquidityCommand, request: &LiquidityRequest) {
+async fn refused(
+    executor: &dyn LiquidityExecutor,
+    cmd: LiquidityCommand,
+    request: &LiquidityRequest,
+) {
     let kind = cmd.kind();
     assert!(
         executor.prepare(&cmd, request).await.is_err(),
@@ -154,7 +158,11 @@ pub async fn liquidity_executor_contract(
     else {
         panic!("Open on {} did not answer Opened", executor.label());
     };
-    assert!(opened > 0, "Open added no liquidity on {}", executor.label());
+    assert!(
+        opened > 0,
+        "Open added no liquidity on {}",
+        executor.label()
+    );
     let position: PositionId = position;
     refused(
         executor,
@@ -209,7 +217,12 @@ pub async fn liquidity_executor_contract(
     else {
         panic!("Remove on {} did not answer Removed", executor.label());
     };
-    assert_eq!(removed, total, "liquidity is conserved on {}", executor.label());
+    assert_eq!(
+        removed,
+        total,
+        "liquidity is conserved on {}",
+        executor.label()
+    );
 
     let LiquidityEvent::Collected {
         transferred: transferred_collect,

@@ -13,9 +13,9 @@
 
 use venue_ports::dex::Outcome;
 use venue_ports::liquidity::{
-    Deposit, DepositGuard, DepositGuardKind, LandedUnread, LiquidityCapabilities,
-    LiquidityCommand, LiquidityEvent, LiquidityExecutor, LiquidityRequest, LiquidityStub,
-    PositionId, Range, TokenPair,
+    Deposit, DepositGuard, DepositGuardKind, LandedUnread, LiquidityCapabilities, LiquidityCommand,
+    LiquidityEvent, LiquidityExecutor, LiquidityRequest, LiquidityStub, PositionId, Range,
+    TokenPair,
 };
 use venue_ports::Network;
 
@@ -122,7 +122,10 @@ async fn main() -> anyhow::Result<()> {
     else {
         return Ok(());
     };
-    if let LiquidityEvent::Added { liquidity: more, .. } = added {
+    if let LiquidityEvent::Added {
+        liquidity: more, ..
+    } = added
+    {
         liquidity += more;
     }
     events.push(added);
@@ -204,10 +207,7 @@ async fn step(
             "[{}] {kind}: timed out — its fate is unknown; resolve it before anything else",
             executor.label()
         ),
-        Outcome::Expired => println!(
-            "[{}] {kind}: expired — it can never land",
-            executor.label()
-        ),
+        Outcome::Expired => println!("[{}] {kind}: expired — it can never land", executor.label()),
     }
     Ok(report.event)
 }

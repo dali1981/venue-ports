@@ -11,10 +11,12 @@
 //! nothing fails for want of funds, which is a property of the account and
 //! not of the route.
 
-use crate::dex::jupiter::{build, check_request, http_client, message_key, Destination, JupiterConfig};
+use crate::dex::jupiter::{
+    build, check_request, http_client, message_key, Destination, JupiterConfig,
+};
 use crate::dex::{
-    DexExecutor, Outcome, Prepared, Realised, RouteQuote, SolanaCost, SolanaTransaction, SwapRequest,
-    TxCost,
+    DexExecutor, Outcome, Prepared, Realised, RouteQuote, SolanaCost, SolanaTransaction,
+    SwapRequest, TxCost,
 };
 use crate::solana::rpc::SolanaRpc;
 use crate::solana::token::token_account_amount;
@@ -65,13 +67,23 @@ impl JupiterSimulated {
 impl DexExecutor for JupiterSimulated {
     async fn prepare(&self, route: &RouteQuote, req: &SwapRequest) -> Result<Prepared> {
         let (sender, recipient) = check_request(self.network, route, req)?;
-        let built = build(&self.config, &self.http, &self.rpc, route, req, sender, recipient).await?;
+        let built = build(
+            &self.config,
+            &self.http,
+            &self.rpc,
+            route,
+            req,
+            sender,
+            recipient,
+        )
+        .await?;
         let signatures = u64::from(built.transaction.message.header().num_required_signatures);
         self.pending.lock().unwrap().insert(
             message_key(&built.transaction),
             Pending {
                 destination: built.destination,
-                fee_lamports: signatures * LAMPORTS_PER_SIGNATURE + built.prioritization_fee_lamports,
+                fee_lamports: signatures * LAMPORTS_PER_SIGNATURE
+                    + built.prioritization_fee_lamports,
             },
         );
         Ok(Prepared::Solana(SolanaTransaction {

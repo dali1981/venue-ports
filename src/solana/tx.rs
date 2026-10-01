@@ -213,13 +213,24 @@ impl SolanaSender {
     /// least `amount`. A fork sender writes the amount with Surfpool's
     /// cheatcode when it holds less, creating the account if it is missing,
     /// as `EvmSender::ensure_balance` writes a storage slot on anvil.
-    pub async fn ensure_balance(&self, mint: [u8; 32], token_program: [u8; 32], amount: u64) -> Result<()> {
+    pub async fn ensure_balance(
+        &self,
+        mint: [u8; 32],
+        token_program: [u8; 32],
+        amount: u64,
+    ) -> Result<()> {
         let (mint, program) = (
             Address::new_from_array(mint),
             Address::new_from_array(token_program),
         );
         let account = associated_token_account(&self.pubkey(), &mint, &program);
-        let held = match self.rpc.multiple_accounts(&[account]).await?.pop().flatten() {
+        let held = match self
+            .rpc
+            .multiple_accounts(&[account])
+            .await?
+            .pop()
+            .flatten()
+        {
             Some(data) => crate::solana::token::token_account_amount(&data)?,
             None => 0,
         };
@@ -414,7 +425,10 @@ fn failure_reason(err: &serde_json::Value, logs: &[String]) -> String {
     let message = logs.iter().rev().find_map(|line| {
         line.split_once("Error Message: ")
             .map(|(_, m)| m.trim_end_matches('.').to_string())
-            .or_else(|| line.strip_prefix("Program log: Error: ").map(str::to_string))
+            .or_else(|| {
+                line.strip_prefix("Program log: Error: ")
+                    .map(str::to_string)
+            })
     });
     match message {
         Some(message) => message,
@@ -549,22 +563,33 @@ mod tests {
     #[tokio::test]
     async fn a_send_unseen_past_its_last_valid_height_is_expired() {
         let server = unseeing_node(vec![10, 100]).await;
-        let sender = SolanaSender::fork(SolanaRpc::new(server.uri())).await.unwrap();
+        let sender = SolanaSender::fork(SolanaRpc::new(server.uri()))
+            .await
+            .unwrap();
         sender.set_poll_settings(SolanaPollSettings {
             interval: Duration::from_millis(10),
             timeout: Duration::from_secs(5),
         });
         let tx = memo_from(&sender).await;
         let outcome = sender.send_and_confirm(&tx).await.unwrap();
-        assert!(matches!(outcome, SolanaTxOutcome::Expired { .. }), "{outcome:?}");
-        assert_eq!(sender.unresolved(), None, "an expiry is known, so it blocks nothing");
+        assert!(
+            matches!(outcome, SolanaTxOutcome::Expired { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            sender.unresolved(),
+            None,
+            "an expiry is known, so it blocks nothing"
+        );
     }
 
     #[tokio::test]
     async fn a_fork_send_loads_its_accounts_and_waits_for_the_forks_clock_to_pass_them() {
         // The fork's clock reads 1970 twice, then the far future.
         let server = mock_node(vec![10, 100], vec![1, 1, i64::MAX / 2]).await;
-        let sender = SolanaSender::fork(SolanaRpc::new(server.uri())).await.unwrap();
+        let sender = SolanaSender::fork(SolanaRpc::new(server.uri()))
+            .await
+            .unwrap();
         sender.set_poll_settings(SolanaPollSettings {
             interval: Duration::from_millis(10),
             timeout: Duration::from_secs(5),
@@ -587,8 +612,14 @@ mod tests {
                 .position(|x| x == m)
                 .unwrap_or_else(|| panic!("no {m}"))
         };
-        let clock_reads = methods.iter().filter(|m| *m == "getMultipleAccounts").count();
-        assert!(at("simulateTransaction") < at("getMultipleAccounts"), "{methods:?}");
+        let clock_reads = methods
+            .iter()
+            .filter(|m| *m == "getMultipleAccounts")
+            .count();
+        assert!(
+            at("simulateTransaction") < at("getMultipleAccounts"),
+            "{methods:?}"
+        );
         assert_eq!(clock_reads, 3, "read until it passed: {methods:?}");
         let last_clock_read = methods
             .iter()
@@ -600,7 +631,9 @@ mod tests {
     #[tokio::test]
     async fn a_fork_whose_clock_never_passes_its_accounts_sends_nothing() {
         let server = mock_node(vec![10], vec![1]).await;
-        let sender = SolanaSender::fork(SolanaRpc::new(server.uri())).await.unwrap();
+        let sender = SolanaSender::fork(SolanaRpc::new(server.uri()))
+            .await
+            .unwrap();
         sender.set_poll_settings(SolanaPollSettings {
             interval: Duration::from_millis(10),
             timeout: Duration::from_millis(100),
@@ -608,12 +641,10 @@ mod tests {
         let tx = memo_from(&sender).await;
         let err = sender.send_and_confirm(&tx).await.unwrap_err();
         assert!(err.to_string().contains("nothing sent"), "{err}");
-        let sent = server
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .any(|r| r.body_json::<serde_json::Value>().unwrap()["method"] == "sendTransaction");
+        let sent =
+            server.received_requests().await.unwrap().iter().any(|r| {
+                r.body_json::<serde_json::Value>().unwrap()["method"] == "sendTransaction"
+            });
         assert!(!sent);
         assert_eq!(sender.unresolved(), None);
     }
@@ -621,7 +652,9 @@ mod tests {
     #[tokio::test]
     async fn a_timed_out_send_blocks_the_next_until_resolved() {
         let server = unseeing_node(vec![10]).await;
-        let sender = SolanaSender::fork(SolanaRpc::new(server.uri())).await.unwrap();
+        let sender = SolanaSender::fork(SolanaRpc::new(server.uri()))
+            .await
+            .unwrap();
         sender.set_poll_settings(SolanaPollSettings {
             interval: Duration::from_millis(10),
             timeout: Duration::from_millis(100),
@@ -634,7 +667,10 @@ mod tests {
         assert_eq!(sender.unresolved(), Some(signature));
         let err = sender.send_and_confirm(&tx).await.unwrap_err();
         assert!(err.to_string().contains("unresolved"), "{err}");
-        assert!(sender.resolve().await.unwrap().is_none(), "it may still land");
+        assert!(
+            sender.resolve().await.unwrap().is_none(),
+            "it may still land"
+        );
         assert_eq!(sender.unresolved(), Some(signature));
     }
 

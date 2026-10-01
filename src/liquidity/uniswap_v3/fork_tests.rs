@@ -29,8 +29,7 @@ use crate::evm::{EvmSender, PollSettings};
 use crate::liquidity::uniswap_v3::abi::manager;
 use crate::liquidity::{
     unix_now, Deposit, DepositGuard, EvmLiquidity, LiquidityCommand, LiquidityEvent,
-    LiquidityExecutor, LiquidityReport, LiquidityRequest, ManagerAbi, PositionId, Range,
-    TokenPair,
+    LiquidityExecutor, LiquidityReport, LiquidityRequest, ManagerAbi, PositionId, Range, TokenPair,
 };
 use crate::testkit::contract::{
     assert_liquidity_shape, liquidity_executor_contract, LiquidityContractFixture,

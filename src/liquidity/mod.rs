@@ -35,7 +35,10 @@ pub enum LiquidityCommand {
     /// Open a position on `range` and deposit into it.
     Open { range: Range, deposit: Deposit },
     /// Deposit more into an open position.
-    Add { position: PositionId, deposit: Deposit },
+    Add {
+        position: PositionId,
+        deposit: Deposit,
+    },
     /// Take `liquidity` out of the range, refusing less than `min_out` of
     /// each token.
     Remove {
@@ -492,7 +495,9 @@ mod tests {
                 },
             },
         };
-        let err = check_command(&banded, &request(), &CAPS).unwrap_err().to_string();
+        let err = check_command(&banded, &request(), &CAPS)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("MinAmounts"), "{err}");
         check_command(&banded, &request(), &LiquidityCapabilities::WHIRLPOOL).unwrap();
         let inverted = LiquidityCommand::Open {
