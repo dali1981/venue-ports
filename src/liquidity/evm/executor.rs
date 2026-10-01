@@ -22,7 +22,7 @@
 //! token, never `U256::MAX`. Any unspent part stays behind, capped at that
 //! desired amount, and the next action approves exactly what it needs.
 
-use crate::dex::{ChainAmount, Outcome, Prepared};
+use crate::dex::{ChainAmount, EvmCall, Outcome, Prepared};
 use crate::evm::erc20;
 use crate::evm::rpc::{address_from_slice, BlockTag};
 use crate::evm::{prepared_key, EvmSender, RpcLog, TxOutcome};
@@ -484,7 +484,7 @@ impl LiquidityExecutor for EvmLiquidity {
             }
         };
 
-        let prepared = Prepared {
+        let call = EvmCall {
             to: manager.as_slice().to_vec(),
             calldata,
             value: 0,
@@ -492,11 +492,12 @@ impl LiquidityExecutor for EvmLiquidity {
         self.pending
             .lock()
             .unwrap()
-            .insert(prepared_key(&prepared), pending);
-        Ok(prepared)
+            .insert(prepared_key(&call), pending);
+        Ok(Prepared::Evm(call))
     }
 
     async fn execute(&self, prepared: &Prepared) -> Result<LiquidityRealised> {
+        let prepared = prepared.evm_call()?;
         let ctx = self
             .pending
             .lock()
@@ -541,6 +542,7 @@ impl LiquidityExecutor for EvmLiquidity {
                 block,
                 tx_hash,
                 logs,
+                ..
             } => {
                 let (id, liquidity_delta, amount0, amount1) = self
                     .read_success(&ctx, &logs)
@@ -567,6 +569,7 @@ impl LiquidityExecutor for EvmLiquidity {
                 block,
                 tx_hash,
                 reason,
+                ..
             } => Ok(self.unsettled(Outcome::Reverted { reason }, block, tx_hash)),
             TxOutcome::TimedOut { tx_hash } => {
                 let at = self.sender.rpc().block_number().await.unwrap_or(0);

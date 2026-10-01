@@ -141,6 +141,10 @@ async fn step(
             "[{}] {kind}: timed out — its fate is unknown; resolve it before anything else",
             executor.label()
         ),
+        Outcome::Expired => println!(
+            "[{}] {kind}: expired — it can never land",
+            executor.label()
+        ),
     }
     Ok(realised)
 }

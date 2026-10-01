@@ -286,13 +286,14 @@ pub async fn cex_account_contract(account: &dyn CexAccount, fixture: CexAccountC
 mod tests {
     use super::*;
     use crate::cex::{CexStub, OrderSide};
-    use crate::dex::evm::EvmStub;
+    use crate::dex::DexStub;
+    use crate::Network;
     use std::str::FromStr;
 
     fn dex_fixture() -> DexContractFixture {
         DexContractFixture {
             route: RouteQuote {
-                chain_id: 1,
+                network: Network::evm(1),
                 token_in: vec![1],
                 token_out: vec![2],
                 amount_in: 100,
@@ -321,8 +322,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evm_stub_satisfies_the_contract() {
-        dex_executor_contract(&EvmStub::new(), dex_fixture()).await;
+    async fn dex_stub_satisfies_the_contract() {
+        dex_executor_contract(&DexStub::new(), dex_fixture()).await;
     }
 
     /// The stub, programmed with one consistent life: the suite asserts

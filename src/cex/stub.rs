@@ -1,5 +1,5 @@
 //! `CexStub` — an in-process fake `CexExecutor`, same shape and
-//! call-recording requirement as `EvmStub` (`SPEC.md` §6).
+//! call-recording requirement as `DexStub` (`SPEC.md` §6).
 //!
 //! **Reduce-only mode.** Once a test sets a signed position for a symbol
 //! with [`CexStub::set_position`], the stub behaves like a venue that holds

@@ -507,6 +507,12 @@ Order of work, each step compiled and tested before the next (V5 §11):
   - **Its cost:** taken with `default-features = false` (no `orca_whirlpools_core`), it takes the
     line's graph from 112 crates to 236, bringing `solana-program` 3.0 and its sysvars; beside this
     crate the total is 393, with one `k256` (0.13.4, the version this crate pins).
+  - **Step 2 done.** `Network`, `Prepared::{Evm, Solana}`, `EvmCall`, `SolanaTransaction`,
+    `Outcome::Expired`, `TxCost` with `native()`, `Realised.cost`, and `DexStub` (was `EvmStub`; a
+    Solana route is prepared as an unsigned transaction for the sender). `EvmLive` reads `gasUsed`,
+    `effectiveGasPrice` and `l1Fee` from the receipt into its cost; `EvmSimulated` reports none, and
+    refuses a Solana route. 173 unit tests pass (167 before, 6 new); the five anvil tests pass with
+    the same output as before the change, 100 lives reconciled to the wei.
 
 ## Tracking
 

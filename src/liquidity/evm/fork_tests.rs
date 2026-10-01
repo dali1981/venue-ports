@@ -292,7 +292,7 @@ impl Fork {
         let mut payload = router.as_slice().to_vec();
         payload.extend_from_slice(&calldata);
         let route = RouteQuote {
-            chain_id: self.chain_id,
+            network: crate::Network::evm(self.chain_id),
             token_in: token_in.as_slice().to_vec(),
             token_out: token_out.as_slice().to_vec(),
             amount_in,

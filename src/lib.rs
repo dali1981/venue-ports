@@ -3,8 +3,10 @@
 //! this crate implements it, module by module, in the order laid out in
 //! `IMPLEMENTATION_PLAN.md`.
 
+mod network;
 mod provenance;
 
+pub use network::Network;
 pub use provenance::Provenance;
 
 pub mod cex;

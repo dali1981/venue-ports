@@ -34,11 +34,14 @@
 //! bytes is an error, never a panic. A router whose output is not its first
 //! word needs its own adapter.
 
-use crate::dex::{ChainAmount, DexExecutor, Outcome, Prepared, Realised, RouteQuote, SwapRequest};
+use crate::dex::{
+    ChainAmount, DexExecutor, EvmCall, EvmCost, Outcome, Prepared, Realised, RouteQuote, SwapRequest,
+    TxCost,
+};
 use crate::evm::erc20::{self, SlotCache};
 use crate::evm::prepared_key;
 use crate::evm::rpc::{address_from_slice, first_word, format_u256, BlockTag, EvmRpc, RpcError};
-use crate::Provenance;
+use crate::{Network, Provenance};
 use alloy_primitives::{Address, B256, U256};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -79,28 +82,35 @@ impl DexExecutor for EvmSimulated {
                 route.payload.len()
             );
         }
+        if let Network::Solana { .. } = route.network {
+            bail!(
+                "route is for network {}, but EvmSimulated runs EVM calls only",
+                route.network
+            );
+        }
         let (router_bytes, calldata) = route.payload.split_at(20);
         let token_in = address_from_slice(&route.token_in).context("route.token_in")?;
         let sender = address_from_slice(&req.sender).context("req.sender")?;
 
-        let prepared = Prepared {
+        let call = EvmCall {
             to: router_bytes.to_vec(),
             calldata: calldata.to_vec(),
             value: 0,
         };
 
         self.pending.lock().unwrap().insert(
-            prepared_key(&prepared),
+            prepared_key(&call),
             PendingSimulation {
                 token_in,
                 sender,
                 amount_in: route.amount_in,
             },
         );
-        Ok(prepared)
+        Ok(Prepared::Evm(call))
     }
 
     async fn execute(&self, prepared: &Prepared, at: Option<u64>) -> Result<Realised> {
+        let prepared = prepared.evm_call()?;
         let ctx = self
             .pending
             .lock()
@@ -163,6 +173,8 @@ impl DexExecutor for EvmSimulated {
                 Ok(Realised {
                     amount_out: Some(amount_out),
                     outcome: Outcome::Success,
+                    // An `eth_call` reports no gas.
+                    cost: TxCost::Evm(EvmCost::default()),
                     at: block,
                     provenance: Provenance::Simulated,
                     tx_ref: None,
@@ -174,6 +186,7 @@ impl DexExecutor for EvmSimulated {
                     outcome: Outcome::Reverted {
                         reason: revert.reason,
                     },
+                    cost: TxCost::Evm(EvmCost::default()),
                     at: block,
                     provenance: Provenance::Simulated,
                     tx_ref: None,
@@ -202,7 +215,7 @@ mod tests {
 
     fn route(payload: Vec<u8>) -> RouteQuote {
         RouteQuote {
-            chain_id: 1,
+            network: Network::evm(1),
             token_in: vec![0xAA; 20],
             token_out: vec![0xBB; 20],
             amount_in: 1_000,
@@ -283,8 +296,9 @@ mod tests {
         let request = request();
 
         let prepared = adapter.prepare(&route, &request).await.unwrap();
-        assert_eq!(prepared.to, router.to_vec());
-        assert_eq!(prepared.calldata, calldata);
+        let call = prepared.evm_call().unwrap();
+        assert_eq!(call.to, router.to_vec());
+        assert_eq!(call.calldata, calldata);
 
         let realised = adapter.execute(&prepared, Some(42)).await.unwrap();
         assert_eq!(realised.amount_out, Some(777));
@@ -515,7 +529,7 @@ mod tests {
         payload.extend_from_slice(&calldata);
 
         let route = RouteQuote {
-            chain_id: 11_155_111,
+            network: Network::evm(11_155_111),
             token_in: usdc.as_slice().to_vec(),
             token_out: weth.as_slice().to_vec(),
             amount_in: 1_000_000,
@@ -605,7 +619,7 @@ mod tests {
             payload.extend_from_slice(&swap_calldata);
 
             let route = RouteQuote {
-                chain_id: 11_155_111,
+                network: Network::evm(11_155_111),
                 token_in: usdc.as_slice().to_vec(),
                 token_out: weth.as_slice().to_vec(),
                 amount_in: amount_in as ChainAmount,

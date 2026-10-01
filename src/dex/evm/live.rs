@@ -40,7 +40,11 @@
 //! sets no `tx_ref`. The owner must hold the input token on the fork;
 //! [`EvmSender::ensure_balance`] writes it there.
 
-use crate::dex::{ChainAmount, DexExecutor, Outcome, Prepared, Realised, RouteQuote, SwapRequest};
+use crate::dex::{
+    ChainAmount, DexExecutor, EvmCall, EvmCost, Outcome, Prepared, Realised, RouteQuote, SwapRequest,
+    TxCost,
+};
+use crate::Network;
 use crate::evm::erc20;
 use crate::evm::rpc::address_from_slice;
 use crate::evm::{prepared_key, EvmSender, RpcLog, TxOutcome};
@@ -97,10 +101,10 @@ impl DexExecutor for EvmLive {
                 route.payload.len()
             );
         }
-        if route.chain_id != self.sender.chain_id() {
+        if route.network != Network::evm(self.sender.chain_id()) {
             bail!(
-                "route is for chain {}, but this EvmLive's sender is on chain {}",
-                route.chain_id,
+                "route is for network {}, but this EvmLive's sender is on chain {}",
+                route.network,
                 self.sender.chain_id()
             );
         }
@@ -130,13 +134,13 @@ impl DexExecutor for EvmLive {
             );
         }
 
-        let prepared = Prepared {
+        let call = EvmCall {
             to: router_bytes.to_vec(),
             calldata: calldata.to_vec(),
             value: 0,
         };
         self.pending.lock().unwrap().insert(
-            prepared_key(&prepared),
+            prepared_key(&call),
             PendingLive {
                 token_in,
                 token_out,
@@ -145,13 +149,14 @@ impl DexExecutor for EvmLive {
                 deadline_unix_secs: req.deadline_unix_secs,
             },
         );
-        Ok(prepared)
+        Ok(Prepared::Evm(call))
     }
 
     /// `at` is ignored: a live adapter only ever acts *now* — there is no
     /// "re-run this at a historical block" for a real broadcast the way
     /// there is for `EvmSimulated`'s throwaway `eth_call`.
     async fn execute(&self, prepared: &Prepared, _at: Option<u64>) -> Result<Realised> {
+        let prepared = prepared.evm_call()?;
         let ctx = self
             .pending
             .lock()
@@ -190,6 +195,7 @@ impl DexExecutor for EvmLive {
                 block,
                 tx_hash,
                 logs,
+                cost,
             } => {
                 let amount_out = decode_transfer_amount(&logs, ctx.token_out, ctx.recipient)
                     .ok_or_else(|| {
@@ -201,6 +207,7 @@ impl DexExecutor for EvmLive {
                 Ok(Realised {
                     amount_out: Some(amount_out),
                     outcome: Outcome::Success,
+                    cost: TxCost::Evm(cost),
                     at: block,
                     provenance: self.sender.provenance(),
                     tx_ref: self.tx_ref(tx_hash),
@@ -210,9 +217,11 @@ impl DexExecutor for EvmLive {
                 block,
                 tx_hash,
                 reason,
+                cost,
             } => Ok(Realised {
                 amount_out: None,
                 outcome: Outcome::Reverted { reason },
+                cost: TxCost::Evm(cost),
                 at: block,
                 provenance: self.sender.provenance(),
                 tx_ref: self.tx_ref(tx_hash),
@@ -222,6 +231,7 @@ impl DexExecutor for EvmLive {
                 Ok(Realised {
                     amount_out: None,
                     outcome: Outcome::TimedOut,
+                    cost: TxCost::Evm(EvmCost::default()),
                     at,
                     provenance: self.sender.provenance(),
                     tx_ref: self.tx_ref(tx_hash),
@@ -275,7 +285,7 @@ mod tests {
         let mut payload = router.as_slice().to_vec();
         payload.extend_from_slice(calldata);
         RouteQuote {
-            chain_id: SEPOLIA,
+            network: Network::evm(SEPOLIA),
             token_in: token_in.as_slice().to_vec(),
             token_out: token_out.as_slice().to_vec(),
             amount_in: 1_000,
@@ -353,7 +363,7 @@ mod tests {
         let router = Address::from([0x11; 20]);
         let token = Address::from([0xAA; 20]);
         let route = RouteQuote {
-            chain_id: 1,
+            network: Network::evm(1),
             ..route(router, token, token, &[0xCA, 0xFE])
         };
         let req = request(live.address(), Address::from([0xDD; 20]));
@@ -426,7 +436,10 @@ mod tests {
         });
         mount_receipt(
             &server,
-            json!({ "status": "0x1", "blockNumber": "0x2a", "logs": [transfer_log] }),
+            json!({
+                "status": "0x1", "blockNumber": "0x2a", "logs": [transfer_log],
+                "gasUsed": "0x249f0", "effectiveGasPrice": "0x77359400", "l1Fee": "0x7",
+            }),
         )
         .await;
 
@@ -440,6 +453,14 @@ mod tests {
 
         assert_eq!(realised.amount_out, Some(4_200));
         assert!(matches!(realised.outcome, Outcome::Success));
+        assert_eq!(
+            realised.cost,
+            TxCost::Evm(EvmCost {
+                gas_used: Some(150_000),
+                effective_gas_price_wei: Some(2_000_000_000),
+                l1_fee_wei: Some(7),
+            })
+        );
         assert_eq!(realised.provenance, Provenance::Landed);
         assert!(realised.tx_ref.is_some());
         assert_eq!(realised.at, 42);
@@ -672,7 +693,7 @@ mod tests {
         payload.extend_from_slice(&swap_calldata);
 
         let route = RouteQuote {
-            chain_id: SEPOLIA,
+            network: Network::evm(SEPOLIA),
             token_in: weth.as_slice().to_vec(),
             token_out: usdc.as_slice().to_vec(),
             amount_in: AMOUNT_IN,

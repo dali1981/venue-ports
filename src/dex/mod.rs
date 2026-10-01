@@ -1,11 +1,14 @@
 //! The DEX port. See `SPEC.md` §5 — this module is the contract; do not
 //! diverge from it without updating the spec first.
 
-use crate::Provenance;
-use anyhow::Result;
+use crate::{Network, Provenance};
+use anyhow::{bail, Result};
 use async_trait::async_trait;
 
 pub mod evm;
+mod stub;
+
+pub use stub::{DexStub, RecordedCall};
 
 /// A chain-native token amount. This crate does not interpret decimals,
 /// symbols, or USD value — that belongs to whatever quoted the route.
@@ -24,7 +27,7 @@ pub type ChainAddress = Vec<u8>;
 /// one itself.
 #[derive(Debug, Clone)]
 pub struct RouteQuote {
-    pub chain_id: u64,
+    pub network: Network,
     pub token_in: ChainAddress,
     pub token_out: ChainAddress,
     pub amount_in: ChainAmount,
@@ -51,17 +54,60 @@ pub struct SwapRequest {
     pub deadline_unix_secs: u64,
 }
 
-/// A route bound to a request: ready to run, one way or another. What
-/// `to`/`calldata`/`value` actually mean is chain-specific; this shape is
-/// deliberately generic across chain families.
-#[derive(Debug, Clone)]
-pub struct Prepared {
+/// A route or command bound to a request: ready to run, one way or
+/// another. It passes from a port's `prepare` to its `execute`, and the
+/// caller does not read it. An EVM adapter refuses `Prepared::Solana` by
+/// name, and the reverse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Prepared {
+    Evm(EvmCall),
+    Solana(SolanaTransaction),
+}
+
+impl Prepared {
+    /// The EVM call, for an EVM adapter; an error naming the other family
+    /// otherwise.
+    pub fn evm_call(&self) -> Result<&EvmCall> {
+        match self {
+            Prepared::Evm(call) => Ok(call),
+            Prepared::Solana(_) => {
+                bail!("a Solana transaction was handed to an EVM adapter: it runs EVM calls only")
+            }
+        }
+    }
+
+    /// The Solana transaction, for a Solana adapter; an error naming the
+    /// other family otherwise.
+    pub fn solana_transaction(&self) -> Result<&SolanaTransaction> {
+        match self {
+            Prepared::Solana(tx) => Ok(tx),
+            Prepared::Evm(_) => {
+                bail!("an EVM call was handed to a Solana adapter: it runs Solana transactions only")
+            }
+        }
+    }
+}
+
+/// A call to one contract: what `Prepared` was before it became an enum.
+/// The fields are unchanged, so no EVM encoding changes. What
+/// `to`/`calldata`/`value` mean is the adapter's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvmCall {
     pub to: ChainAddress,
     pub calldata: Vec<u8>,
     pub value: ChainAmount,
 }
 
-#[derive(Debug, Clone)]
+/// A transaction built for one fee payer, unsigned until a sender signs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SolanaTransaction {
+    pub transaction: solana_transaction::versioned::VersionedTransaction,
+    /// The last block height its blockhash is valid at: after it, the
+    /// transaction can never land.
+    pub last_valid_block_height: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     Success,
     /// The swap reverted. There is no output amount; there is a reason.
@@ -74,6 +120,81 @@ pub enum Outcome {
     /// poll that outlives this call, a manual check) before it is treated
     /// as anything else.
     TimedOut,
+    /// Known never to have landed: the transaction's blockhash has expired
+    /// (`last_valid_block_height` is past) and its signature has no status.
+    /// Solana can answer this; no EVM adapter returns it.
+    Expired,
+}
+
+/// What a transaction cost, per family (`SPEC.md` §5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxCost {
+    Evm(EvmCost),
+    Solana(SolanaCost),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EvmCost {
+    /// `None` where a dry run reports none.
+    pub gas_used: Option<u64>,
+    pub effective_gas_price_wei: Option<u128>,
+    /// A rollup's data fee, from the receipt.
+    pub l1_fee_wei: Option<u128>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SolanaCost {
+    /// Signature fee + priority fee, from the transaction's meta.
+    pub fee_lamports: u64,
+    pub units_consumed: u64,
+    /// Paid into accounts that return it when closed (a position).
+    pub rent_deposited_lamports: u64,
+    /// Paid into accounts that never return it (a tick array).
+    pub rent_spent_lamports: u64,
+    /// Given back by an account this transaction closed.
+    pub rent_returned_lamports: u64,
+}
+
+/// The same four figures for every family, in the chain's smallest native
+/// unit (wei, lamports).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeCost {
+    pub fee: u128,
+    pub deposited: u128,
+    pub spent: u128,
+    pub returned: u128,
+}
+
+impl TxCost {
+    /// The same four figures for every family: what a caller records
+    /// without branching on the family. On EVM, `deposited`, `spent` and
+    /// `returned` are zero, and `fee` is `gas_used × effective_gas_price +
+    /// l1_fee`, counting a missing figure as zero.
+    pub fn native(&self) -> NativeCost {
+        match self {
+            TxCost::Evm(cost) => NativeCost {
+                fee: u128::from(cost.gas_used.unwrap_or(0))
+                    .saturating_mul(cost.effective_gas_price_wei.unwrap_or(0))
+                    .saturating_add(cost.l1_fee_wei.unwrap_or(0)),
+                ..NativeCost::default()
+            },
+            TxCost::Solana(cost) => NativeCost {
+                fee: u128::from(cost.fee_lamports),
+                deposited: u128::from(cost.rent_deposited_lamports),
+                spent: u128::from(cost.rent_spent_lamports),
+                returned: u128::from(cost.rent_returned_lamports),
+            },
+        }
+    }
+
+    /// The cost of nothing, in the family `prepared` belongs to: what an
+    /// adapter that runs nothing real (a stub, a paper model) reports.
+    pub fn none_for(prepared: &Prepared) -> Self {
+        match prepared {
+            Prepared::Evm(_) => TxCost::Evm(EvmCost::default()),
+            Prepared::Solana(_) => TxCost::Solana(SolanaCost::default()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +204,10 @@ pub struct Realised {
     /// real, terrible price; "no price" is a different fact.
     pub amount_out: Option<ChainAmount>,
     pub outcome: Outcome,
+    /// What it cost, whenever something ran, a revert included. A dry run's
+    /// figures are what the run reported: an `eth_call` reports no gas, and
+    /// `simulateTransaction` reports `unitsConsumed`.
+    pub cost: TxCost,
     /// The block (or slot) the outcome was observed at.
     pub at: u64,
     pub provenance: Provenance,
@@ -111,6 +236,60 @@ pub trait DexExecutor: Send + Sync {
     async fn execute(&self, prepared: &Prepared, at: Option<u64>) -> Result<Realised>;
 
     /// A short, stable label for logging — e.g. `"evm-live"`,
-    /// `"evm-simulated"`, `"evm-stub"`.
+    /// `"evm-simulated"`, `"dex-stub"`.
     fn label(&self) -> &'static str;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_cost_is_gas_times_price_plus_the_l1_fee_on_evm() {
+        let cost = TxCost::Evm(EvmCost {
+            gas_used: Some(150_000),
+            effective_gas_price_wei: Some(2_000_000_000),
+            l1_fee_wei: Some(7),
+        });
+        assert_eq!(
+            cost.native(),
+            NativeCost {
+                fee: 300_000_000_000_007,
+                ..NativeCost::default()
+            }
+        );
+        assert_eq!(TxCost::Evm(EvmCost::default()).native(), NativeCost::default());
+    }
+
+    #[test]
+    fn native_cost_carries_the_rent_on_solana() {
+        let cost = TxCost::Solana(SolanaCost {
+            fee_lamports: 5_000,
+            units_consumed: 180_000,
+            rent_deposited_lamports: 2_000_000,
+            rent_spent_lamports: 70_000_000,
+            rent_returned_lamports: 0,
+        });
+        assert_eq!(
+            cost.native(),
+            NativeCost {
+                fee: 5_000,
+                deposited: 2_000_000,
+                spent: 70_000_000,
+                returned: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn each_family_refuses_the_others_prepared_by_name() {
+        let evm = Prepared::Evm(EvmCall {
+            to: vec![1; 20],
+            calldata: vec![2],
+            value: 0,
+        });
+        assert!(evm.evm_call().is_ok());
+        let err = evm.solana_transaction().unwrap_err().to_string();
+        assert!(err.contains("EVM call") && err.contains("Solana adapter"), "{err}");
+    }
 }

@@ -5,7 +5,7 @@
 //! receives.
 //!
 //! **An action with no programmed outcome is an `Err` naming the action.**
-//! Unlike `EvmStub` and `CexStub`, there is no default: a fallback would
+//! Unlike `DexStub` and `CexStub`, there is no default: a fallback would
 //! have to invent liquidity and amounts, and invented numbers in a test are
 //! how a fake drifts away from the real thing.
 //!
@@ -13,7 +13,7 @@
 //! deadline, token order, tick order, amounts), so a test against the stub
 //! is refused what the real adapter would refuse.
 
-use crate::dex::{ChainAmount, Outcome, Prepared};
+use crate::dex::{ChainAmount, EvmCall, Outcome, Prepared};
 use crate::liquidity::{
     validate, LandedUnread, LiquidityAction, LiquidityExecutor, LiquidityRealised,
     LiquidityRequest, PositionRef,
@@ -139,11 +139,11 @@ impl LiquidityExecutor for LiquidityStub {
             // be traced back to the action it came from.
             let calldata = format!("{}#{}", action.kind(), prepared.len()).into_bytes();
             prepared.insert(calldata.clone(), action.clone());
-            Prepared {
+            Prepared::Evm(EvmCall {
                 to: action.manager().clone(),
                 calldata,
                 value: 0,
-            }
+            })
         });
         self.calls.lock().unwrap().push(LiquidityCall::Prepare {
             action: action.clone(),
@@ -158,7 +158,7 @@ impl LiquidityExecutor for LiquidityStub {
             .prepared
             .lock()
             .unwrap()
-            .get(&prepared.calldata)
+            .get(&prepared.evm_call().map(|call| call.calldata.clone()).unwrap_or_default())
             .cloned();
         self.calls.lock().unwrap().push(LiquidityCall::Execute {
             prepared: prepared.clone(),
@@ -288,7 +288,7 @@ mod tests {
         assert_eq!(calls.len(), 3);
         assert!(matches!(
             &calls[0],
-            LiquidityCall::Prepare { prepared: Some(p), .. } if p.calldata == prepared.calldata
+            LiquidityCall::Prepare { prepared: Some(p), .. } if p == &prepared
         ));
         assert!(matches!(
             &calls[1],

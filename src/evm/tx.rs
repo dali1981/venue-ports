@@ -39,6 +39,7 @@
 //! outcome with its reason. Fork senders are not in the registry: a fork is
 //! its own node, and anvil assigns an impersonated account's nonces itself.
 
+use crate::dex::EvmCost;
 use crate::evm::erc20::{self, SlotCache};
 use crate::evm::rpc::{format_u256, BlockTag, EvmRpc, Receipt, RpcError, RpcLog};
 use crate::Provenance;
@@ -163,11 +164,15 @@ pub enum TxOutcome {
         block: u64,
         tx_hash: B256,
         logs: Vec<RpcLog>,
+        /// What it cost, from the receipt.
+        cost: EvmCost,
     },
     Reverted {
         block: u64,
         tx_hash: B256,
         reason: String,
+        /// A reverted transaction still pays for its gas.
+        cost: EvmCost,
     },
     TimedOut {
         tx_hash: B256,
@@ -638,6 +643,7 @@ impl EvmSender {
                 block: receipt.block,
                 tx_hash,
                 logs: receipt.logs,
+                cost: receipt.cost,
             };
         }
         let reason = self
@@ -648,6 +654,7 @@ impl EvmSender {
             block: receipt.block,
             tx_hash,
             reason,
+            cost: receipt.cost,
         }
     }
 }

@@ -3,6 +3,7 @@
 //! `EvmLive` and `EvmLiquidity` all talk to a node through this one type
 //! rather than each carrying its own copy of it.
 
+use crate::dex::EvmCost;
 use alloy_primitives::{Address, B256, U256};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
@@ -105,6 +106,10 @@ pub struct Receipt {
     pub success: bool,
     pub block: u64,
     pub logs: Vec<RpcLog>,
+    /// What the transaction cost, as far as the receipt says: `gasUsed`,
+    /// `effectiveGasPrice`, and a rollup's `l1Fee`. A field the node leaves
+    /// out is `None`.
+    pub cost: EvmCost,
 }
 
 #[derive(Debug, Clone)]
@@ -343,10 +348,22 @@ impl EvmRpc {
             .map(|logs| logs.iter().map(RpcLog::from_json).collect::<Result<_>>())
             .transpose()?
             .unwrap_or_default();
+        let quantity = |name: &str| {
+            receipt
+                .get(name)
+                .and_then(Value::as_str)
+                .and_then(|hex| u128::from_str_radix(hex.trim_start_matches("0x"), 16).ok())
+        };
+        let cost = EvmCost {
+            gas_used: quantity("gasUsed").and_then(|gas| u64::try_from(gas).ok()),
+            effective_gas_price_wei: quantity("effectiveGasPrice"),
+            l1_fee_wei: quantity("l1Fee"),
+        };
         Ok(Some(Receipt {
             success,
             block,
             logs,
+            cost,
         }))
     }
 
