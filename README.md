@@ -16,20 +16,38 @@ stub), the test strategy that keeps the stub honest, and acceptance criteria. Se
 
 | port | `Stub` | `Simulated` | `Live` |
 |---|---|---|---|
-| DEX (EVM) | done (`EvmStub`) | done, mechanism only — §9.2's real-RPC acceptance bar not yet cleared | not started |
-| CEX | done (`CexStub`) | — (a CEX's `Simulated` is `Live` pointed at a sandbox, §3) | not started, no venue picked yet |
+| DEX (EVM) | done (`EvmStub`) | verified against a real Sepolia swap (Uniswap V3 `SwapRouter02`) — §9.2's full 100-run replication not yet done | verified against a real, successful Sepolia swap — quote/simulated/executed agree to the wei; §9.2's full 100-run replication not yet done |
+| CEX — Binance | done (`CexStub`) | testnet credentials in hand; blocked on Binance's own geo-eligibility check (HTTP 451) from this environment | scaffolded (`BinanceLive`), unit-tested against a mocked server, not yet run against the real testnet |
+| CEX — Bybit | done (`CexStub`) | blocked on Bybit's own CloudFront geo-restriction from this environment | scaffolded (`BybitLive`), unit-tested against a mocked server, not yet run against the real testnet |
+| CEX — Binance USDⓈ-M futures | done (`CexStub`, with a reduce-only mode) | needs futures testnet keys; the gated §9.2 run is written | built (`BinanceFuturesLive`), unit-tested against a mocked server, not yet run against the real testnet |
+| Liquidity (EVM position managers) | done (`LiquidityStub`) | `EvmLiquidity` over a fork sender meets §9.2 for Uniswap v3 on anvil (100 lives reconciled to the wei); Slipstream needs a Base fork | built (`EvmLiquidity` over a signing sender); no live life taken yet |
+| Perp account reads | done (`CexAccountStub`) | needs futures testnet keys; the gated run is written | built (`BinanceFuturesAccount`), unit-tested against a mocked server |
 
-Both `Stub` implementations pass the shared contract-test suite (`src/testkit/contract.rs`) and are
+Every `Stub` implementation passes the shared contract-test suites (`src/testkit/contract.rs`) and is
 ready to build a trading system against today. See [`examples/basic_usage.rs`](examples/basic_usage.rs)
-for a minimal sketch of calling both ports and handling what comes back.
+for a minimal sketch of calling the swap and order ports and handling what comes back, and
+[`examples/liquidity_lifecycle.rs`](examples/liquidity_lifecycle.rs) for a position's whole life through
+the liquidity port.
 
 Neither `Live` adapter is exercised by an automated test or a schedule — per `SPEC.md` §3/§9, that is
 only ever a deliberate, human-triggered action.
 
-**Both `Live` adapters are currently blocked on input only a human can give — RPC access, a router/venue
-choice, and credentials.** See the "BLOCKED" section at the top of
+**Every `Live` adapter is testnet-first by default** — `EvmLive` against Ethereum Sepolia,
+`BinanceLive`/`BybitLive` against each venue's own testnet host. `EvmLive` has now run a real,
+successful, human-triggered swap on Sepolia (see the Status table above); `BinanceLive`/`BybitLive`
+remain blocked on input only a human can give: real testnet credentials, and (from inside this
+environment specifically) each venue's own geo-restriction. See the "BLOCKED" section at the top of
 [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md#blocked--everything-below-needs-input-only-you-can-give)
 for exactly what is needed and why nothing further can proceed without it.
+
+**Added from [`specs/`](specs/README.md)** (phases 10–14 in the plan): one shared EVM sender per
+wallet and chain, reduce-only orders and `OrderStateUnknown`, a Binance USDⓈ-M futures adapter, a
+liquidity port for concentrated-liquidity position managers, and read-only perp account queries.
+
+**Running the EVM tests against a real node, without a fork RPC:** start `anvil
+--disable-code-size-limit`, then `eval "$(scripts/anvil-uniswap-v3.py)"` deploys Uniswap's published
+v3 bytecode onto it and exports what the anvil-gated tests read; `cargo test -- against_anvil` runs
+them. CI's `anvil` job does the same on every push and nightly.
 
 ## Scope, in one paragraph
 

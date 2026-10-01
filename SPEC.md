@@ -1,7 +1,7 @@
 # Specification — `venue-ports`
 
-Status: **specification only, nothing implemented yet.** This document is the target to implement
-against. Where it gives a Rust signature, that signature is the contract — implement it as written
+Status: the contract the crate implements. What is built so far, and to which bar, is tracked in
+`IMPLEMENTATION_PLAN.md`. This document is the target to implement against. Where it gives a Rust signature, that signature is the contract — implement it as written
 unless a limitation forces a change, in which case change this document first.
 
 ## 1. Why this crate exists
@@ -22,7 +22,9 @@ This crate does **not**:
 - fetch price quotes or discover routes (it executes a route/order it is *given*, it does not go and
   find one);
 - decide whether a trade is worth taking, or size one;
-- track positions, balances, or capital, or enforce any risk policy;
+- track positions, balances, or capital — hold, compute, or cache them — or enforce any risk policy.
+  *Reading* what a venue reports about an account, at the moment it is asked, is not tracking:
+  nothing is kept between calls and nothing is derived (§6b);
 - persist anything — every call returns a value; what the caller does with it (log it, write it to a
   database, throw it away) is entirely the caller's concern;
 - know anything about a specific trading strategy. A market-making system, a directional system, and
@@ -197,13 +199,27 @@ pub trait DexExecutor: Send + Sync {
   transaction (never the zero address, never omitted); the venue cap enforced as an on-chain
   `approve`, never an unlimited allowance; one nonce in flight per chain at a time; decoding the
   landed amount from the transaction's own logs (e.g. an ERC-20 `Transfer` event), never assumed equal
-  to what was quoted.
+  to what was quoted. It sends through a shared `EvmSender` (below) and never owns a key itself:
+
+  ```rust
+  impl EvmLive {
+      pub fn new(sender: Arc<EvmSender>) -> Self;
+  }
+  ```
+
+  `prepare` refuses a `RouteQuote` whose `chain_id` is not the sender's. Given a fork sender (§5b)
+  instead of a signing one, `EvmLive` becomes a swap simulator whose state persists between calls: its
+  provenance is then `Simulated` and it sets no `tx_ref`.
 - **`EvmSimulated`** — runs the prepared call against current (or a specified historical) chain state
   through a read-only simulation endpoint (an `eth_call`-equivalent), with no transaction ever
   broadcast. Where the simulated sender does not actually hold the input token or the router's
   allowance, the adapter is responsible for overriding just enough state (balance, allowance) to make
   the call possible — and for granting that allowance *to the router the route actually calls*, not to
-  whatever address happens to be probing it.
+  whatever address happens to be probing it. `amount_out` is decoded from the **first 32-byte word**
+  of the router's return data: `SwapRouter02.exactInputSingle` returns one word, and KyberSwap's
+  `MetaAggregationRouterV2.swap` and the other common aggregator routers put the output amount first.
+  Fewer than 32 bytes is an error, never a panic. A router whose output is not its first word needs its
+  own adapter.
 - **`EvmStub`** — an in-process fake with no network calls at all. Must let a test program the exact
   `Realised` (or error) a given `execute()` call returns, including reverts with a specific reason and
   a forced `TimedOut`. Must record every call it received (route, request, prepared value) so a test
@@ -213,6 +229,328 @@ A second chain family (e.g. a Solana-style chain, where transactions are signed 
 differently from an EVM chain) gets its own `Live`/`Simulated` pair implementing the same trait; the
 trait does not change to accommodate it. `Stub` is chain-family-agnostic and does not need to be
 duplicated per chain.
+
+### The EVM sender — one per wallet and chain
+
+Every adapter that sends from an EVM wallet (`EvmLive`, and `EvmLiquidity` in §5b) sends through the
+same `Arc<EvmSender>`. It is the only thing in the crate that assigns nonces, so two adapters can
+never race for one: "one nonce in flight per chain at a time" holds for the wallet, not just for each
+adapter.
+
+```rust
+// src/evm/tx.rs
+/// The only thing in the crate that assigns nonces for one wallet on one
+/// chain. Every adapter that sends from that wallet holds the same `Arc`.
+pub struct EvmSender { /* EvmRpc, backend (Signer or fork owner), chain_id, FeePolicy,
+                          poll settings, unresolved: Option<B256> */ }
+
+pub enum TxOutcome {
+    Success { block: u64, tx_hash: B256, logs: Vec<RpcLog> },
+    Reverted { block: u64, tx_hash: B256, reason: String },
+    TimedOut { tx_hash: B256 },
+}
+
+/// How max fee and priority fee are chosen: `base_fee_multiplier` × base
+/// fee + priority fee, and `fallback_priority_fee_wei` when the node has no
+/// `eth_maxPriorityFeePerGas`. The default (2×, 1.5 gwei) is tuned for
+/// Sepolia; it is a per-chain setting.
+pub struct FeePolicy { pub base_fee_multiplier: u32, pub fallback_priority_fee_wei: u128 }
+
+impl EvmSender {
+    /// Checks `eth_chainId` against `chain_id`. Returns an error if this
+    /// process already holds an `EvmSender` for the same (address, chain_id).
+    pub async fn connect(rpc: EvmRpc, signer: Signer, chain_id: u64, fees: FeePolicy) -> Result<Arc<Self>>;
+    pub fn address(&self) -> Address;
+    pub fn chain_id(&self) -> u64;
+
+    /// Build, sign, broadcast and poll one transaction to a terminal
+    /// outcome, holding the send lock throughout. Returns an error without
+    /// sending if an earlier send timed out and has not been resolved.
+    pub async fn send_and_confirm(&self, to: Address, calldata: Vec<u8>, value: U256) -> Result<TxOutcome>;
+
+    /// If the sender's allowance to `spender` is below `amount`, approve
+    /// exactly `amount`. Never `U256::MAX`. A revert or timeout here is an
+    /// `Err`, a setup failure, and not the caller's outcome.
+    pub async fn ensure_allowance(&self, token: Address, spender: Address, amount: U256) -> Result<()>;
+
+    /// The hash of a send that ended `TimedOut` and is not yet resolved.
+    pub fn unresolved(&self) -> Option<B256>;
+
+    /// Polls the unresolved hash once. Returns its terminal outcome, which
+    /// clears it. Returns `None` if it is still pending. Once the node no
+    /// longer knows the hash and the account's `latest` nonce has moved past
+    /// it, it was replaced or dropped: that is reported as an error naming the
+    /// hash, and the hash is cleared.
+    pub async fn resolve(&self) -> Result<Option<TxOutcome>>;
+
+    /// The node this sender talks to, for reads alongside its sends.
+    pub fn rpc(&self) -> &EvmRpc;
+    /// How often, and for how long, a receipt is polled for before a send
+    /// ends `TimedOut` (default: every 4 s, for 3 minutes).
+    pub fn set_poll_settings(&self, poll: PollSettings);
+}
+```
+
+A send whose broadcast response is lost may still have reached the node, so it is polled for like any
+other and ends `TimedOut` (and unresolved) if no receipt appears; only a broadcast the node answered and
+refused is an `Err`. A failed receipt poll is retried until the timeout, never returned as an `Err`
+after the transaction is out.
+
+Rules:
+
+- **One `EvmSender` per (address, chain_id) per process.** `connect` enforces this with a process-wide
+  registry, and the entry is removed on drop. Nothing can enforce it across processes: run one process
+  per wallet per chain.
+- **An `EvmSender` belongs to one chain.** Adapters refuse actions for any other `chain_id`.
+- **Nothing is sent over an unresolved timeout.** After a `TimedOut`, every send is refused until
+  `resolve` has cleared the hash. This makes `Outcome::TimedOut`'s "resolve before anything else" rule
+  impossible to skip.
+- **No convenience constructor builds a sender inside an adapter.** It would make a second sender for
+  the same wallet the easy thing to write.
+
+The EVM chain family's plumbing is shared by every EVM adapter rather than copied into each:
+`src/evm/rpc.rs` (`EvmRpc`: JSON-RPC, `eth_call` with `from` and state overrides, receipts,
+revert-reason replay, hex/ABI helpers) and `src/evm/erc20.rs` (selectors, balance and allowance reads,
+storage-slot probing).
+
+## 5b. The liquidity port
+
+A concentrated-liquidity position goes through a **position manager**, not a router. It is created,
+grown, shrunk, harvested and closed. `DexExecutor` cannot express this: `Realised` holds one
+`amount_out`, while a mint returns a position id, an amount of liquidity and two token amounts, and a
+decrease moves nothing until a later collect. The port turns a decided action into a known outcome like
+the other two; it has its own trait because its outcomes have a different shape.
+
+In this port's terms, the crate does **not**: choose ranges, or compute liquidity from prices or
+prices from ticks (the manager computes the liquidity, the chain reports it, and the crate reads the
+report back); value a position, track what it holds, or remember what it minted; stake positions in
+gauges or claim emissions; create pools, or handle native ETH (`value` is always zero, and tokens are
+ERC-20s). It does not support fee-on-transfer tokens: the EVM adapter detects them and refuses to read
+their outcome, but does not handle them.
+
+```rust
+// src/liquidity/mod.rs
+use crate::dex::{ChainAddress, ChainAmount, Outcome, Prepared};
+use crate::Provenance;
+
+/// Identifies the pool a range belongs to. It is also what decides how the
+/// manager's `mint` is encoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PoolKey {
+    /// Uniswap v3's NonfungiblePositionManager and its ABI-identical forks
+    /// (PancakeSwap v3): the fee tier in hundredths of a basis point
+    /// (500 = 0.05 %).
+    Fee(u32),
+    /// Aerodrome and Velodrome Slipstream: the pool's tick spacing. Their
+    /// `mint` takes one more argument, `sqrtPriceX96`, which this crate
+    /// always sends as zero because it never creates a pool.
+    TickSpacing(i32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeSpec {
+    pub chain_id: u64,
+    /// The position manager contract, not the pool.
+    pub manager: ChainAddress,
+    /// In the pool's own order: token0 < token1.
+    pub token0: ChainAddress,
+    pub token1: ChainAddress,
+    pub pool_key: PoolKey,
+    pub tick_lower: i32,
+    pub tick_upper: i32,
+}
+
+/// A position held in a manager. On v3-style managers it is an ERC-721
+/// token id, as 32 big-endian bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionRef {
+    pub chain_id: u64,
+    pub manager: ChainAddress,
+    pub id: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub enum LiquidityAction {
+    Mint {
+        range: RangeSpec,
+        amount0_desired: ChainAmount,
+        amount1_desired: ChainAmount,
+        amount0_min: ChainAmount,
+        amount1_min: ChainAmount,
+    },
+    Increase {
+        position: PositionRef,
+        amount0_desired: ChainAmount,
+        amount1_desired: ChainAmount,
+        amount0_min: ChainAmount,
+        amount1_min: ChainAmount,
+    },
+    /// Moves `liquidity` out of the range and into the position's owed
+    /// tokens. **It transfers nothing**: tokens leave only on `Collect`.
+    Decrease {
+        position: PositionRef,
+        liquidity: u128,
+        amount0_min: ChainAmount,
+        amount1_min: ChainAmount,
+    },
+    /// Transfers the owed tokens to the owner, up to the caps. Owed tokens
+    /// are the principal released by earlier decreases plus the fees earned.
+    Collect { position: PositionRef, amount0_max: u128, amount1_max: u128 },
+    /// Destroys a position that has no liquidity and nothing owed.
+    Burn { position: PositionRef },
+}
+
+#[derive(Debug, Clone)]
+pub struct LiquidityRequest {
+    /// Signs and pays. It also receives the minted position and the collected
+    /// tokens: the crate never sends either anywhere else. Never the zero
+    /// address.
+    pub owner: ChainAddress,
+    /// Unix time after which the action must not execute. Required, as for a
+    /// swap.
+    pub deadline_unix_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiquidityRealised {
+    pub outcome: Outcome,
+    /// The position acted on; for `Mint`, the new one.
+    pub position: Option<PositionRef>,
+    pub liquidity_delta: Option<u128>,
+    pub amount0: Option<ChainAmount>,
+    pub amount1: Option<ChainAmount>,
+    /// The block the outcome was observed at.
+    pub at: u64,
+    pub provenance: Provenance,
+    /// Set if and only if `provenance == Provenance::Landed`.
+    pub tx_ref: Option<Vec<u8>>,
+}
+
+/// Returned inside `anyhow::Error` when an action's transaction landed but
+/// its outcome could not be read from the receipt: an expected event was
+/// missing, or the cross-check failed. Something happened on chain, so the
+/// caller must inspect `tx_ref` before it acts on this position again.
+#[derive(Debug, Clone)]
+pub struct LandedUnread {
+    pub tx_ref: Vec<u8>,
+    pub reason: String,
+}
+impl std::error::Error for LandedUnread {}
+
+#[async_trait]
+pub trait LiquidityExecutor: Send + Sync {
+    /// Validates the action and encodes it. It may read the chain (the
+    /// position's owner and tokens) but sends nothing.
+    async fn prepare(&self, action: &LiquidityAction, req: &LiquidityRequest) -> Result<Prepared>;
+    /// Runs the prepared action to a terminal outcome and does not return
+    /// before then, like `DexExecutor::execute`.
+    async fn execute(&self, prepared: &Prepared) -> Result<LiquidityRealised>;
+    fn label(&self) -> &'static str;
+}
+```
+
+**The shape rules**, asserted for every implementation by `liquidity_executor_contract` (§7):
+
+- `position`, `liquidity_delta`, `amount0` and `amount1` are all `Some` exactly when `outcome` is
+  `Success`. A revert or a timeout is never shown as zeros.
+- `tx_ref` is `Some` exactly when `provenance` is `Landed`.
+- An `Err` means nothing was sent for the action itself, unless it is `LandedUnread`. A failed
+  approval is an `Err`: it is setup, and no position changed.
+
+**What the amounts mean, per action:**
+
+| Action | `liquidity_delta` | `amount0`, `amount1` | Read from the manager's events |
+| --- | --- | --- | --- |
+| `Mint` | liquidity added | tokens paid in | ERC-721 `Transfer(0 → owner, id)` and `IncreaseLiquidity(id, …)` |
+| `Increase` | liquidity added | tokens paid in | `IncreaseLiquidity(id, …)` |
+| `Decrease` | liquidity removed | tokens **credited to the position's owed balance**, not transferred | `DecreaseLiquidity(id, …)` |
+| `Collect` | 0 | tokens transferred to the owner | `Collect(id, …)` |
+| `Burn` | 0 | 0, 0 | ERC-721 `Transfer(owner → 0, id)` |
+
+The zeros for `Collect` and `Burn` are real values: those actions change no liquidity, and `Burn`
+moves no tokens.
+
+**There is no `at` parameter on `execute`.** A liquidity action changes state that later actions
+depend on, so re-running one alone at an older block means nothing. A caller who wants an older state
+starts the fork at that block.
+
+### Required implementations (liquidity)
+
+A position's life is a sequence of actions, each depending on the state the last one left, and an
+`eth_call` discards that state. So the Simulated mode runs the actions on an **anvil fork**, as real
+transactions from an impersonated owner: the same operation as Live, sent to a chain that is thrown
+away afterwards. The result is one implementation and two senders — §3's CEX pattern, arrived at by a
+different route — and Simulated and Live share every line of encoding and decoding.
+
+- **`LiquidityStub`** — no network calls. Each call's outcome is programmed: success with given
+  values, `Reverted { reason }`, `TimedOut`, an `Err`, or `LandedUnread`. It records every `prepare` and
+  `execute` it receives. **An action with no programmed outcome is an `Err` naming the action**: a
+  fallback would have to invent liquidity and amounts.
+- **`EvmLiquidity`** — one implementation over an `Arc<EvmSender>`; its label is
+  `"evm-liquidity-live"` or `"evm-liquidity-fork"`, from the sender.
+
+  ```rust
+  impl EvmLiquidity {
+      pub fn new(sender: Arc<EvmSender>) -> Self;
+  }
+  ```
+
+  `prepare` checks the owner is the sender's address and not zero, the deadline is set and has not
+  passed, and the action's `chain_id` is the sender's. `Mint`: token0 < token1, tick_lower <
+  tick_upper, the desired amounts are not both zero, and each minimum is at most its desired amount
+  (tick spacing is the manager's to check). Any other action: `ownerOf(id)` must be the owner;
+  `Increase` reads token0 and token1 from `positions(id)`; `Decrease` needs liquidity above zero;
+  `Collect` needs at least one cap above zero. Encoding uses `alloy-sol-types`, never hand-encoding.
+
+  `execute`: refuses a passed deadline without sending; for `Mint` and `Increase`, `ensure_balance`
+  and `ensure_allowance` per token, with the manager as spender and **exactly the desired amount**,
+  never `U256::MAX`; sends to the manager; decodes the events from the manager's own logs
+  (`LandedUnread` if one is missing); **cross-checks** against the ERC-20 `Transfer` logs of the same
+  receipt — for `Mint` and `Increase` the owner sent exactly `amount0`/`amount1`, for `Collect` it
+  received exactly them, zero amounts skipped — and gives `LandedUnread` naming both figures on a
+  mismatch; an amount above `u128` is `LandedUnread`, never truncated. `Reverted` and `TimedOut` map
+  onto `Outcome` as they do for swaps.
+
+  | Manager | `PoolKey` | ABI |
+  | --- | --- | --- |
+  | Uniswap v3 `NonfungiblePositionManager` | `Fee` | reference |
+  | PancakeSwap v3 `NonfungiblePositionManager` | `Fee` | identical to Uniswap v3 |
+  | Aerodrome / Velodrome Slipstream `NonfungiblePositionManager` | `TickSpacing` | `mint` takes `tickSpacing` in place of `fee` and ends with `sqrtPriceX96` (always 0) |
+
+  Manager addresses are not listed in the crate: the consumer passes them in. Uniswap v4's
+  `PositionManager` (`modifyLiquidities` with Permit2) needs a `PoolKey::V4` variant and a different
+  event set, and is deferred until a consumer needs it.
+
+The sender gains a fork backend for this mode:
+
+```rust
+impl EvmSender {
+    /// A sender that impersonates `owner` on an anvil fork. It refuses any
+    /// node whose `web3_clientVersion` does not start with "anvil": this
+    /// backend sends transactions, and must never send them anywhere real.
+    pub async fn fork(rpc: EvmRpc, owner: Address, chain_id: u64) -> Result<Arc<Self>>;
+
+    /// `Simulated` for a fork sender, `Landed` for a signing one. Adapters
+    /// take their provenance from this, and set `tx_ref` only when it is
+    /// `Landed`.
+    pub fn provenance(&self) -> Provenance;
+
+    /// Checks that the owner holds at least `amount` of `token`. A signing
+    /// sender returns an error when it does not, so a transaction that would
+    /// revert with STF is never sent. A fork sender instead writes the balance
+    /// slot with `anvil_setStorageAt` (the slot comes from `evm::erc20`'s
+    /// probing), exactly as `EvmSimulated` overrides state.
+    pub async fn ensure_balance(&self, token: Address, amount: U256) -> Result<()>;
+}
+```
+
+On a fork, `send_and_confirm` calls `anvil_impersonateAccount` and then `eth_sendTransaction` from the
+owner, and follows the same receipt polling, revert-reason replay, timeout path and unresolved-timeout
+rule as signing. One difference is deliberate: when the node's gas estimate says a transaction will
+revert, a signing sender refuses to spend gas on it (an `Err`, nothing sent), while a fork sender
+sends it anyway with a fixed gas limit, so a fork run observes the revert — `"Price slippage check"`,
+`"Not cleared"` — as an `Outcome::Reverted` with its reason. A fork sender is not in the process-wide
+registry: a fork is its own node, and anvil assigns an impersonated account's nonces itself.
 
 ## 6. The CEX port
 
@@ -238,7 +576,28 @@ pub struct OrderRequest {
     /// build the order itself — a market order carries no price, and
     /// treating this as one would be a fabricated quote, not a real order.
     pub quoted_price: Decimal,
+    /// The venue must refuse any part of this order that would increase or
+    /// flip the position instead of reducing it. A venue with no positions
+    /// (spot) must reject `true` with an error before sending, never ignore
+    /// it: an ignored reduce-only is an unguarded order.
+    pub reduce_only: bool,
 }
+
+/// Returned (inside `anyhow::Error`, found with `downcast_ref`) when an
+/// order may have reached the venue but its outcome could not be read: the
+/// placing call's response was lost, and the status query that should
+/// follow it also failed. The venue may have filled some, all or none of
+/// it. The caller must find out before it acts on this symbol again, for
+/// example by reading its position.
+#[derive(Debug, Clone)]
+pub struct OrderStateUnknown {
+    pub symbol: String,
+    /// The id this crate gave the order, which the venue can be asked about.
+    pub client_order_id: String,
+    /// `Some` if the venue acknowledged the order before contact was lost.
+    pub order_ref: Option<u64>,
+}
+impl std::error::Error for OrderStateUnknown {}
 
 #[derive(Debug, Clone)]
 pub struct CexFill {
@@ -265,6 +624,12 @@ pub trait CexExecutor: Send + Sync {
 }
 ```
 
+**An `Err` from `execute` means nothing filled, unless it is an `OrderStateUnknown`.** Every `Live`
+adapter keeps to this. After a venue accepts an order, a lost response, a failed status query, or a
+fill whose details cannot be read (for example commission charged in more than one asset, which
+`CexFill` cannot hold) all become `OrderStateUnknown`. None of them may surface as a plain error, and
+no fill is ever returned with a guessed commission.
+
 ### Required implementations (CEX)
 
 - **`CexLive`** — places a real order against a venue's trading API. Responsible for: rounding
@@ -274,11 +639,121 @@ pub trait CexExecutor: Send + Sync {
   time where the venue requires a timestamp within a tolerance; reading the fill correctly (§ above).
   Configurable by a base URL and a credential set, so that pointing it at a venue's sandbox/testnet
   host with sandbox credentials *is* the "Simulated" mode for this leg (§3) — no separate struct.
+  Venues without positions (spot) reject `reduce_only: true` before sending anything.
+- **`BinanceFuturesLive`** — the `CexLive` for Binance USDⓈ-M perpetuals (`src/cex/binance_futures/`),
+  which sends `reduceOnly`. It checks the account once, at construction, and refuses to return an
+  adapter for an account it cannot trade correctly:
+
+  ```rust
+  pub struct BinanceFuturesConfig {
+      pub base_url: String,   // BINANCE_FUTURES_BASE_URL; defaults to the testnet host, never production
+      pub api_key: String,    // BINANCE_FUTURES_API_KEY, required
+      pub api_secret: String, // BINANCE_FUTURES_API_SECRET, required
+  }
+
+  impl BinanceFuturesLive {
+      /// Connects, then refuses to return an adapter for an account it cannot
+      /// trade correctly. `symbols` are the only symbols `execute` will accept.
+      pub async fn connect(config: BinanceFuturesConfig, symbols: &[&str]) -> Result<Self>;
+  }
+  ```
+
+  It refuses hedge mode (`dualSidePosition`), multi-asset margin, BNB fee payment (`feeBurn`, which
+  would split commission across two assets), a clock too far out to fit `recvWindow`, and any symbol
+  that is missing, not `TRADING` or not `PERPETUAL`. Margin type and leverage are read (§6b), never
+  set. `execute` rounds `quantity` down to `MARKET_LOT_SIZE`, refuses quantities outside
+  `minQty`/`maxQty`, refuses `quantity × quoted_price` below `MIN_NOTIONAL` except for reduce-only
+  orders (a small remaining position must always be closable), places a `MARKET` order with its own
+  `newClientOrderId`, returns a partial fill (`EXPIRED`/`CANCELED` with `executedQty > 0`) as a
+  `CexFill`, reads commission from the order's trades (exactly one asset, or `OrderStateUnknown`), and
+  recovers a lost placing response by its client order id. `provenance` is `Landed`, on the testnet
+  too.
+
+  Every wait a live CEX adapter makes (request timeout, `recvWindow`, clock refresh, status polling,
+  how long trade lines may lag a fill) is one `CexTimings` value, so a test can make them short. A
+  failed call is sorted by whether the venue may have acted on it: a connection never opened is not
+  sent; a 4xx is a refusal (nothing filled); a timeout, a dropped connection, a 5xx or a 408 is lost,
+  and is followed by a status query by client order id rather than a blind resend.
 - **`CexStub`** — an in-process fake, same shape and same call-recording requirement as `EvmStub`:
-  programmable fills, rejections, and partial fills, no network.
+  programmable fills, rejections, partial fills and `OrderStateUnknown`, no network. It records
+  `reduce_only`, and has a reduce-only mode: given a signed position set by the test, it rejects any
+  reduce-only order that would increase or flip it.
 
 A second venue (a different exchange, with a different wire protocol) gets its own `Live`
 implementation; the trait does not change.
+
+## 6b. Reading a perp account
+
+A consumer holding a perp position needs three facts only the venue knows: the position the venue
+holds, the account's margin, and the funding it paid or received. Every value below is the venue's own
+number, read at call time. Nothing is summed across calls, marked to a price the crate chose, or
+remembered (§2).
+
+```rust
+// src/cex/account.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarginMode { Isolated, Cross }
+
+#[derive(Debug, Clone)]
+pub struct PerpPosition {
+    pub symbol: String,
+    /// Signed: negative is short. Zero when flat, which is an answer and not
+    /// an error.
+    pub qty: Decimal,
+    pub entry_price: Decimal,
+    pub mark_price: Decimal,
+    /// `None` when flat, or when the venue reports none.
+    pub liquidation_price: Option<Decimal>,
+    pub margin_mode: MarginMode,
+    pub leverage: u32,
+    /// `Some` exactly when `margin_mode` is `Isolated`.
+    pub isolated_margin: Option<Decimal>,
+    /// The venue's own update time for this position, in Unix ms.
+    pub as_of_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MarginState {
+    /// The asset these figures are in, e.g. "USDT".
+    pub asset: String,
+    pub margin_balance: Decimal,
+    pub maint_margin: Decimal,
+    pub available: Decimal,
+    pub as_of_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct FundingPayment {
+    pub symbol: String,
+    pub ts_ms: i64,
+    /// Signed: positive was received, negative was paid.
+    pub amount: Decimal,
+    pub asset: String,
+    /// The venue's id for this payment, so a caller can de-duplicate.
+    pub venue_ref: u64,
+}
+
+#[async_trait]
+pub trait CexAccount: Send + Sync {
+    async fn position(&self, symbol: &str) -> Result<PerpPosition>;
+    async fn margin(&self) -> Result<MarginState>;
+    /// Every payment with `ts_ms >= since_ms`, oldest first. The adapter pages
+    /// through the venue's limit itself; the result is never cut short
+    /// without a word.
+    async fn funding_since(&self, symbol: &str, since_ms: i64) -> Result<Vec<FundingPayment>>;
+    fn label(&self) -> &'static str;
+}
+```
+
+Reads carry no `Provenance`: nothing is sent, so there is no "sent or thrown away" to report. Which
+account was read, testnet or production, is the adapter's `label()` and base URL.
+
+### Required implementations (account reads)
+
+- **`BinanceFuturesAccount`** — shares `BinanceFuturesRest` (client, keys and clock offset) with
+  `BinanceFuturesLive`. In one-way mode, which `BinanceFuturesLive` requires, the venue reports one
+  position per symbol; more than one row for a symbol is an error, never a sum.
+- **`CexAccountStub`** — programmable values and errors; records its calls.
 
 ## 7. Contract tests — what keeps the stub honest
 
@@ -289,7 +764,8 @@ that is never checked against the real thing eventually stops resembling it, and
 production does.
 
 The rule that prevents it: **one shared test suite per port, written generically over "any
-`impl DexExecutor`" / "any `impl CexExecutor`"**, that every implementation must pass:
+`impl DexExecutor`" / "any `impl CexExecutor`" / "any `impl LiquidityExecutor`" / "any
+`impl CexAccount`"**, that every implementation must pass:
 
 ```rust
 // sketch — the real suite lives in `src/testkit/contract.rs`
@@ -304,12 +780,22 @@ pub async fn dex_executor_contract(executor: &dyn DexExecutor, fixture: Contract
 }
 ```
 
+The suites, all in `src/testkit/contract.rs`:
+
+| suite | runs against | asserts |
+|---|---|---|
+| `dex_executor_contract` | every `DexExecutor` | the two shape rules above |
+| `cex_executor_contract` | every `CexExecutor`, with `reduce_only: false` | `order_ref.is_some() == Landed` |
+| `cex_spot_rejects_reduce_only` | every spot `CexExecutor` | `reduce_only: true` is an error, and nothing reaches the venue |
+| `liquidity_executor_contract` | every `LiquidityExecutor` | one whole life — mint, increase, decrease all of it, collect everything (`u128::MAX` caps), burn — with the §5b shape rules at every step; mint gives a position and liquidity above zero and every later step returns that position; decrease removes exactly what mint and increase added; collect returns, per token, at least what decrease credited; burn succeeds |
+| `cex_account_contract` | every `CexAccount` | `isolated_margin.is_some() == (margin_mode == Isolated)`; `qty == 0` implies no liquidation price; funding sorted by `ts_ms`, every `ts_ms >= since_ms`, no repeated `venue_ref`; `asset` never empty |
+
 Run three ways, at different points in the development cycle:
 
 | run against | when | needs |
 |---|---|---|
 | `Stub` | every test run, unconditionally | nothing |
-| `Simulated` (a fork / a sandbox) | before any change to a `Live` adapter ships, and on a recurring schedule even without a code change | fork infrastructure or sandbox credentials |
+| `Simulated` (a fork / a sandbox) | before any change to a `Live` adapter ships, and on a recurring schedule even without a code change | fork infrastructure or sandbox credentials. For the liquidity port this is `EvmLiquidity` over a fork sender (§5b) |
 | `Live` | never automated — only a deliberate, watched, human-triggered run | real credentials, real money |
 
 The middle row is what makes the top row trustworthy: if `Stub` and `Simulated` ever disagree on the
@@ -323,23 +809,50 @@ venue-ports/
 ├── Cargo.toml
 └── src/
     ├── lib.rs
+    ├── evm/                  # the EVM chain family's plumbing, shared by every EVM adapter (§5)
+    │   ├── mod.rs
+    │   ├── rpc.rs            # EvmRpc: JSON-RPC, eth_call (with `from` and state overrides),
+    │   │                     # receipts, revert-reason replay, hex/ABI helpers
+    │   ├── erc20.rs          # selectors; balance and allowance reads; storage-slot probing
+    │   └── tx.rs             # Signer, EvmSender (signing and fork backends), TxOutcome, FeePolicy
     ├── dex/
-    │   ├── mod.rs           # DexExecutor, RouteQuote, SwapRequest, Prepared,
+    │   ├── mod.rs            # DexExecutor, RouteQuote, SwapRequest, Prepared,
     │   │                     # Realised, Outcome (Provenance is shared, § 4)
     │   └── evm/
-    │       ├── live.rs       # EvmLive
-    │       ├── simulated.rs  # EvmSimulated
-    │       ├── stub.rs       # EvmStub
-    │       └── tx.rs         # signing + nonce management shared within the family
+    │       ├── live.rs       # EvmLive, over an Arc<EvmSender>
+    │       ├── simulated.rs  # EvmSimulated, over an EvmRpc
+    │       └── stub.rs       # EvmStub
+    ├── liquidity/            # § 5b
+    │   ├── mod.rs            # LiquidityExecutor, LiquidityAction, LiquidityRealised, LandedUnread, …
+    │   ├── stub.rs           # LiquidityStub
+    │   └── evm/
+    │       ├── abi.rs        # sol! definitions for both manager ABIs and their events
+    │       └── executor.rs   # EvmLiquidity, over an Arc<EvmSender>
     ├── cex/
-    │   ├── mod.rs            # CexExecutor, OrderRequest, CexFill
+    │   ├── mod.rs            # CexExecutor, OrderRequest, OrderStateUnknown, CexFill
+    │   ├── account.rs        # § 6b: CexAccount, PerpPosition, MarginState, FundingPayment
     │   ├── stub.rs           # CexStub
+    │   ├── account_stub.rs   # CexAccountStub
+    │   ├── binance/          # shared by spot and futures:
+    │   │   ├── sign.rs       #   HMAC-SHA256 query signing
+    │   │   ├── clock.rs      #   the venue-clock offset
+    │   │   ├── client.rs     #   the signed client; -1021 retry; each failure sorted into
+    │   │   │                 #   not sent / refused / lost
+    │   │   ├── order.rs      #   finding an order by client order id, trade lines, the
+    │   │   │                 #   one-commission-asset rule
+    │   │   ├── rest.rs       # spot REST client
+    │   │   └── live.rs       # BinanceLive (spot)
+    │   ├── binance_futures/
+    │   │   ├── rest.rs       # BinanceFuturesRest: signed fapi client, server-clock offset
+    │   │   ├── filters.rs    # exchangeInfo → per-symbol MARKET_LOT_SIZE and MIN_NOTIONAL
+    │   │   ├── live.rs       # BinanceFuturesLive: impl CexExecutor
+    │   │   └── account.rs    # BinanceFuturesAccount: impl CexAccount
     │   └── <venue>/
     │       ├── rest.rs        # a signed REST client for one venue's API
     │       └── live.rs        # CexLive for that venue (base_url selects
     │                           # production vs. sandbox)
     └── testkit/
-        └── contract.rs        # § 7's shared suite
+        └── contract.rs        # § 7's shared suites
 ```
 
 ## 9. Acceptance criteria

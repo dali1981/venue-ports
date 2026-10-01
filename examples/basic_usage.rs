@@ -10,7 +10,7 @@
 use std::str::FromStr;
 
 use rust_decimal::Decimal;
-use venue_ports::cex::{CexExecutor, CexStub, OrderRequest, OrderSide};
+use venue_ports::cex::{CexExecutor, CexStub, OrderRequest, OrderSide, OrderStateUnknown};
 use venue_ports::dex::evm::EvmStub;
 use venue_ports::dex::{DexExecutor, Outcome, RouteQuote, SwapRequest};
 
@@ -80,6 +80,9 @@ async fn run_cex_leg() -> anyhow::Result<()> {
         side: OrderSide::Buy,
         quantity: Decimal::from_str("10")?,
         quoted_price: Decimal::from_str("150.25")?,
+        // A spot order: there is no position to reduce. A consumer closing
+        // part of a perp position sets this to `true` (SPEC.md §6).
+        reduce_only: false,
     };
 
     match cex.execute(&req).await {
@@ -91,7 +94,13 @@ async fn run_cex_leg() -> anyhow::Result<()> {
             fill.filled_price,
             fill.provenance
         ),
-        Err(err) => println!("[{}] order rejected: {err}", cex.label()),
+        // The one error that does not mean "nothing filled": the order may
+        // have reached the venue, so the caller finds out (e.g. by reading
+        // its position) before acting on this symbol again.
+        Err(err) if err.downcast_ref::<OrderStateUnknown>().is_some() => {
+            println!("[{}] order state unknown — resolve it: {err}", cex.label())
+        }
+        Err(err) => println!("[{}] order rejected, nothing filled: {err}", cex.label()),
     }
 
     Ok(())
