@@ -60,6 +60,42 @@ path. A DEX's "run it and discard the result" (simulate-only) and "sign and broa
 *different operations* against the chain, so a DEX adapter genuinely needs three distinct
 implementations where a CEX adapter typically needs two.
 
+### Ports and venues: one strict contract, venues are adapters
+
+Every port keeps one contract, the same for every venue behind it (`specs/V5-venues-and-solana.md` §1,
+after pm-trading's "Fix Venue Abstraction & Enforce Cross-Venue Parity"):
+
+1. **One command interface.** Every action goes through it. The caller never calls a venue directly.
+2. **One event interface.** Normalized and deterministic, enough to rebuild the position's state, with
+   no venue-specific event.
+3. **Explicit capabilities.** The caller branches only on them, never on the venue's name.
+4. **The simulator is a venue** like any other, not a special case.
+5. **One contract suite.** The same sequence runs against every venue, and asserts the same events
+   and the same state changes (§7).
+
+In this crate a **port is the contract**: the DEX port (§5) and the liquidity port (§5b). Its commands,
+events and capabilities are the only types a caller sees. A **venue is an adapter behind the port**:
+Uniswap v3's position managers, Orca's Whirlpool and Jupiter are venues. A venue's own types (its ABI,
+its instructions, its accounts, its program's events) live inside its adapter and never cross the port.
+A consumer's own paper simulator implements the same ports and passes the same suite: it is an adapter,
+not a mode.
+
+### Simulated runs one of two ways. "Fork" is not a mode
+
+The three modes above are the only modes. Simulated means the real protocol runs and nothing real is
+spent, and it runs one of two ways, chosen by what the port needs:
+
+- **A dry run.** One call against the real chain's current state, whose result is thrown away:
+  `eth_call` (`EvmSimulated`), `simulateTransaction` (`JupiterSimulated`). This is enough for a swap,
+  which is one action.
+- **On a fork.** The Live adapter, unchanged, sends to a throwaway copy of the chain: anvil on EVM,
+  Surfpool on Solana. The sender's fork backend makes it Simulated (`EvmSender::fork`, §5b;
+  `SolanaSender::fork`, §5). This is what a liquidity position needs: its actions build on each other
+  (open, then remove, then collect), and a dry run forgets each one's state before the next.
+
+A consumer's paper simulator is neither: its own model of a venue, with no protocol and no chain. It is
+a venue like any other, and its outcomes are `Simulated`.
+
 ## 4. Shared vocabulary
 
 ```rust
@@ -79,11 +115,27 @@ Every outcome type below carries a `Provenance`. A caller that cannot tell, by l
 whether it came from a real send or a throwaway run has been handed a bug; the type exists so that
 question always has an answer.
 
+```rust
+/// The network a command is for. An EIP-155 id means nothing on Solana, so
+/// a command names its network instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Network {
+    Evm { chain_id: u64 },
+    /// Identified by its genesis hash, which the adapter checks against its
+    /// node at construction.
+    Solana { genesis_hash: [u8; 32] },
+}
+```
+
+An adapter belongs to one network and refuses a command for any other. `ChainAddress` (§5) stays
+bytes: 20 on EVM, 32 on Solana, and the adapter checks the length.
+
 ## 5. The DEX port
 
 ```rust
 use async_trait::async_trait;
 use anyhow::Result;
+use crate::{Network, Provenance};
 
 /// A chain-native token amount. This crate does not interpret decimals,
 /// symbols, or USD value — that belongs to whatever quoted the route.
@@ -102,7 +154,7 @@ pub type ChainAddress = Vec<u8>;
 /// one itself.
 #[derive(Debug, Clone)]
 pub struct RouteQuote {
-    pub chain_id: u64,
+    pub network: Network,
     pub token_in: ChainAddress,
     pub token_out: ChainAddress,
     pub amount_in: ChainAmount,
@@ -129,17 +181,35 @@ pub struct SwapRequest {
     pub deadline_unix_secs: u64,
 }
 
-/// A route bound to a request: ready to run, one way or another. What
-/// `to`/`calldata`/`value` actually mean is chain-specific; this shape is
-/// deliberately generic across chain families.
+/// A route or command bound to a request: ready to run, one way or
+/// another. It passes from a port's `prepare` to its `execute`, and the
+/// caller does not read it. An EVM adapter refuses `Prepared::Solana` by
+/// name, and the reverse.
 #[derive(Debug, Clone)]
-pub struct Prepared {
+pub enum Prepared {
+    Evm(EvmCall),
+    Solana(SolanaTransaction),
+}
+
+/// A call to one contract (what `Prepared` was before it became an enum:
+/// the fields are unchanged, so no EVM encoding changes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvmCall {
     pub to: ChainAddress,
     pub calldata: Vec<u8>,
     pub value: ChainAmount,
 }
 
+/// A transaction built for one fee payer, unsigned until a sender signs it.
 #[derive(Debug, Clone)]
+pub struct SolanaTransaction {
+    pub transaction: solana_transaction::versioned::VersionedTransaction,
+    /// The last block height its blockhash is valid at: after it, the
+    /// transaction can never land.
+    pub last_valid_block_height: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     Success,
     /// The swap reverted. There is no output amount; there is a reason.
@@ -150,6 +220,56 @@ pub enum Outcome {
     /// poll that outlives this call, a manual check) before it is treated
     /// as anything else.
     TimedOut,
+    /// Known never to have landed: the transaction's blockhash has expired
+    /// (`last_valid_block_height` is past) and its signature has no status.
+    /// Solana can answer this; no EVM adapter returns it.
+    Expired,
+}
+
+/// What a transaction cost, per family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxCost {
+    Evm(EvmCost),
+    Solana(SolanaCost),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EvmCost {
+    /// `None` where a dry run reports none.
+    pub gas_used: Option<u64>,
+    pub effective_gas_price_wei: Option<u128>,
+    /// A rollup's data fee, from the receipt.
+    pub l1_fee_wei: Option<u128>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SolanaCost {
+    /// Signature fee + priority fee, from the transaction's meta.
+    pub fee_lamports: u64,
+    pub units_consumed: u64,
+    /// Paid into accounts that return it when closed (a position).
+    pub rent_deposited_lamports: u64,
+    /// Paid into accounts that never return it (a tick array).
+    pub rent_spent_lamports: u64,
+    /// Given back by an account this transaction closed.
+    pub rent_returned_lamports: u64,
+}
+
+impl TxCost {
+    /// The same four figures for every family, in the chain's smallest
+    /// native unit (wei, lamports): what a caller records without
+    /// branching on the family. On EVM, `deposited`, `spent` and
+    /// `returned` are zero, and `fee` is `gas_used × effective_gas_price +
+    /// l1_fee`, counting a missing figure as zero.
+    pub fn native(&self) -> NativeCost;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeCost {
+    pub fee: u128,
+    pub deposited: u128,
+    pub spent: u128,
+    pub returned: u128,
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +279,10 @@ pub struct Realised {
     /// real, terrible price; "no price" is a different fact.
     pub amount_out: Option<ChainAmount>,
     pub outcome: Outcome,
+    /// What it cost, whenever something ran, a revert included. A dry
+    /// run's figures are what the run reported (an `eth_call` reports no
+    /// gas; `simulateTransaction` reports `unitsConsumed`).
+    pub cost: TxCost,
     /// The block (or slot) the outcome was observed at.
     pub at: u64,
     pub provenance: Provenance,
@@ -207,9 +331,10 @@ pub trait DexExecutor: Send + Sync {
   }
   ```
 
-  `prepare` refuses a `RouteQuote` whose `chain_id` is not the sender's. Given a fork sender (§5b)
+  `prepare` refuses a `RouteQuote` whose `network` is not the sender's. Given a fork sender (§5b)
   instead of a signing one, `EvmLive` becomes a swap simulator whose state persists between calls: its
-  provenance is then `Simulated` and it sets no `tx_ref`.
+  provenance is then `Simulated` and it sets no `tx_ref`. Its `cost` is `TxCost::Evm` with the
+  receipt's `gasUsed`, `effectiveGasPrice` and, on a rollup, `l1Fee`.
 - **`EvmSimulated`** — runs the prepared call against current (or a specified historical) chain state
   through a read-only simulation endpoint (an `eth_call`-equivalent), with no transaction ever
   broadcast. Where the simulated sender does not actually hold the input token or the router's
@@ -219,16 +344,34 @@ pub trait DexExecutor: Send + Sync {
   of the router's return data: `SwapRouter02.exactInputSingle` returns one word, and KyberSwap's
   `MetaAggregationRouterV2.swap` and the other common aggregator routers put the output amount first.
   Fewer than 32 bytes is an error, never a panic. A router whose output is not its first word needs its
-  own adapter.
-- **`EvmStub`** — an in-process fake with no network calls at all. Must let a test program the exact
-  `Realised` (or error) a given `execute()` call returns, including reverts with a specific reason and
-  a forced `TimedOut`. Must record every call it received (route, request, prepared value) so a test
-  can assert on what was actually sent to it, not just on what it returned.
+  own adapter. Its `cost` is `TxCost::Evm` with every figure `None`: an `eth_call` reports no gas.
+- **`DexStub`** (today's `EvmStub`, renamed: it was never EVM-specific) — an in-process fake with no
+  network calls at all. Must let a test program the exact `Realised` (or error) a given `execute()` call
+  returns, including reverts with a specific reason, a forced `TimedOut` and an `Expired`. Must record
+  every call it received (route, request, prepared value) so a test can assert on what was actually
+  sent to it, not just on what it returned.
 
-A second chain family (e.g. a Solana-style chain, where transactions are signed and simulated
-differently from an EVM chain) gets its own `Live`/`Simulated` pair implementing the same trait; the
-trait does not change to accommodate it. `Stub` is chain-family-agnostic and does not need to be
-duplicated per chain.
+**Jupiter** is a venue behind this port, with its rules inside its adapters (`src/dex/jupiter/`):
+
+- **The payload** is Jupiter's quote response, verbatim (it is what `/swap` takes back).
+- **The minimum.** Jupiter's program takes a slippage in bps against its quoted amount. The adapter
+  sets it to the smallest value whose on-chain minimum is at or above `SwapRequest.min_amount_out`,
+  rounding toward safety. It refuses a minimum above the quoted amount. The literal number stays the
+  contract, and the bps are the venue's encoding of it.
+- **The amount out** is the destination token account's balance after, less before. It is read from
+  `simulateTransaction`'s returned accounts (dry run), or from the landed transaction's post token
+  balances.
+- **The cost** is `TxCost::Solana`, carrying the run's `unitsConsumed`.
+
+| Mode | Adapter |
+| --- | --- |
+| Simulated, dry run | **`JupiterSimulated`**: `/swap`, then `simulateTransaction` with `sigVerify: false` and `replaceRecentBlockhash: true`, from an account that holds the input token (Solana has no state override) |
+| Simulated, on a fork | **`JupiterLive`** over a fork `SolanaSender` (Surfpool) |
+| Live | `JupiterLive` over a signing `SolanaSender`: not built until the owner asks |
+| Stub | `DexStub` |
+
+`Stub` is chain-family-agnostic and is not duplicated per chain. The trait does not change for a
+second family: only `Prepared`, `Outcome` and `TxCost` gained the Solana forms above.
 
 ### The EVM sender — one per wallet and chain
 
@@ -313,215 +456,322 @@ The EVM chain family's plumbing is shared by every EVM adapter rather than copie
 revert-reason replay, hex/ABI helpers) and `src/evm/erc20.rs` (selectors, balance and allowance reads,
 storage-slot probing).
 
+### The Solana family — one sender per wallet and cluster
+
+The Solana family's plumbing lives in `src/solana/`, shared by every Solana adapter (Jupiter here,
+Whirlpool in §5b), as `src/evm/` is for EVM. Transactions, keys and instructions are the Solana SDK's
+own crates — `solana-pubkey` (or `solana-address`), `solana-hash`, `solana-instruction`,
+`solana-message`, `solana-transaction`, `solana-keypair`, `solana-signer` — on one version line,
+pinned. The crate does not use `solana-rpc-client`.
+
+```rust
+// src/solana/rpc.rs
+/// JSON-RPC over `reqwest`, as `EvmRpc` is: `getGenesisHash`,
+/// `getLatestBlockhash`, `getBlockHeight`, `simulateTransaction`,
+/// `sendTransaction`, `getSignatureStatuses`, `getTransaction`,
+/// `getMultipleAccounts`, and the fork node's `surfnet_*` methods.
+pub struct SolanaRpc { /* reqwest client, URL */ }
+
+// src/solana/tx.rs
+pub enum SolanaTxOutcome {
+    Success { slot: u64, signature: [u8; 64], cost: SolanaCost, meta: TxMeta },
+    /// The transaction landed and failed: its fee is spent, its effects are not.
+    Failed { slot: u64, signature: [u8; 64], reason: String, cost: SolanaCost },
+    /// Sent, not seen, and its blockhash not yet expired when polling gave up.
+    TimedOut { signature: [u8; 64] },
+    /// Its blockhash expired with no status for its signature: it can never land.
+    Expired { signature: [u8; 64] },
+}
+
+/// The only thing in the crate that signs for one wallet on one cluster.
+/// Every Solana adapter that sends from that wallet holds the same `Arc`.
+pub struct SolanaSender { /* SolanaRpc, backend (signing or fork), network, poll settings */ }
+
+impl SolanaSender {
+    /// A signing sender, with a key from the environment. **Refused**: it
+    /// returns an error until the owner asks for Live.
+    pub async fn signing(rpc: SolanaRpc, network: Network) -> Result<Arc<Self>>;
+    /// A sender on a Surfpool fork. It refuses any node that does not serve
+    /// a `surfnet_*` method (a real cluster serves none), generates its key
+    /// at run time and never writes it, and funds it with SOL for fees.
+    pub async fn fork(rpc: SolanaRpc) -> Result<Arc<Self>>;
+    pub fn address(&self) -> [u8; 32];
+    pub fn network(&self) -> Network;
+    /// `Simulated` for a fork sender, `Landed` for a signing one.
+    pub fn provenance(&self) -> Provenance;
+    pub fn rpc(&self) -> &SolanaRpc;
+    /// A fresh blockhash and the block height it stays valid to, for an
+    /// adapter building a `SolanaTransaction`.
+    pub async fn latest_blockhash(&self) -> Result<([u8; 32], u64)>;
+    /// Sign, send, and poll the signature until its outcome is known or
+    /// its blockhash expires.
+    pub async fn send_and_confirm(&self, tx: &SolanaTransaction) -> Result<SolanaTxOutcome>;
+    /// Checks that the owner's token account for `mint` holds at least
+    /// `amount`. A signing sender returns an error when it does not; a fork
+    /// sender writes the balance with Surfpool's cheatcode, as
+    /// `EvmSender::ensure_balance` writes a storage slot on anvil.
+    pub async fn ensure_balance(&self, mint: [u8; 32], token_program: [u8; 32], amount: u64) -> Result<()>;
+}
+```
+
+Rules, as for `EvmSender`:
+
+- **One `SolanaSender` per (address, network) per process**, and adapters refuse actions for any other
+  network. A sender checks `getGenesisHash` against its network at construction.
+- **The fork backend never sends anywhere real**: it refuses a node that does not answer a `surfnet_*`
+  method, as the EVM fork backend refuses a node that is not anvil.
+- **A send that ends `TimedOut`** blocks the next send until it is resolved, as on EVM. **`Expired` is
+  terminal**: the transaction can never land, so it blocks nothing.
+- **Pace the public endpoints.** Surfpool fetches mainnet accounts on demand from its upstream RPC;
+  one Solana process per IP on the public endpoints.
+
 ## 5b. The liquidity port
 
-A concentrated-liquidity position goes through a **position manager**, not a router. It is created,
-grown, shrunk, harvested and closed. `DexExecutor` cannot express this: `Realised` holds one
-`amount_out`, while a mint returns a position id, an amount of liquidity and two token amounts, and a
-decrease moves nothing until a later collect. The port turns a decided action into a known outcome like
-the other two; it has its own trait because its outcomes have a different shape.
+A concentrated-liquidity position is opened, grown, shrunk, harvested and closed. `DexExecutor` cannot
+express this: `Realised` holds one `amount_out`, while an open returns a position, an amount of
+liquidity and two token amounts. The port turns a decided command into a known outcome like the other
+two; it has its own trait because its outcomes have a different shape. It is one contract for every
+venue (§3): Uniswap v3's position managers on EVM, Orca's Whirlpool on Solana, and a consumer's paper
+model pass the same suite.
 
 In this port's terms, the crate does **not**: choose ranges, or compute liquidity from prices or
-prices from ticks (the manager computes the liquidity, the chain reports it, and the crate reads the
-report back); value a position, track what it holds, or remember what it minted; stake positions in
-gauges or claim emissions; create pools, or handle native ETH (`value` is always zero, and tokens are
-ERC-20s). It does not support fee-on-transfer tokens: the EVM adapter detects them and refuses to read
-their outcome, but does not handle them.
+prices from ticks (the venue computes the liquidity from a deposit in token amounts, the chain reports
+it, and the crate reads the report back); value a position, track what it holds, or remember what it
+opened; stake positions in gauges or claim emissions; create pools; wrap native ETH or SOL (tokens are
+ERC-20s or SPL tokens); or create the owner's token accounts on Solana. It does not support
+fee-on-transfer tokens: the EVM adapter detects them and refuses to read their outcome, but does not
+handle them.
+
+### Commands
 
 ```rust
 // src/liquidity/mod.rs
-use crate::dex::{ChainAddress, ChainAmount, Outcome, Prepared};
-use crate::Provenance;
+use crate::dex::{ChainAddress, Outcome, Prepared, TxCost};
+use crate::{Network, Provenance};
 
-/// Identifies the pool a range belongs to. It is also what decides how the
-/// manager's `mint` is encoded.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PoolKey {
-    /// Uniswap v3's NonfungiblePositionManager and its ABI-identical forks
-    /// (PancakeSwap v3): the fee tier in hundredths of a basis point
-    /// (500 = 0.05 %).
-    Fee(u32),
-    /// Aerodrome and Velodrome Slipstream: the pool's tick spacing. Their
-    /// `mint` takes one more argument, `sqrtPriceX96`, which this crate
-    /// always sends as zero because it never creates a pool.
-    TickSpacing(i32),
+pub enum LiquidityCommand {
+    /// Open a position on `range` and deposit into it.
+    Open { range: Range, deposit: Deposit },
+    /// Deposit more into an open position.
+    Add { position: PositionId, deposit: Deposit },
+    /// Take `liquidity` out of the range, refusing less than `min_out` of each token.
+    Remove { position: PositionId, liquidity: u128, min_out: TokenPair },
+    /// Transfer to the owner everything the position owes.
+    Collect { position: PositionId },
+    /// Close a position that holds no liquidity and owes nothing.
+    Close { position: PositionId },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RangeSpec {
-    pub chain_id: u64,
-    /// The position manager contract, not the pool.
-    pub manager: ChainAddress,
-    /// In the pool's own order: token0 < token1.
-    pub token0: ChainAddress,
-    pub token1: ChainAddress,
-    pub pool_key: PoolKey,
-    pub tick_lower: i32,
-    pub tick_upper: i32,
+/// The pool, not a manager or a program: the adapter knows its venue's
+/// deployment from its construction, and reads the pool's tokens and key
+/// from the pool.
+pub struct Range { pub network: Network, pub pool: ChainAddress, pub tick_lower: i32, pub tick_upper: i32 }
+
+pub struct Deposit { pub max: TokenPair, pub guard: DepositGuard }
+
+/// The slippage guard. A venue enforces one kind, and says which in its
+/// capabilities.
+pub enum DepositGuard {
+    MinAmounts(TokenPair),
+    SqrtPriceBand { min_sqrt_price_x64: u128, max_sqrt_price_x64: u128 },
 }
 
-/// A position held in a manager. On v3-style managers it is an ERC-721
-/// token id, as 32 big-endian bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PositionRef {
-    pub chain_id: u64,
-    pub manager: ChainAddress,
-    pub id: Vec<u8>,
-}
+/// Opaque to the caller: an ERC-721 id under a manager (32 big-endian
+/// bytes), a position mint under a program.
+pub struct PositionId { pub network: Network, pub bytes: Vec<u8> }
 
-#[derive(Debug, Clone)]
-pub enum LiquidityAction {
-    Mint {
-        range: RangeSpec,
-        amount0_desired: ChainAmount,
-        amount1_desired: ChainAmount,
-        amount0_min: ChainAmount,
-        amount1_min: ChainAmount,
-    },
-    Increase {
-        position: PositionRef,
-        amount0_desired: ChainAmount,
-        amount1_desired: ChainAmount,
-        amount0_min: ChainAmount,
-        amount1_min: ChainAmount,
-    },
-    /// Moves `liquidity` out of the range and into the position's owed
-    /// tokens. **It transfers nothing**: tokens leave only on `Collect`.
-    Decrease {
-        position: PositionRef,
-        liquidity: u128,
-        amount0_min: ChainAmount,
-        amount1_min: ChainAmount,
-    },
-    /// Transfers the owed tokens to the owner, up to the caps. Owed tokens
-    /// are the principal released by earlier decreases plus the fees earned.
-    Collect { position: PositionRef, amount0_max: u128, amount1_max: u128 },
-    /// Destroys a position that has no liquidity and nothing owed.
-    Burn { position: PositionRef },
-}
+/// In the pool's own token order.
+pub struct TokenPair { pub token0: u128, pub token1: u128 }
 
-#[derive(Debug, Clone)]
 pub struct LiquidityRequest {
-    /// Signs and pays. It also receives the minted position and the collected
-    /// tokens: the crate never sends either anywhere else. Never the zero
-    /// address.
+    /// Signs and pays. It also receives the position and every token the
+    /// position transfers: the crate never sends either anywhere else.
+    /// Never the zero address.
     pub owner: ChainAddress,
-    /// Unix time after which the action must not execute. Required, as for a
-    /// swap.
+    /// Unix time after which the command must not execute. Required, as for
+    /// a swap.
     pub deadline_unix_secs: u64,
 }
+```
 
-#[derive(Debug, Clone)]
-pub struct LiquidityRealised {
+Both venues take a deposit in token amounts and compute the liquidity themselves: Uniswap's managers in
+`mint` and `increaseLiquidity`, Whirlpool in `increase_liquidity_by_token_amounts_v2`, which takes
+`token_max_a`, `token_max_b` and a sqrt-price band. `Collect` has no caps: it always takes everything.
+
+### Events and reports
+
+```rust
+pub enum LiquidityEvent {
+    Opened { position: PositionId, liquidity: u128, paid: TokenPair },
+    Added { liquidity: u128, paid: TokenPair },
+    /// `released`: the principal taken out of the range. `transferred`:
+    /// what reached the owner in this transaction.
+    Removed { liquidity: u128, released: TokenPair, transferred: TokenPair },
+    Collected { transferred: TokenPair },
+    Closed,
+}
+
+/// One per command executed.
+pub struct LiquidityReport {
     pub outcome: Outcome,
-    /// The position acted on; for `Mint`, the new one.
-    pub position: Option<PositionRef>,
-    pub liquidity_delta: Option<u128>,
-    pub amount0: Option<ChainAmount>,
-    pub amount1: Option<ChainAmount>,
-    /// The block the outcome was observed at.
+    /// `Some` exactly when `outcome` is `Success`.
+    pub event: Option<LiquidityEvent>,
+    /// Whenever something ran, a revert included.
+    pub cost: TxCost,
+    /// The block or slot the outcome was observed at.
     pub at: u64,
     pub provenance: Provenance,
-    /// Set if and only if `provenance == Provenance::Landed`.
+    /// `Some` exactly when `provenance` is `Landed`.
     pub tx_ref: Option<Vec<u8>>,
 }
 
-/// Returned inside `anyhow::Error` when an action's transaction landed but
-/// its outcome could not be read from the receipt: an expected event was
-/// missing, or the cross-check failed. Something happened on chain, so the
-/// caller must inspect `tx_ref` before it acts on this position again.
-#[derive(Debug, Clone)]
-pub struct LandedUnread {
-    pub tx_ref: Vec<u8>,
-    pub reason: String,
-}
+/// Returned inside `anyhow::Error` when a command's transaction landed but
+/// its outcome could not be read: an expected event was missing, or the
+/// cross-check failed. Something happened on chain, so the caller must
+/// inspect `tx_ref` before it acts on this position again.
+pub struct LandedUnread { pub tx_ref: Vec<u8>, pub reason: String }
 impl std::error::Error for LandedUnread {}
+```
+
+The events state facts, never a venue's semantics. **A position's token flow is the sum of `paid`, less
+the sum of `transferred`. The fees it earned are the sum of `transferred`, less the sum of
+`released`.** The caller computes both the same way for every venue.
+
+### Capabilities and the trait
+
+```rust
+pub enum DepositGuardKind { MinAmounts, SqrtPriceBand }
+
+pub struct LiquidityCapabilities {
+    /// The guard the venue enforces on a deposit.
+    pub deposit_guard: DepositGuardKind,
+    /// A Remove transfers the principal at once. Otherwise it stays owed until Collect.
+    pub remove_transfers: bool,
+    /// Opening a range may create accounts whose rent never returns (`NativeCost.spent`).
+    pub open_may_spend_rent: bool,
+    /// Close returns a deposit (`NativeCost.returned`).
+    pub close_returns_deposit: bool,
+}
 
 #[async_trait]
 pub trait LiquidityExecutor: Send + Sync {
-    /// Validates the action and encodes it. It may read the chain (the
-    /// position's owner and tokens) but sends nothing.
-    async fn prepare(&self, action: &LiquidityAction, req: &LiquidityRequest) -> Result<Prepared>;
-    /// Runs the prepared action to a terminal outcome and does not return
+    fn capabilities(&self) -> LiquidityCapabilities;
+    /// Validates the command and encodes it. It may read the chain (the
+    /// pool, the position) but sends nothing.
+    async fn prepare(&self, cmd: &LiquidityCommand, req: &LiquidityRequest) -> Result<Prepared>;
+    /// Runs the prepared command to a terminal outcome and does not return
     /// before then, like `DexExecutor::execute`.
-    async fn execute(&self, prepared: &Prepared) -> Result<LiquidityRealised>;
+    async fn execute(&self, prepared: &Prepared) -> Result<LiquidityReport>;
     fn label(&self) -> &'static str;
 }
 ```
 
-**The shape rules**, asserted for every implementation by `liquidity_executor_contract` (§7):
+The caller branches on `deposit_guard` alone, to build the guard. The other three explain the events'
+and costs' figures, and no accounting needs them.
 
-- `position`, `liquidity_delta`, `amount0` and `amount1` are all `Some` exactly when `outcome` is
-  `Success`. A revert or a timeout is never shown as zeros.
-- `tx_ref` is `Some` exactly when `provenance` is `Landed`.
-- An `Err` means nothing was sent for the action itself, unless it is `LandedUnread`. A failed
-  approval is an `Err`: it is setup, and no position changed.
-
-**What the amounts mean, per action:**
-
-| Action | `liquidity_delta` | `amount0`, `amount1` | Read from the manager's events |
-| --- | --- | --- | --- |
-| `Mint` | liquidity added | tokens paid in | ERC-721 `Transfer(0 → owner, id)` and `IncreaseLiquidity(id, …)` |
-| `Increase` | liquidity added | tokens paid in | `IncreaseLiquidity(id, …)` |
-| `Decrease` | liquidity removed | tokens **credited to the position's owed balance**, not transferred | `DecreaseLiquidity(id, …)` |
-| `Collect` | 0 | tokens transferred to the owner | `Collect(id, …)` |
-| `Burn` | 0 | 0, 0 | ERC-721 `Transfer(owner → 0, id)` |
-
-The zeros for `Collect` and `Burn` are real values: those actions change no liquidity, and `Burn`
-moves no tokens.
-
-**There is no `at` parameter on `execute`.** A liquidity action changes state that later actions
+**There is no `at` parameter on `execute`.** A liquidity command changes state that later commands
 depend on, so re-running one alone at an older block means nothing. A caller who wants an older state
 starts the fork at that block.
 
+### The rules every venue keeps
+
+Each holds on every venue, and `liquidity_executor_contract` (§7) checks it:
+
+- **A command the position cannot take is refused before sending**, an `Err` with nothing sent.
+  Removing more liquidity than the position holds, closing a position that holds liquidity or owes
+  tokens, and acting on a position the owner does not hold are refused this way. Every venue reads the
+  position first.
+- **Collect on a position that owes nothing** is a success that transfers zero.
+- **A passed deadline** is refused without sending. On Solana, the blockhash also bounds the
+  transaction once sent (`Outcome::Expired`).
+- **A transaction that ran and whose effect cannot be read** is `LandedUnread`, on every venue.
+- **The shape rules**: `event` is `Some` exactly on `Success`; `tx_ref` is `Some` exactly when
+  `Landed`; `cost` is set whenever something ran. An `Err` means nothing was sent for the command
+  itself, unless it is `LandedUnread`. A failed approval is an `Err`: it is setup, and no position
+  changed.
+
+### The venues
+
+| | Uniswap v3 position managers (EVM) | Orca Whirlpool (Solana) | A consumer's paper model |
+| --- | --- | --- | --- |
+| Deployment given at construction | the manager's address and its ABI variant (Uniswap, PancakeSwap, Slipstream) | the Whirlpool program id | the pool's mirror |
+| `Open` | `mint` | the range's missing tick arrays created, then `open_position_with_token_extensions` and `increase_liquidity_by_token_amounts_v2`, in one transaction | the position maths |
+| `Add` | `increaseLiquidity` | `increase_liquidity_by_token_amounts_v2` | the position maths |
+| `Remove` | `decreaseLiquidity`: the principal stays owed | `decrease_liquidity_v2`: the principal is paid at once | as its venue would |
+| `Collect` | `collect`: owed principal and fees | `update_fees_and_rewards`, then `collect_fees_v2` | what the position owes |
+| `Close` | `burn` | `close_position_with_token_extensions`: the position's rent comes back | — |
+| Events read from | the manager's logs, checked against the ERC-20 `Transfer` logs | the program's own events (`LiquidityIncreased`, `LiquidityDecreased`, `PositionOpened`), checked against the token accounts' balance changes | itself |
+| `deposit_guard` | `MinAmounts` | `SqrtPriceBand` | either, as configured |
+| `remove_transfers` | false | true | as its venue |
+| `open_may_spend_rent`, `close_returns_deposit` | false, false | true, true | as its venue |
+| Live, Simulated | `EvmLiquidity` over a signing sender, or over anvil | `WhirlpoolLiquidity` over a signing `SolanaSender` (not built until the owner asks), or over Surfpool | Simulated only |
+
+Inside the Whirlpool adapter, and never outside it: the instructions above, the position mint and its
+derived account, the tick arrays (fixed or dynamic), SPL Token and Token-2022 (the `_v2` instructions
+take either), and the rent figures it reports in `SolanaCost`.
+
 ### Required implementations (liquidity)
 
-A position's life is a sequence of actions, each depending on the state the last one left, and an
-`eth_call` discards that state. So the Simulated mode runs the actions on an **anvil fork**, as real
-transactions from an impersonated owner: the same operation as Live, sent to a chain that is thrown
-away afterwards. The result is one implementation and two senders — §3's CEX pattern, arrived at by a
-different route — and Simulated and Live share every line of encoding and decoding.
+A position's life is a sequence of commands, each depending on the state the last one left, and a dry
+run discards that state. So Simulated runs the commands **on a fork**, as real transactions: the same
+operation as Live, sent to a chain that is thrown away afterwards (§3). One implementation, two senders,
+and Simulated and Live share every line of encoding and decoding.
 
-- **`LiquidityStub`** — no network calls. Each call's outcome is programmed: success with given
-  values, `Reverted { reason }`, `TimedOut`, an `Err`, or `LandedUnread`. It records every `prepare` and
-  `execute` it receives. **An action with no programmed outcome is an `Err` naming the action**: a
-  fallback would have to invent liquidity and amounts.
+- **`LiquidityStub`** — no network calls. Each call's outcome is programmed: success with a given
+  event and cost, `Reverted { reason }`, `TimedOut`, an `Err`, or `LandedUnread`. Its capabilities are
+  set by the test. It records every `prepare` and `execute` it receives. **A command with no programmed
+  outcome is an `Err` naming the command**: a fallback would have to invent liquidity and amounts.
 - **`EvmLiquidity`** — one implementation over an `Arc<EvmSender>`; its label is
   `"evm-liquidity-live"` or `"evm-liquidity-fork"`, from the sender.
 
   ```rust
+  /// Which position manager ABI the deployment speaks.
+  pub enum ManagerAbi {
+      /// Uniswap v3's NonfungiblePositionManager: the pool key is the fee tier.
+      UniswapV3,
+      /// PancakeSwap v3's: ABI-identical to Uniswap v3's.
+      PancakeSwapV3,
+      /// Aerodrome and Velodrome Slipstream: the pool key is the tick spacing, and
+      /// `mint` ends with `sqrtPriceX96`, always sent as zero (this crate never
+      /// creates a pool).
+      Slipstream,
+  }
+
   impl EvmLiquidity {
-      pub fn new(sender: Arc<EvmSender>) -> Self;
+      pub fn new(sender: Arc<EvmSender>, manager: Address, abi: ManagerAbi) -> Self;
   }
   ```
 
+  Its encoding, its checks and its log reading are V3's; only where its inputs come from changed.
   `prepare` checks the owner is the sender's address and not zero, the deadline is set and has not
-  passed, and the action's `chain_id` is the sender's. `Mint`: token0 < token1, tick_lower <
-  tick_upper, the desired amounts are not both zero, and each minimum is at most its desired amount
-  (tick spacing is the manager's to check). Any other action: `ownerOf(id)` must be the owner;
-  `Increase` reads token0 and token1 from `positions(id)`; `Decrease` needs liquidity above zero;
-  `Collect` needs at least one cap above zero. Encoding uses `alloy-sol-types`, never hand-encoding.
+  passed, and the command's `network` is the sender's. `Open`: tick_lower < tick_upper, the deposit's
+  maxima are not both zero, the guard is `MinAmounts` with each minimum at most its maximum; it reads
+  `token0`, `token1` and the pool key (`fee`, or `tickSpacing` for Slipstream) from the pool, and
+  refuses a pool whose `factory` is not the manager's (tick spacing is the manager's to check). Any
+  other command: `ownerOf(id)` must be the owner, and `positions(id)` gives the tokens, the liquidity and
+  what is owed — `Remove` above the liquidity is refused, as is `Close` on a position holding liquidity
+  or owing tokens. Encoding uses `alloy-sol-types`, never hand-encoding.
 
-  `execute`: refuses a passed deadline without sending; for `Mint` and `Increase`, `ensure_balance`
-  and `ensure_allowance` per token, with the manager as spender and **exactly the desired amount**,
-  never `U256::MAX`; sends to the manager; decodes the events from the manager's own logs
-  (`LandedUnread` if one is missing); **cross-checks** against the ERC-20 `Transfer` logs of the same
-  receipt — for `Mint` and `Increase` the owner sent exactly `amount0`/`amount1`, for `Collect` it
-  received exactly them, zero amounts skipped — and gives `LandedUnread` naming both figures on a
-  mismatch; an amount above `u128` is `LandedUnread`, never truncated. `Reverted` and `TimedOut` map
-  onto `Outcome` as they do for swaps.
-
-  | Manager | `PoolKey` | ABI |
-  | --- | --- | --- |
-  | Uniswap v3 `NonfungiblePositionManager` | `Fee` | reference |
-  | PancakeSwap v3 `NonfungiblePositionManager` | `Fee` | identical to Uniswap v3 |
-  | Aerodrome / Velodrome Slipstream `NonfungiblePositionManager` | `TickSpacing` | `mint` takes `tickSpacing` in place of `fee` and ends with `sqrtPriceX96` (always 0) |
+  `execute`: refuses a passed deadline without sending; for `Open` and `Add`, `ensure_balance` and
+  `ensure_allowance` per token, with the manager as spender and **exactly the deposit's maximum**, never
+  `U256::MAX`; sends to the manager; decodes the events from the manager's own logs (`LandedUnread` if
+  one is missing); **cross-checks** against the ERC-20 `Transfer` logs of the same receipt — for `Open`
+  and `Add` the owner sent exactly `paid`, for `Collect` it received exactly `transferred`, zero amounts
+  skipped — and gives `LandedUnread` naming both figures on a mismatch; an amount above `u128` is
+  `LandedUnread`, never truncated. `Remove`'s `transferred` is zero. `Reverted` and `TimedOut` map
+  onto `Outcome` as they do for swaps, and `cost` is the receipt's, as for `EvmLive`.
 
   Manager addresses are not listed in the crate: the consumer passes them in. Uniswap v4's
-  `PositionManager` (`modifyLiquidities` with Permit2) needs a `PoolKey::V4` variant and a different
-  event set, and is deferred until a consumer needs it.
+  `PositionManager` (`modifyLiquidities` with Permit2) is deferred until a consumer needs it.
+- **`WhirlpoolLiquidity`** — one implementation over an `Arc<SolanaSender>`, constructed with the
+  Whirlpool program id. Over a fork sender (Surfpool) it is Simulated; over a signing sender it would be
+  Live, which is not built until the owner asks. `Open` creates the range's missing tick arrays in the
+  same transaction and reports their rent in `rent_spent_lamports`, and the position's in
+  `rent_deposited_lamports`; `Close` reports the position's rent in `rent_returned_lamports`. Amounts are
+  read from the program's events and checked against the owner's token accounts' balance changes, with
+  `LandedUnread` on a mismatch.
 
-The sender gains a fork backend for this mode:
+The EVM sender gains a fork backend for this mode:
 
 ```rust
 impl EvmSender {
@@ -548,8 +798,9 @@ On a fork, `send_and_confirm` calls `anvil_impersonateAccount` and then `eth_sen
 owner, and follows the same receipt polling, revert-reason replay, timeout path and unresolved-timeout
 rule as signing. One difference is deliberate: when the node's gas estimate says a transaction will
 revert, a signing sender refuses to spend gas on it (an `Err`, nothing sent), while a fork sender
-sends it anyway with a fixed gas limit, so a fork run observes the revert — `"Price slippage check"`,
-`"Not cleared"` — as an `Outcome::Reverted` with its reason. A fork sender is not in the process-wide
+sends it anyway with a fixed gas limit, so a fork run observes the revert — `"Price slippage check"` —
+as an `Outcome::Reverted` with its reason. (`"Not cleared"` is no longer reachable: `Close` on a
+position that holds liquidity or owes tokens is refused before sending.) A fork sender is not in the process-wide
 registry: a fork is its own node, and anvil assigns an impersonated account's nonces itself.
 
 ## 6. The CEX port
@@ -784,18 +1035,35 @@ The suites, all in `src/testkit/contract.rs`:
 
 | suite | runs against | asserts |
 |---|---|---|
-| `dex_executor_contract` | every `DexExecutor` | the two shape rules above |
+| `dex_executor_contract` | every `DexExecutor`: `DexStub`, `EvmSimulated`, `EvmLive` on anvil, `JupiterSimulated`, and `JupiterLive` on Surfpool | the two shape rules above |
 | `cex_executor_contract` | every `CexExecutor`, with `reduce_only: false` | `order_ref.is_some() == Landed` |
 | `cex_spot_rejects_reduce_only` | every spot `CexExecutor` | `reduce_only: true` is an error, and nothing reaches the venue |
-| `liquidity_executor_contract` | every `LiquidityExecutor` | one whole life — mint, increase, decrease all of it, collect everything (`u128::MAX` caps), burn — with the §5b shape rules at every step; mint gives a position and liquidity above zero and every later step returns that position; decrease removes exactly what mint and increase added; collect returns, per token, at least what decrease credited; burn succeeds |
+| `liquidity_executor_contract` | every `LiquidityExecutor`: `LiquidityStub`, `EvmLiquidity` on anvil, `WhirlpoolLiquidity` on Surfpool, and a consumer's paper model | the sequence below |
 | `cex_account_contract` | every `CexAccount` | `isolated_margin.is_some() == (margin_mode == Isolated)`; `qty == 0` implies no liquidation price; funding sorted by `ts_ms`, every `ts_ms >= since_ms`, no repeated `venue_ref`; `asset` never empty |
+
+`liquidity_executor_contract` runs one sequence against every liquidity venue, and asserts the same
+things of each:
+
+1. `Open`, then `Add`, then `Remove` of all the liquidity, then `Collect`, then `Close`.
+2. **The same event sequence on every venue**: `Opened`, `Added`, `Removed`, `Collected`, `Closed`.
+3. **The same accounting on every venue:**
+   - With no swap between `Open` and `Remove`, `Removed.released` is what `Opened` and `Added` paid,
+     less at most one unit per token: each venue rounds a deposit up and a withdrawal down.
+   - The sum of `transferred` over `Removed` and `Collected` is at least the sum of `released`.
+   - `liquidity` is conserved: what `Removed` takes out is what `Opened` and `Added` put in.
+4. **The same refusals on every venue**: `Close` on a position that still holds liquidity, and
+   `Remove` above the held liquidity, each an `Err` with nothing sent. (`Close` after `Remove` and
+   before `Collect` is not tested. On Uniswap's managers the principal is still owed, so it is
+   refused. On a Whirlpool that earned no fees, the position is already empty.)
+5. **The shape rules on every report**: `event` is `Some` exactly on `Success`, and `tx_ref` is `Some`
+   exactly when `Landed`. Cost is set whenever something ran.
 
 Run three ways, at different points in the development cycle:
 
 | run against | when | needs |
 |---|---|---|
 | `Stub` | every test run, unconditionally | nothing |
-| `Simulated` (a fork / a sandbox) | before any change to a `Live` adapter ships, and on a recurring schedule even without a code change | fork infrastructure or sandbox credentials. For the liquidity port this is `EvmLiquidity` over a fork sender (§5b) |
+| `Simulated` (a fork / a sandbox) | before any change to a `Live` adapter ships, and on a recurring schedule even without a code change | fork infrastructure or sandbox credentials. For the liquidity port this is `EvmLiquidity` over anvil and `WhirlpoolLiquidity` over Surfpool (§5b) |
 | `Live` | never automated — only a deliberate, watched, human-triggered run | real credentials, real money |
 
 The middle row is what makes the top row trustworthy: if `Stub` and `Simulated` ever disagree on the
@@ -815,19 +1083,24 @@ venue-ports/
     │   │                     # receipts, revert-reason replay, hex/ABI helpers
     │   ├── erc20.rs          # selectors; balance and allowance reads; storage-slot probing
     │   └── tx.rs             # Signer, EvmSender (signing and fork backends), TxOutcome, FeePolicy
+    ├── network.rs            # Network (§4)
+    ├── solana/               # the Solana family's plumbing (§5): rpc.rs (SolanaRpc),
+    │                         # tx.rs (SolanaSender, SolanaTxOutcome), token.rs
     ├── dex/
-    │   ├── mod.rs            # DexExecutor, RouteQuote, SwapRequest, Prepared,
-    │   │                     # Realised, Outcome (Provenance is shared, § 4)
-    │   └── evm/
-    │       ├── live.rs       # EvmLive, over an Arc<EvmSender>
-    │       ├── simulated.rs  # EvmSimulated, over an EvmRpc
-    │       └── stub.rs       # EvmStub
+    │   ├── mod.rs            # DexExecutor, RouteQuote (network), SwapRequest, Prepared (enum),
+    │   │                     # EvmCall, SolanaTransaction, Realised (+ cost), Outcome (+ Expired),
+    │   │                     # TxCost, EvmCost, SolanaCost, NativeCost
+    │   ├── stub.rs           # DexStub (was EvmStub)
+    │   ├── evm/
+    │   │   ├── live.rs       # EvmLive, over an Arc<EvmSender>
+    │   │   └── simulated.rs  # EvmSimulated, over an EvmRpc
+    │   └── jupiter/          # JupiterSimulated, JupiterLive (§5)
     ├── liquidity/            # § 5b
-    │   ├── mod.rs            # LiquidityExecutor, LiquidityAction, LiquidityRealised, LandedUnread, …
+    │   ├── mod.rs            # LiquidityCommand, LiquidityEvent, LiquidityReport,
+    │   │                     # LiquidityCapabilities, LiquidityExecutor, LandedUnread
     │   ├── stub.rs           # LiquidityStub
-    │   └── evm/
-    │       ├── abi.rs        # sol! definitions for both manager ABIs and their events
-    │       └── executor.rs   # EvmLiquidity, over an Arc<EvmSender>
+    │   ├── uniswap_v3/       # EvmLiquidity: the managers' ABI and logs, over an Arc<EvmSender>
+    │   └── whirlpool/        # WhirlpoolLiquidity: instructions, accounts, events
     ├── cex/
     │   ├── mod.rs            # CexExecutor, OrderRequest, OrderStateUnknown, CexFill
     │   ├── account.rs        # § 6b: CexAccount, PerpPosition, MarginState, FundingPayment

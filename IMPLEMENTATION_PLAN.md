@@ -277,12 +277,11 @@ Two venues from the start, not one followed by a second later — confirmed by M
 - Done when: §9's four-point bar is met for each venue, same as Phase 5's DEX equivalent, with "Live"
   meaning a real order against that venue's production API.
 
-## Phase 8 — Second chain family (optional, lower priority)
+## Phase 8 — Second chain family
 
-- A Solana-style `Live`/`Simulated` pair implementing the same `DexExecutor` trait (§5, final
-  paragraph) — `EvmStub` is reused as-is; the trait does not change.
-- Defer until at least one consumer actually needs a second chain family — the spec explicitly treats
-  this as an extension point, not a launch requirement.
+Superseded by Phase 15 ([V5](specs/V5-venues-and-solana.md)): a consumer needs Solana, and V5 is how
+it arrives. The trait is unchanged, as this phase said; `Prepared`, `Outcome` and the cost gained
+Solana forms, and the stub is `DexStub`.
 
 ## Phase 9 — Consumer-facing polish
 
@@ -452,6 +451,44 @@ the relevant environment variables, a no-op when they are unset, like the Sepoli
   so `MarginState.as_of_ms` is the venue clock as this client estimates it; funding is paged in
   windows of at most 7 days and refused for a `since_ms` older than 89 days, since Binance keeps three
   months of income and an older start could only be answered short.
+
+## Phase 15 — one contract for every venue, and the Solana family (V5)
+
+[V5](specs/V5-venues-and-solana.md), accepted 1 October 2026 with its §12 decided as recommended. Its
+signatures are in `SPEC.md` §3, §4, §5, §5b, §7 and §8. Requested by a consumer for its Solana work
+(arb-searcher's network plan, W6.3 and W6.4). Branch `feature/solana`, from `main` at `1c5f2c6`.
+
+The rule throughout: one contract per port — commands, events, capabilities. The caller branches only
+on capabilities, a venue's own types never cross the port, and a paper model is a venue that passes the
+same suite. Modes stay Live, Simulated and Stub; a fork is how Simulated runs a sequence. **No EVM
+number may move**: the suite and the anvil tests here, and the consumer's goldens and fork test, pin it.
+Solana Live signing is not built (the signing backend refuses) until the owner asks.
+
+Order of work, each step compiled and tested before the next (V5 §11):
+
+1. **Dependency spike.** One pinned Solana SDK line builds a v0 transaction, signs it, and
+   round-trips a transaction Jupiter built. Settles V5 §12.3: whether `orca_whirlpools_client`'s key
+   type is the transaction crate's, so Orca's client builds the instructions, or whether the adapter
+   encodes the six it needs from the IDL. *Stop and report.*
+2. **The shared types** (`SPEC.md` §4, §5): `Network`, `Prepared` as an enum over `EvmCall` and
+   `SolanaTransaction`, `Outcome::Expired`, `TxCost`, `Realised.cost`, `DexStub`. The EVM adapters only
+   rewrap. Done when the whole suite and the anvil tests pass unchanged.
+3. **The liquidity contract** (`SPEC.md` §5b): `LiquidityCommand`, `LiquidityEvent`,
+   `LiquidityReport`, `LiquidityCapabilities`. `EvmLiquidity` (now `liquidity/uniswap_v3/`, built with
+   its manager and ABI) and `LiquidityStub` move onto it, and `liquidity_executor_contract` runs V5
+   §8's sequence against both. The consumer's LP runner and paper model move at the same time, proven
+   by its `lp_golden` and `lp_fork`. *Stop and report.*
+4. **`solana/`** (`SPEC.md` §5): `SolanaRpc`, `SolanaSender` with the Surfpool fork backend and its
+   check, the signing backend refusing.
+5. **Jupiter**: `JupiterSimulated`, then `JupiterLive` on Surfpool, each through
+   `dex_executor_contract`.
+6. **Whirlpool**: `WhirlpoolLiquidity` on Surfpool, through `liquidity_executor_contract`. Needs
+   Surfpool installed, and its funding cheatcodes verified (V5 §12.5). *Stop and report.*
+7. The consumer bumps its rev, then runs its paper Whirlpool and its Solana fork gate.
+
+- Done when: steps 1–6 pass as stated, every EVM test here passes with no number changed, and the
+  consumer's gates are green on the new rev.
+- **Status: in progress.**
 
 ## Tracking
 
