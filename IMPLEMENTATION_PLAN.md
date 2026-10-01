@@ -528,6 +528,17 @@ Order of work, each step compiled and tested before the next (V5 §11):
     the replay goldens and `lp_golden` pass, and `lp_fork` on an Ethereum fork pinned at block
     26,096,526 gives the same figures before and after (L 177916823714679017, minted
     (13913933153331884, 1441119065980946), fee 1801218710 token1 units).
+  - **Step 4 done.** `src/solana/`: `SolanaRpc` (JSON-RPC over `reqwest`, no `solana-rpc-client`),
+    `SolanaSender` and `token.rs`. The signing backend refuses. The fork backend refuses a node that
+    does not answer `surfnet_getSurfnetInfo`, generates its key at run time, funds it through
+    `surfnet_setAccount`, and takes its network from the node's genesis hash (Surfpool reports
+    mainnet's). `ensure_balance` writes the owner's associated token account through
+    `surfnet_setTokenAccount`. Surfpool 1.6.0 (the darwin-arm64 release, in `~/.local/bin`) was
+    installed for this; its cheatcodes behave as documented except that both answer `null`
+    (V5 §12.5). On Surfpool forking mainnet: a memo transaction lands with its fee, and the payer's
+    lamports fall by exactly that fee; a blockhash past its height is refused before sending.
+    Against a mock node: an unseen send past its last valid height is `Expired` and blocks nothing,
+    and a `TimedOut` one blocks the next send until resolved. 188 unit tests pass.
 
 ## Tracking
 

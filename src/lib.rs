@@ -13,4 +13,5 @@ pub mod cex;
 pub mod dex;
 pub mod evm;
 pub mod liquidity;
+pub mod solana;
 pub mod testkit;
