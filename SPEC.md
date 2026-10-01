@@ -1048,7 +1048,11 @@ things of each:
 2. **The same event sequence on every venue**: `Opened`, `Added`, `Removed`, `Collected`, `Closed`.
 3. **The same accounting on every venue:**
    - With no swap between `Open` and `Remove`, `Removed.released` is what `Opened` and `Added` paid,
-     less at most one unit per token: each venue rounds a deposit up and a withdrawal down.
+     less at most one unit per token **per deposit**: each venue rounds a deposit up and a withdrawal
+     down. The sequence makes two deposits and one withdrawal, so the bound is two units per token
+     (exact amounts 10.4 and 20.4 pay 11 + 21 = 32, and release 30.8, rounded down to 30). Amended 1
+     October: "one unit per token" did not allow for the second deposit's rounding. It is a test's
+     tolerance, not a feature.
    - The sum of `transferred` over `Removed` and `Collected` is at least the sum of `released`.
    - `liquidity` is conserved: what `Removed` takes out is what `Opened` and `Added` put in.
 4. **The same refusals on every venue**: `Close` on a position that still holds liquidity, and
