@@ -19,6 +19,20 @@
 //! polling gave up first (`TimedOut`: unknown, so every later send is refused
 //! until `resolve` settles it). On a fork, preflight is skipped, so a
 //! transaction that fails lands and is observed as `Failed` with its reason.
+//!
+//! **A fork never runs a transaction against an account newer than its
+//! clock.** Surfpool fetches an account from its upstream the first time a
+//! transaction needs it, so the account carries the chain's time at that
+//! moment, while the fork's clock runs from its own start, slot by slot, and
+//! is about a second behind the chain's (measured 1 October 2026). A program
+//! that orders the two refuses: a Whirlpool's last reward update is then
+//! after the fork's now ("Timestamp should be greater than the last updated
+//! timestamp"). So the fork sender first loads the transaction's accounts
+//! with a dry run, and sends once the fork's clock has passed the second the
+//! dry run ended in. Surfpool's `surfnet_timeTravel` cannot do this instead:
+//! in 1.6.0 it writes the slot's index within the epoch into the `Clock`
+//! sysvar's absolute slot (so every lookup table's entries read as not yet
+//! active), and the clock falls back behind at the next slot.
 
 use crate::dex::{SolanaCost, SolanaTransaction};
 use crate::solana::rpc::{SolanaRpc, SolanaRpcError, TxMeta};
@@ -63,7 +77,8 @@ pub enum SolanaTxOutcome {
 }
 
 /// How often a signature is polled, and for how long before a send ends
-/// `TimedOut`.
+/// `TimedOut`. A fork send waits for its fork's clock (below) on the same
+/// terms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SolanaPollSettings {
     pub interval: Duration,
@@ -249,8 +264,9 @@ impl SolanaSender {
 
     /// Sign, send, and poll the signature until its outcome is known or its
     /// blockhash expires. An `Err` means nothing was sent: an earlier send
-    /// is unresolved, the blockhash had already expired, a signature is
-    /// missing, or the node refused the transaction.
+    /// is unresolved, a signature is missing, the fork could not load the
+    /// transaction's accounts or its clock did not pass them, the blockhash
+    /// had already expired, or the node refused the transaction.
     pub async fn send_and_confirm(&self, tx: &SolanaTransaction) -> Result<SolanaTxOutcome> {
         let _guard = self.send_lock.lock().await;
         if let Some(signature) = self.unresolved() {
@@ -259,6 +275,10 @@ impl SolanaSender {
                 Signature::from(signature)
             );
         }
+        let signed = self.sign(&tx.transaction)?;
+        let signature: [u8; 64] = signed.signatures[0].into();
+        let wire = bincode::serialize(&signed).context("encoding the transaction")?;
+        self.load_on_fork(&wire).await?;
         let height = self.rpc.block_height().await?;
         if height > tx.last_valid_block_height {
             bail!(
@@ -266,9 +286,6 @@ impl SolanaSender {
                 tx.last_valid_block_height
             );
         }
-        let signed = self.sign(&tx.transaction)?;
-        let signature: [u8; 64] = signed.signatures[0].into();
-        let wire = bincode::serialize(&signed).context("encoding the transaction")?;
         match self.rpc.send_transaction(&wire, true).await {
             Ok(_) => {}
             // The node answered and refused it: nothing landed.
@@ -293,6 +310,40 @@ impl SolanaSender {
             if tokio::time::Instant::now() >= deadline {
                 *self.unresolved.lock().unwrap() = Some(pending);
                 return Ok(SolanaTxOutcome::TimedOut { signature });
+            }
+            tokio::time::sleep(poll.interval).await;
+        }
+    }
+
+    /// Loads `wire`'s accounts into the fork with a dry run, then waits until
+    /// the fork's clock has passed the second the dry run ended in: an `Err`,
+    /// with nothing sent, when the fork cannot load them or its clock does
+    /// not get there (the module's docs say why). What the dry run says of
+    /// the transaction is not read: a failure lands, and is read, when it is
+    /// sent.
+    async fn load_on_fork(&self, wire: &[u8]) -> Result<()> {
+        self.rpc
+            .simulate_transaction(wire, false, false, &[])
+            .await
+            .context("loading the transaction's accounts into the fork: nothing sent")?;
+        let loaded_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("the wall clock is before 1970")?
+            .as_secs();
+        let loaded_at = i64::try_from(loaded_at).context("the wall clock is past 2^63 s")?;
+        let poll = *self.poll.lock().unwrap();
+        let give_up = tokio::time::Instant::now() + poll.timeout;
+        loop {
+            let clock = self.rpc.clock_unix_timestamp().await?;
+            if clock > loaded_at {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= give_up {
+                bail!(
+                    "the fork's clock ({clock}) did not pass the time its accounts were loaded \
+                     ({loaded_at}) within {:?}: nothing sent",
+                    poll.timeout
+                );
             }
             tokio::time::sleep(poll.interval).await;
         }
@@ -408,13 +459,21 @@ mod tests {
 
     /// A mock Surfpool whose block height is `heights[i]` on the i-th
     /// `getBlockHeight` (the last one after that), which accepts every
-    /// transaction and never shows a status for it.
+    /// transaction and never shows a status for it. Its clock is far in the
+    /// future.
     async fn unseeing_node(heights: Vec<u64>) -> wiremock::MockServer {
+        mock_node(heights, vec![i64::MAX / 2]).await
+    }
+
+    /// As `unseeing_node`, with the clock reading `clocks[i]` on the i-th
+    /// read (the last one after that).
+    async fn mock_node(heights: Vec<u64>, clocks: Vec<i64>) -> wiremock::MockServer {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
         let calls = Arc::new(AtomicUsize::new(0));
+        let clock_reads = Arc::new(AtomicUsize::new(0));
         Mock::given(method("POST"))
             .respond_with(move |req: &wiremock::Request| {
                 let body: serde_json::Value = req.body_json().unwrap();
@@ -430,6 +489,26 @@ mod tests {
                         let i = calls.fetch_add(1, Ordering::SeqCst);
                         json!(heights[i.min(heights.len() - 1)])
                     }
+                    // The Clock sysvar, its unix_timestamp from `clocks`.
+                    "getMultipleAccounts" => {
+                        use base64::Engine;
+                        let i = clock_reads.fetch_add(1, Ordering::SeqCst);
+                        let mut clock = vec![0u8; 40];
+                        let unix_timestamp = clocks[i.min(clocks.len() - 1)];
+                        clock[32..40].copy_from_slice(&unix_timestamp.to_le_bytes());
+                        let data = base64::engine::general_purpose::STANDARD.encode(clock);
+                        json!({ "context": { "slot": 1 }, "value": [{
+                            "lamports": 1_169_280,
+                            "owner": "Sysvar1111111111111111111111111111111111111",
+                            "data": [data, "base64"],
+                            "executable": false,
+                            "rentEpoch": 0,
+                        }] })
+                    }
+                    "simulateTransaction" => json!({
+                        "context": { "slot": 1 },
+                        "value": { "err": null, "logs": [], "unitsConsumed": 150 },
+                    }),
                     "sendTransaction" => json!("sig"),
                     "getSignatureStatuses" => json!({ "context": { "slot": 1 }, "value": [null] }),
                     other => panic!("unexpected {other}"),
@@ -479,6 +558,64 @@ mod tests {
         let outcome = sender.send_and_confirm(&tx).await.unwrap();
         assert!(matches!(outcome, SolanaTxOutcome::Expired { .. }), "{outcome:?}");
         assert_eq!(sender.unresolved(), None, "an expiry is known, so it blocks nothing");
+    }
+
+    #[tokio::test]
+    async fn a_fork_send_loads_its_accounts_and_waits_for_the_forks_clock_to_pass_them() {
+        // The fork's clock reads 1970 twice, then the far future.
+        let server = mock_node(vec![10, 100], vec![1, 1, i64::MAX / 2]).await;
+        let sender = SolanaSender::fork(SolanaRpc::new(server.uri())).await.unwrap();
+        sender.set_poll_settings(SolanaPollSettings {
+            interval: Duration::from_millis(10),
+            timeout: Duration::from_secs(5),
+        });
+        let tx = memo_from(&sender).await;
+        sender.send_and_confirm(&tx).await.unwrap();
+        let methods: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let body: serde_json::Value = r.body_json().unwrap();
+                body["method"].as_str().unwrap().to_string()
+            })
+            .collect();
+        let at = |m: &str| {
+            methods
+                .iter()
+                .position(|x| x == m)
+                .unwrap_or_else(|| panic!("no {m}"))
+        };
+        let clock_reads = methods.iter().filter(|m| *m == "getMultipleAccounts").count();
+        assert!(at("simulateTransaction") < at("getMultipleAccounts"), "{methods:?}");
+        assert_eq!(clock_reads, 3, "read until it passed: {methods:?}");
+        let last_clock_read = methods
+            .iter()
+            .rposition(|m| m == "getMultipleAccounts")
+            .unwrap();
+        assert!(at("sendTransaction") > last_clock_read, "{methods:?}");
+    }
+
+    #[tokio::test]
+    async fn a_fork_whose_clock_never_passes_its_accounts_sends_nothing() {
+        let server = mock_node(vec![10], vec![1]).await;
+        let sender = SolanaSender::fork(SolanaRpc::new(server.uri())).await.unwrap();
+        sender.set_poll_settings(SolanaPollSettings {
+            interval: Duration::from_millis(10),
+            timeout: Duration::from_millis(100),
+        });
+        let tx = memo_from(&sender).await;
+        let err = sender.send_and_confirm(&tx).await.unwrap_err();
+        assert!(err.to_string().contains("nothing sent"), "{err}");
+        let sent = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.body_json::<serde_json::Value>().unwrap()["method"] == "sendTransaction");
+        assert!(!sent);
+        assert_eq!(sender.unresolved(), None);
     }
 
     #[tokio::test]

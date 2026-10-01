@@ -2,8 +2,14 @@
 //! step 5): `JupiterSimulated` from an account the fork funded, through
 //! `dex_executor_contract`, and `JupiterLive` over a fork sender. Gated on
 //! `SURFPOOL_RPC_URL`, a no-op when it is unset; `JUP_API_KEY` is used when
-//! set. The test fetches Jupiter's quote itself (the crate never does), with
-//! direct routes only, so the fork reads few accounts from its upstream.
+//! set. The test fetches Jupiter's quote itself (the crate never does), as a
+//! direct route through Orca's Whirlpool only (`dexes=Whirlpool`): one venue,
+//! the same each run and the program phase 15's liquidity venue runs on, and
+//! few accounts for the fork to read from its upstream. Unpinned, Jupiter
+//! chose a proprietary AMM (Kipseli) on 1 October.
+//!
+//! A free public node behind the fork refuses the burst of account reads a
+//! swap needs; `scripts/rpc-pacer.py` paces them (its docs say how).
 
 use crate::dex::jupiter::{slippage_bps_for, JupiterConfig, JupiterLive, JupiterSimulated};
 use crate::dex::{DexExecutor, Outcome, RouteQuote, SwapRequest, TxCost};
@@ -28,12 +34,12 @@ fn surfpool() -> Option<SolanaRpc> {
     Some(SolanaRpc::new(url))
 }
 
-/// One Jupiter quote, USDC to wSOL, direct routes only; paced to the keyed
-/// rate of one call a second.
+/// One Jupiter quote, USDC to wSOL, one hop through a Whirlpool; paced to
+/// the keyed rate of one call a second.
 async fn quote(config: &JupiterConfig) -> Value {
     tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
     let url = format!(
-        "{}/quote?inputMint={USDC}&outputMint={WSOL}&amount={AMOUNT_IN}&slippageBps=50&onlyDirectRoutes=true",
+        "{}/quote?inputMint={USDC}&outputMint={WSOL}&amount={AMOUNT_IN}&slippageBps=50&onlyDirectRoutes=true&dexes=Whirlpool",
         config.base_url
     );
     let mut request = reqwest::Client::new().get(url);

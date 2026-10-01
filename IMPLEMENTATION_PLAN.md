@@ -539,6 +539,28 @@ Order of work, each step compiled and tested before the next (V5 §11):
     lamports fall by exactly that fee; a blockhash past its height is refused before sending.
     Against a mock node: an unseen send past its last valid height is `Expired` and blocks nothing,
     and a `TimedOut` one blocks the next send until resolved. 188 unit tests pass.
+  - **Step 5 done.** `dex/jupiter/`: `JupiterSimulated` (`/swap`, then `simulateTransaction`) and
+    `JupiterLive` (over a `SolanaSender`, Jupiter's blockhash re-stamped with the sender's node's).
+    The minimum is written as the largest bps whose on-chain minimum is still at or above
+    `min_amount_out`. Both pass `dex_executor_contract` on Surfpool forking mainnet, 1 October 2026:
+    5 USDC to wSOL through Orca's SOL/USDC Whirlpool (the test pins `dexes=Whirlpool`), 42,594,159
+    wSOL units quoted and 42,579,328 simulated at 53,478 CU; on the fork, 42,569,092 landed, the
+    fork's own token account agreeing with the transaction's meta. Two causes had to be found first:
+    - **The upstream refused the fork's reads.** Every free node tried answered the burst of account
+      reads a swap needs with HTTP 429 (Solana Vibe Station refuses any `getMultipleAccounts` of more
+      than 3 keys); Surfpool gives up after five retries 500 ms apart and answers "Internal error",
+      and a transaction sent with preflight skipped is dropped, which the sender read as `Expired`.
+      `scripts/rpc-pacer.py` fixes it from outside the crate (`SPEC.md` §5, the Solana family).
+      `SolanaRpcError` now keeps the error's `data`, where Surfpool says why. LeoRPC's free node was
+      tried too: it sends `rentEpoch` as a float, which Surfpool cannot parse.
+    - **The fork's clock is behind the accounts it fetches.** Surfpool's clock runs about a second
+      behind the chain's, and a Whirlpool fetched fresh at send time carries a later reward-update
+      time, so the swap reverted ("Timestamp should be greater than the last updated timestamp").
+      The fork sender now loads a transaction's accounts with a dry run and sends once the fork's
+      clock has passed them. Surfpool's `surfnet_timeTravel` was tried first and dropped: in 1.6.0 it
+      writes the slot's index within the epoch into the `Clock` sysvar's slot, after which a lookup
+      table's entries read as inactive ("Transaction address table lookup uses an invalid index").
+    193 unit tests pass; the four Surfpool tests pass together on a fresh fork.
 
 ## Tracking
 

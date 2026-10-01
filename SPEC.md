@@ -522,8 +522,23 @@ Rules, as for `EvmSender`:
   method, as the EVM fork backend refuses a node that is not anvil.
 - **A send that ends `TimedOut`** blocks the next send until it is resolved, as on EVM. **`Expired` is
   terminal**: the transaction can never land, so it blocks nothing.
+- **A fork never runs a transaction against an account newer than its clock.** Surfpool fetches an
+  account from its upstream the first time a transaction needs it, so the account carries the chain's
+  time at that moment, while the fork's clock runs from its own start and is about a second behind
+  the chain's. A program that orders the two refuses (a Whirlpool: "Timestamp should be greater than
+  the last updated timestamp"). So a fork send first loads the transaction's accounts with a dry run,
+  and sends once the fork's clock has passed the second the dry run ended in, waiting no longer than
+  the sender's poll timeout; otherwise it is an `Err` with nothing sent. (Surfpool 1.6.0's
+  `surfnet_timeTravel` cannot do this instead: it writes the slot's index within the epoch into the
+  `Clock` sysvar's absolute slot, so every lookup table's entries read as not yet active, and the
+  clock falls back behind at the next slot.)
 - **Pace the public endpoints.** Surfpool fetches mainnet accounts on demand from its upstream RPC;
-  one Solana process per IP on the public endpoints.
+  one Solana process per IP on the public endpoints. A swap needs a burst of reads that the free
+  nodes refuse with HTTP 429, which Surfpool reports as a bare "Internal error" (and a send with
+  preflight skipped is then dropped, so it ends `Expired`). `scripts/rpc-pacer.py` sits between the
+  fork and its upstream, one call at a time with 429s retried; with `--split-accounts` it sends a
+  `getMultipleAccounts` as one `getAccountInfo` per key, which Solana Vibe Station's public node
+  needs (more than 3 keys a call are always refused).
 
 ## 5b. The liquidity port
 

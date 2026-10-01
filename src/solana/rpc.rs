@@ -16,6 +16,8 @@ use solana_address::Address;
 use std::time::Duration;
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const CLOCK_SYSVAR: Address =
+    Address::from_str_const("SysvarC1ock11111111111111111111111111111111");
 
 /// A JSON-RPC error the node returned, with its code: what was asked was
 /// refused, and nothing about it was done.
@@ -23,11 +25,18 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct SolanaRpcError {
     pub code: i64,
     pub message: String,
+    /// The error's `data`, where the node says why: a refused preflight's
+    /// logs, or a fork's own cause behind a bare "Internal error".
+    pub data: Option<Value>,
 }
 
 impl std::fmt::Display for SolanaRpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} (code {})", self.message, self.code)
+        write!(f, "{} (code {})", self.message, self.code)?;
+        match &self.data {
+            Some(data) => write!(f, ": {data}"),
+            None => Ok(()),
+        }
     }
 }
 
@@ -164,6 +173,7 @@ impl SolanaRpc {
                     .and_then(Value::as_str)
                     .unwrap_or("no message")
                     .to_string(),
+                data: error.get("data").filter(|d| !d.is_null()).cloned(),
             }
             .into());
         }
@@ -379,6 +389,24 @@ impl SolanaRpc {
                 .unwrap_or_default(),
             accounts,
         })
+    }
+
+    /// The cluster's clock, `Clock.unix_timestamp` in seconds, read from the
+    /// Clock sysvar at `confirmed`.
+    pub async fn clock_unix_timestamp(&self) -> Result<i64> {
+        let clock = self
+            .multiple_accounts(&[CLOCK_SYSVAR])
+            .await?
+            .pop()
+            .flatten()
+            .ok_or_else(|| anyhow!("the node has no Clock sysvar"))?;
+        // slot, epoch_start_timestamp, epoch, leader_schedule_epoch, then
+        // unix_timestamp: five eight-byte fields.
+        let bytes = clock
+            .data
+            .get(32..40)
+            .ok_or_else(|| anyhow!("a Clock sysvar of {} bytes", clock.data.len()))?;
+        Ok(i64::from_le_bytes(bytes.try_into().expect("eight bytes")))
     }
 
     /// Whether the node is a Surfpool fork: it answers `surfnet_getSurfnetInfo`,
