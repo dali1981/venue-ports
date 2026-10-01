@@ -522,7 +522,7 @@ Order of work, each step compiled and tested before the next (V5 §11):
     before sending. `LiquidityStub` keeps the position state its own events imply, so it refuses the
     same. `liquidity_executor_contract` runs V5 §8's sequence (its rounding bound: one unit per token
     per deposit). `Prepared::offline` gives a venue that runs nothing real its family's placeholder.
-    181 unit tests pass; on anvil the suite, the 100 lives (27 with a swap) and the injected failures
+    179 unit tests pass; on anvil the suite, the 100 lives (27 with a swap) and the injected failures
     pass — the "Not cleared" burn is now an `Err` before sending, with no block mined. The consumer's
     LP runner and paper model moved at the same time: its workspace tests (715 passed, 0 failed),
     the replay goldens and `lp_golden` pass, and `lp_fork` on an Ethereum fork pinned at block
