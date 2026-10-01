@@ -8,6 +8,7 @@ use solana_message::{v0, MessageHeader, VersionedMessage};
 use solana_transaction::versioned::VersionedTransaction;
 
 pub mod evm;
+pub mod jupiter;
 mod stub;
 
 pub use stub::{DexStub, RecordedCall};
