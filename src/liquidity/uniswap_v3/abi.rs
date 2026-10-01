@@ -1,5 +1,5 @@
-//! `sol!` definitions for the position managers `EvmLiquidity` speaks to
-//! (`SPEC.md` §5b). Every call takes struct arguments with `int24` and
+//! `sol!` definitions for the position managers `EvmLiquidity` speaks to,
+//! and the pool reads it makes (`SPEC.md` §5b). Every call takes struct arguments with `int24` and
 //! `uint24` fields, so none of it is hand-encoded.
 //!
 //! Uniswap v3's `NonfungiblePositionManager` is the reference;
@@ -60,6 +60,19 @@ pub mod manager {
         /// ERC-721's `Transfer`: the same signature, and so the same topic,
         /// as ERC-20's, but with the token id indexed (four topics).
         event Transfer(address indexed from, address indexed to, uint256 indexed tokenId);
+    }
+}
+
+/// What `EvmLiquidity` reads from a pool: its tokens, its key, and the
+/// factory it came from. A Uniswap v3 or PancakeSwap v3 pool's key is its
+/// `fee`; a Slipstream pool's is its `tickSpacing`.
+pub mod pool {
+    alloy_sol_types::sol! {
+        function token0() external view returns (address);
+        function token1() external view returns (address);
+        function fee() external view returns (uint24);
+        function tickSpacing() external view returns (int24);
+        function factory() external view returns (address);
     }
 }
 

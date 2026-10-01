@@ -1,7 +1,7 @@
 //! `EvmLiquidity` over a fork sender against a real position manager on an
-//! anvil node (`IMPLEMENTATION_PLAN.md` Phase 13): the contract suite,
-//! `SPEC.md` §9.2's bar of 100 lives reconciled to the wei against the
-//! chain's own state, and one injected failure per `Outcome` variant.
+//! anvil node (`IMPLEMENTATION_PLAN.md` Phases 13 and 15): the contract
+//! suite, `SPEC.md` §9.2's bar of 100 lives reconciled to the wei against
+//! the chain's own state, and one injected failure per `Outcome` variant.
 //!
 //! Gated on `EVM_ANVIL_RPC_URL` and the `LIQUIDITY_FORK_*` variables, a
 //! no-op when they are unset:
@@ -26,15 +26,16 @@ use crate::evm::erc20;
 use crate::evm::rpc::{BlockTag, EvmRpc};
 use crate::evm::tx::tests::anvil;
 use crate::evm::{EvmSender, PollSettings};
-use crate::liquidity::evm::abi::manager;
+use crate::liquidity::uniswap_v3::abi::manager;
 use crate::liquidity::{
-    unix_now, EvmLiquidity, LiquidityAction, LiquidityExecutor, LiquidityRealised,
-    LiquidityRequest, PoolKey, PositionRef, RangeSpec,
+    unix_now, Deposit, DepositGuard, EvmLiquidity, LiquidityCommand, LiquidityEvent,
+    LiquidityExecutor, LiquidityReport, LiquidityRequest, ManagerAbi, PositionId, Range,
+    TokenPair,
 };
 use crate::testkit::contract::{
     assert_liquidity_shape, liquidity_executor_contract, LiquidityContractFixture,
 };
-use crate::Provenance;
+use crate::{Network, Provenance};
 use alloy_primitives::aliases::{U160, U24};
 use alloy_primitives::{keccak256, Address, U256};
 use alloy_sol_types::SolCall;
@@ -57,6 +58,14 @@ alloy_sol_types::sol! {
     }
     function exactInputSingle(ExactInputSingleParams calldata params)
         external payable returns (uint256 amountOut);
+}
+
+/// The pool's key, from `LIQUIDITY_FORK_POOL_KEY`: what finds the pool in
+/// its factory, and which manager ABI the fork speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolKey {
+    Fee(u32),
+    TickSpacing(i32),
 }
 
 struct Fork {
@@ -203,15 +212,27 @@ impl Fork {
         }
     }
 
-    fn range(&self, tick_lower: i32, tick_upper: i32) -> RangeSpec {
-        RangeSpec {
-            chain_id: self.chain_id,
-            manager: self.manager.as_slice().to_vec(),
-            token0: self.token0.as_slice().to_vec(),
-            token1: self.token1.as_slice().to_vec(),
-            pool_key: self.pool_key.clone(),
+    fn liquidity(&self, sender: Arc<EvmSender>) -> EvmLiquidity {
+        let abi = match self.pool_key {
+            PoolKey::Fee(_) => ManagerAbi::UniswapV3,
+            PoolKey::TickSpacing(_) => ManagerAbi::Slipstream,
+        };
+        EvmLiquidity::new(sender, self.manager, abi)
+    }
+
+    fn range(&self, tick_lower: i32, tick_upper: i32) -> Range {
+        Range {
+            network: Network::evm(self.chain_id),
+            pool: self.pool.as_slice().to_vec(),
             tick_lower,
             tick_upper,
+        }
+    }
+
+    fn open(&self, tick_lower: i32, tick_upper: i32, max: (u128, u128)) -> LiquidityCommand {
+        LiquidityCommand::Open {
+            range: self.range(tick_lower, tick_upper),
+            deposit: deposit(max, (0, 0)),
         }
     }
 
@@ -239,8 +260,8 @@ impl Fork {
     }
 
     /// `positions(id)`'s liquidity (word 7) and tokens owed (words 10, 11).
-    async fn position_state(&self, position: &PositionRef) -> (u128, u128, u128) {
-        let id = U256::from_be_slice(&position.id);
+    async fn position_state(&self, position: &PositionId) -> (u128, u128, u128) {
+        let id = U256::from_be_slice(&position.bytes);
         let data = self
             .rpc
             .eth_call(
@@ -263,7 +284,7 @@ impl Fork {
     /// A swap through `SwapRouter`, run by `EvmLive` over the same fork
     /// sender the liquidity adapter uses.
     async fn swap(&self, live: &EvmLive, owner: Address, zero_for_one: bool, amount_in: u128) {
-        let (Some(router), PoolKey::Fee(fee)) = (self.swap_router, &self.pool_key) else {
+        let (Some(router), PoolKey::Fee(fee)) = (self.swap_router, self.pool_key) else {
             return;
         };
         let (token_in, token_out) = if zero_for_one {
@@ -280,7 +301,7 @@ impl Fork {
             params: ExactInputSingleParams {
                 tokenIn: token_in,
                 tokenOut: token_out,
-                fee: U24::from(*fee),
+                fee: U24::from(fee),
                 recipient: owner,
                 deadline: U256::from(deadline),
                 amountIn: U256::from(amount_in),
@@ -292,7 +313,7 @@ impl Fork {
         let mut payload = router.as_slice().to_vec();
         payload.extend_from_slice(&calldata);
         let route = RouteQuote {
-            network: crate::Network::evm(self.chain_id),
+            network: Network::evm(self.chain_id),
             token_in: token_in.as_slice().to_vec(),
             token_out: token_out.as_slice().to_vec(),
             amount_in,
@@ -314,26 +335,33 @@ impl Fork {
     }
 }
 
+fn deposit(max: (u128, u128), min: (u128, u128)) -> Deposit {
+    Deposit {
+        max: TokenPair::new(max.0, max.1),
+        guard: DepositGuard::MinAmounts(TokenPair::new(min.0, min.1)),
+    }
+}
+
 async fn run(
     liquidity: &EvmLiquidity,
-    action: LiquidityAction,
+    cmd: LiquidityCommand,
     request: &LiquidityRequest,
-) -> LiquidityRealised {
-    let prepared = liquidity.prepare(&action, request).await.unwrap();
-    let realised = liquidity.execute(&prepared).await.unwrap();
-    assert_liquidity_shape(&realised);
-    assert_eq!(realised.provenance, Provenance::Simulated);
-    realised
+) -> LiquidityReport {
+    let prepared = liquidity.prepare(&cmd, request).await.unwrap();
+    let report = liquidity.execute(&prepared).await.unwrap();
+    assert_liquidity_shape(&report);
+    assert_eq!(report.provenance, Provenance::Simulated);
+    report
 }
 
 async fn succeed(
     liquidity: &EvmLiquidity,
-    action: LiquidityAction,
+    cmd: LiquidityCommand,
     request: &LiquidityRequest,
-) -> LiquidityRealised {
-    let realised = run(liquidity, action, request).await;
-    assert!(matches!(realised.outcome, Outcome::Success), "{realised:?}");
-    realised
+) -> LiquidityEvent {
+    let report = run(liquidity, cmd, request).await;
+    assert!(matches!(report.outcome, Outcome::Success), "{report:?}");
+    report.event.unwrap()
 }
 
 #[tokio::test]
@@ -342,7 +370,7 @@ async fn against_anvil_evm_liquidity_satisfies_the_contract() {
         return;
     };
     let owner = Address::repeat_byte(0x51);
-    let liquidity = EvmLiquidity::new(fork.sender(owner).await);
+    let liquidity = fork.liquidity(fork.sender(owner).await);
     assert_eq!(liquidity.label(), "evm-liquidity-fork");
     let tick = fork.aligned_tick().await;
 
@@ -351,8 +379,9 @@ async fn against_anvil_evm_liquidity_satisfies_the_contract() {
         LiquidityContractFixture {
             range: fork.range(tick - 10 * fork.spacing, tick + 10 * fork.spacing),
             request: fork.request(owner),
-            mint: fork.amounts,
-            increase: (fork.amounts.0 / 2, fork.amounts.1 / 2),
+            open: TokenPair::new(fork.amounts.0, fork.amounts.1),
+            add: TokenPair::new(fork.amounts.0 / 2, fork.amounts.1 / 2),
+            sqrt_price_band_x64: (0, u128::MAX),
         },
     )
     .await;
@@ -375,7 +404,7 @@ async fn against_anvil_hundred_lives_reconcile_to_the_wei() {
         .unwrap_or(100);
     let owner = Address::repeat_byte(0x52);
     let sender = fork.sender(owner).await;
-    let liquidity = EvmLiquidity::new(sender.clone());
+    let liquidity = fork.liquidity(sender.clone());
     let live = EvmLive::new(sender);
     let request = fork.request(owner);
     let (base0, base1) = fork.amounts;
@@ -403,75 +432,54 @@ async fn against_anvil_hundred_lives_reconcile_to_the_wei() {
         let increase_amounts = (mint_amounts.0 / 3 + 1, mint_amounts.1 / 3 + 1);
         let before = |token| fork.balance(token, owner);
 
-        // Mint: the owner pays exactly what the manager reports.
+        // Open: the owner pays exactly what the manager reports.
         let (b0, b1) = (before(fork.token0).await, before(fork.token1).await);
-        let mint = succeed(
-            &liquidity,
-            LiquidityAction::Mint {
-                range: fork.range(lower, upper),
-                amount0_desired: mint_amounts.0,
-                amount1_desired: mint_amounts.1,
-                amount0_min: 0,
-                amount1_min: 0,
-            },
-            &request,
-        )
-        .await;
-        let position = mint.position.clone().unwrap();
+        let LiquidityEvent::Opened {
+            position,
+            liquidity: minted,
+            paid: mint,
+        } = succeed(&liquidity, fork.open(lower, upper, mint_amounts), &request).await
+        else {
+            panic!("life {i}: Open did not answer Opened");
+        };
         // The adapter topped the balance up before paying, so reconcile
         // against the balance it was given: pre-mint balance plus any
         // top-up is at least the desired amount, and what left is exact.
         let paid0 = b0.max(U256::from(mint_amounts.0)) - fork.balance(fork.token0, owner).await;
         let paid1 = b1.max(U256::from(mint_amounts.1)) - fork.balance(fork.token1, owner).await;
-        assert_eq!(
-            paid0,
-            U256::from(mint.amount0.unwrap()),
-            "life {i}: mint token0"
-        );
-        assert_eq!(
-            paid1,
-            U256::from(mint.amount1.unwrap()),
-            "life {i}: mint token1"
-        );
-        let minted = mint.liquidity_delta.unwrap();
+        assert_eq!(paid0, U256::from(mint.token0), "life {i}: mint token0");
+        assert_eq!(paid1, U256::from(mint.token1), "life {i}: mint token1");
         assert!(minted > 0, "life {i}: mint added no liquidity");
         assert_eq!(fork.position_state(&position).await.0, minted, "life {i}");
         if k % 5 == 4 {
             assert_eq!(
-                mint.amount1,
-                Some(0),
+                mint.token1, 0,
                 "life {i}: a range above the price takes no token1"
             );
         }
 
-        // Increase.
+        // Add.
         let (b0, b1) = (before(fork.token0).await, before(fork.token1).await);
-        let increase = succeed(
+        let LiquidityEvent::Added {
+            liquidity: added,
+            paid: increase,
+        } = succeed(
             &liquidity,
-            LiquidityAction::Increase {
+            LiquidityCommand::Add {
                 position: position.clone(),
-                amount0_desired: increase_amounts.0,
-                amount1_desired: increase_amounts.1,
-                amount0_min: 0,
-                amount1_min: 0,
+                deposit: deposit(increase_amounts, (0, 0)),
             },
             &request,
         )
-        .await;
-        assert_eq!(increase.position.as_ref(), Some(&position));
+        .await
+        else {
+            panic!("life {i}: Add did not answer Added");
+        };
         let paid0 = b0.max(U256::from(increase_amounts.0)) - fork.balance(fork.token0, owner).await;
         let paid1 = b1.max(U256::from(increase_amounts.1)) - fork.balance(fork.token1, owner).await;
-        assert_eq!(
-            paid0,
-            U256::from(increase.amount0.unwrap()),
-            "life {i}: increase token0"
-        );
-        assert_eq!(
-            paid1,
-            U256::from(increase.amount1.unwrap()),
-            "life {i}: increase token1"
-        );
-        let total = minted + increase.liquidity_delta.unwrap();
+        assert_eq!(paid0, U256::from(increase.token0), "life {i}: add token0");
+        assert_eq!(paid1, U256::from(increase.token1), "life {i}: add token1");
+        let total = minted + added;
         assert_eq!(fork.position_state(&position).await.0, total, "life {i}");
 
         // A swap across the position, so it earns fees.
@@ -482,80 +490,87 @@ async fn against_anvil_hundred_lives_reconcile_to_the_wei() {
             // Small against the position, so the price stays inside its
             // range and every swapped token pays the position a fee.
             let amount_in = if zero_for_one {
-                mint.amount0.unwrap() / 50 + 1
+                mint.token0 / 50 + 1
             } else {
-                mint.amount1.unwrap() / 50 + 1
+                mint.token1 / 50 + 1
             };
             fork.swap(&live, owner, zero_for_one, amount_in).await;
         }
 
-        // Decrease: nothing moves; the position owes exactly what it
-        // reports, plus any fees it earned.
+        // Remove: nothing moves; the position owes exactly what it
+        // released, plus any fees it earned.
         let (b0, b1) = (before(fork.token0).await, before(fork.token1).await);
-        let decrease = succeed(
+        let LiquidityEvent::Removed {
+            liquidity: removed,
+            released,
+            transferred,
+        } = succeed(
             &liquidity,
-            LiquidityAction::Decrease {
+            LiquidityCommand::Remove {
                 position: position.clone(),
                 liquidity: total,
-                amount0_min: 0,
-                amount1_min: 0,
+                min_out: TokenPair::default(),
             },
             &request,
         )
-        .await;
-        assert_eq!(decrease.liquidity_delta, Some(total), "life {i}");
+        .await
+        else {
+            panic!("life {i}: Remove did not answer Removed");
+        };
+        assert_eq!(removed, total, "life {i}");
+        assert_eq!(transferred, TokenPair::default(), "life {i}");
         assert_eq!(fork.balance(fork.token0, owner).await, b0, "life {i}");
         assert_eq!(fork.balance(fork.token1, owner).await, b1, "life {i}");
         let (left, owed0, owed1) = fork.position_state(&position).await;
         assert_eq!(left, 0, "life {i}");
-        assert!(owed0 >= decrease.amount0.unwrap(), "life {i}");
-        assert!(owed1 >= decrease.amount1.unwrap(), "life {i}");
+        assert!(owed0 >= released.token0, "life {i}");
+        assert!(owed1 >= released.token1, "life {i}");
 
         // Collect: the owner receives exactly what is reported, which is
         // exactly what was owed.
-        let collect = succeed(
+        let LiquidityEvent::Collected {
+            transferred: collect,
+        } = succeed(
             &liquidity,
-            LiquidityAction::Collect {
+            LiquidityCommand::Collect {
                 position: position.clone(),
-                amount0_max: u128::MAX,
-                amount1_max: u128::MAX,
             },
             &request,
         )
-        .await;
+        .await
+        else {
+            panic!("life {i}: Collect did not answer Collected");
+        };
         assert_eq!(
             fork.balance(fork.token0, owner).await - b0,
-            U256::from(collect.amount0.unwrap()),
+            U256::from(collect.token0),
             "life {i}: collect token0"
         );
         assert_eq!(
             fork.balance(fork.token1, owner).await - b1,
-            U256::from(collect.amount1.unwrap()),
+            U256::from(collect.token1),
             "life {i}: collect token1"
         );
-        assert_eq!(
-            (collect.amount0.unwrap(), collect.amount1.unwrap()),
-            (owed0, owed1)
-        );
+        assert_eq!((collect.token0, collect.token1), (owed0, owed1));
         assert_eq!(fork.position_state(&position).await, (0, 0, 0), "life {i}");
         if swapped {
             assert!(
-                collect.amount0.unwrap() > decrease.amount0.unwrap()
-                    || collect.amount1.unwrap() > decrease.amount1.unwrap(),
+                collect.token0 > released.token0 || collect.token1 > released.token1,
                 "life {i}: the swap earned the position no fees"
             );
         }
 
-        // Burn: nothing moves, and the token is gone.
+        // Close: nothing moves, and the token is gone.
         let (b0, b1) = (before(fork.token0).await, before(fork.token1).await);
-        succeed(
+        let closed = succeed(
             &liquidity,
-            LiquidityAction::Burn {
+            LiquidityCommand::Close {
                 position: position.clone(),
             },
             &request,
         )
         .await;
+        assert_eq!(closed, LiquidityEvent::Closed, "life {i}");
         assert_eq!(fork.balance(fork.token0, owner).await, b0, "life {i}");
         assert_eq!(fork.balance(fork.token1, owner).await, b1, "life {i}");
         let owner_of = fork
@@ -563,7 +578,7 @@ async fn against_anvil_hundred_lives_reconcile_to_the_wei() {
             .eth_call(
                 fork.manager,
                 &manager::ownerOfCall {
-                    tokenId: U256::from_be_slice(&position.id),
+                    tokenId: U256::from_be_slice(&position.bytes),
                 }
                 .abi_encode(),
                 None,
@@ -580,9 +595,11 @@ async fn against_anvil_hundred_lives_reconcile_to_the_wei() {
 }
 
 /// One injected failure per `Outcome` variant, each ending in the §5b
-/// shape: a mint whose minimum the range cannot meet, a burn with
-/// liquidity left, and a `TimedOut` forced by turning automine off — which
-/// then blocks the sender until `resolve` sees the mint land.
+/// shape: an open whose minimum the range cannot meet, and a `TimedOut`
+/// forced by turning automine off — which then blocks the sender until
+/// `resolve` sees the open land. A close with liquidity left is refused
+/// before sending, so no block is mined for it (V5: it used to revert with
+/// "Not cleared").
 #[tokio::test]
 async fn against_anvil_injected_failures_end_in_the_right_shape() {
     let Some((fork, _anvil)) = fork().await else {
@@ -590,7 +607,7 @@ async fn against_anvil_injected_failures_end_in_the_right_shape() {
     };
     let owner = Address::repeat_byte(0x53);
     let sender = fork.sender(owner).await;
-    let liquidity = EvmLiquidity::new(sender.clone());
+    let liquidity = fork.liquidity(sender.clone());
     let request = fork.request(owner);
     let (a0, a1) = fork.amounts;
     let tick = fork.aligned_tick().await;
@@ -600,12 +617,9 @@ async fn against_anvil_injected_failures_end_in_the_right_shape() {
     // least 1 of it must fail the manager's slippage check.
     let slippage = run(
         &liquidity,
-        LiquidityAction::Mint {
+        LiquidityCommand::Open {
             range: fork.range(tick + 2 * s, tick + 10 * s),
-            amount0_desired: a0,
-            amount1_desired: a1,
-            amount0_min: 0,
-            amount1_min: 1,
+            deposit: deposit((a0, a1), (0, 1)),
         },
         &request,
     )
@@ -615,31 +629,29 @@ async fn against_anvil_injected_failures_end_in_the_right_shape() {
         other => panic!("expected a slippage revert, got {other:?}"),
     }
 
-    // Burning a position that still holds liquidity.
-    let mint = succeed(
+    // Closing a position that still holds liquidity: refused before
+    // sending, so no block is mined.
+    let LiquidityEvent::Opened { position, .. } = succeed(
         &liquidity,
-        LiquidityAction::Mint {
-            range: fork.range(tick - 5 * s, tick + 5 * s),
-            amount0_desired: a0,
-            amount1_desired: a1,
-            amount0_min: 0,
-            amount1_min: 0,
-        },
+        fork.open(tick - 5 * s, tick + 5 * s, (a0, a1)),
         &request,
     )
-    .await;
-    let not_cleared = run(
-        &liquidity,
-        LiquidityAction::Burn {
-            position: mint.position.clone().unwrap(),
-        },
-        &request,
-    )
-    .await;
-    match &not_cleared.outcome {
-        Outcome::Reverted { reason } => assert_eq!(reason, "Not cleared"),
-        other => panic!("expected a Not cleared revert, got {other:?}"),
-    }
+    .await
+    else {
+        panic!("Open did not answer Opened");
+    };
+    let block = fork.rpc.block_number().await.unwrap();
+    let err = liquidity
+        .prepare(
+            &LiquidityCommand::Close {
+                position: position.clone(),
+            },
+            &request,
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("holds liquidity"), "{err}");
+    assert_eq!(fork.rpc.block_number().await.unwrap(), block);
 
     // A mint that never gets mined. Balances and approvals are put in place
     // first, so the only transaction left in flight is the mint itself.
@@ -653,27 +665,14 @@ async fn against_anvil_injected_failures_end_in_the_right_shape() {
             .await
             .unwrap();
     }
-    let action = LiquidityAction::Mint {
-        range: fork.range(tick - 3 * s, tick + 3 * s),
-        amount0_desired: a0,
-        amount1_desired: a1,
-        amount0_min: 0,
-        amount1_min: 0,
-    };
-    let prepared = liquidity.prepare(&action, &request).await.unwrap();
-    // A second, different action, to show the sender refuses it while the
+    let prepared = liquidity
+        .prepare(&fork.open(tick - 3 * s, tick + 3 * s, (a0, a1)), &request)
+        .await
+        .unwrap();
+    // A second, different command, to show the sender refuses it while the
     // first is unresolved.
     let next = liquidity
-        .prepare(
-            &LiquidityAction::Mint {
-                range: fork.range(tick - 4 * s, tick + 4 * s),
-                amount0_desired: a0,
-                amount1_desired: a1,
-                amount0_min: 0,
-                amount1_min: 0,
-            },
-            &request,
-        )
+        .prepare(&fork.open(tick - 4 * s, tick + 4 * s, (a0, a1)), &request)
         .await
         .unwrap();
     sender.set_poll_settings(PollSettings {
@@ -704,14 +703,13 @@ async fn against_anvil_injected_failures_end_in_the_right_shape() {
     }
     assert_eq!(sender.unresolved(), None);
 
-    // Resolved, the sender sends again.
-    let again = run(
-        &liquidity,
-        LiquidityAction::Burn {
-            position: mint.position.unwrap(),
-        },
-        &request,
-    )
-    .await;
-    assert!(matches!(again.outcome, Outcome::Reverted { .. }));
+    // Resolved, the sender sends again: a Collect on a position that owes
+    // nothing is a success that transfers zero.
+    let again = succeed(&liquidity, LiquidityCommand::Collect { position }, &request).await;
+    assert_eq!(
+        again,
+        LiquidityEvent::Collected {
+            transferred: TokenPair::default()
+        }
+    );
 }

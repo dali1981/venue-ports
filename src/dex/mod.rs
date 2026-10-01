@@ -4,6 +4,8 @@
 use crate::{Network, Provenance};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
+use solana_message::{v0, MessageHeader, VersionedMessage};
+use solana_transaction::versioned::VersionedTransaction;
 
 pub mod evm;
 mod stub;
@@ -76,6 +78,48 @@ impl Prepared {
         }
     }
 
+    /// What a venue that runs nothing real — a stub, a paper model — hands
+    /// back from `prepare`: the network's family's form, distinct for each
+    /// `index`, and never sent. On EVM a call to no contract whose calldata
+    /// is the index; on Solana an unsigned v0 transaction with `payer` (32
+    /// bytes, else the default key) as fee payer, no instructions, and the
+    /// index in its blockhash. Its `execute` finds what it prepared by
+    /// equality.
+    pub fn offline(network: Network, payer: &[u8], index: u64) -> Prepared {
+        match network {
+            Network::Evm { .. } => Prepared::Evm(EvmCall {
+                to: Vec::new(),
+                calldata: index.to_be_bytes().to_vec(),
+                value: 0,
+            }),
+            Network::Solana { .. } => {
+                let payer = <[u8; 32]>::try_from(payer)
+                    .map(solana_address::Address::new_from_array)
+                    .unwrap_or_default();
+                let mut blockhash = [0u8; 32];
+                blockhash[24..].copy_from_slice(&index.to_be_bytes());
+                let message = v0::Message {
+                    header: MessageHeader {
+                        num_required_signatures: 1,
+                        num_readonly_signed_accounts: 0,
+                        num_readonly_unsigned_accounts: 0,
+                    },
+                    account_keys: vec![payer],
+                    recent_blockhash: solana_hash::Hash::new_from_array(blockhash),
+                    instructions: Vec::new(),
+                    address_table_lookups: Vec::new(),
+                };
+                Prepared::Solana(SolanaTransaction {
+                    transaction: VersionedTransaction {
+                        signatures: Vec::new(),
+                        message: VersionedMessage::V0(message),
+                    },
+                    last_valid_block_height: 0,
+                })
+            }
+        }
+    }
+
     /// The Solana transaction, for a Solana adapter; an error naming the
     /// other family otherwise.
     pub fn solana_transaction(&self) -> Result<&SolanaTransaction> {
@@ -101,7 +145,7 @@ pub struct EvmCall {
 /// A transaction built for one fee payer, unsigned until a sender signs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SolanaTransaction {
-    pub transaction: solana_transaction::versioned::VersionedTransaction,
+    pub transaction: VersionedTransaction,
     /// The last block height its blockhash is valid at: after it, the
     /// transaction can never land.
     pub last_valid_block_height: u64,

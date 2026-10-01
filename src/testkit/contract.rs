@@ -7,9 +7,10 @@
 
 use crate::cex::{CexAccount, MarginMode};
 use crate::cex::{CexExecutor, OrderRequest, OrderStateUnknown};
-use crate::dex::{ChainAmount, DexExecutor, Outcome, RouteQuote, SwapRequest};
+use crate::dex::{DexExecutor, Outcome, RouteQuote, SwapRequest};
 use crate::liquidity::{
-    LiquidityAction, LiquidityExecutor, LiquidityRealised, LiquidityRequest, PositionRef, RangeSpec,
+    Deposit, DepositGuard, DepositGuardKind, LiquidityCommand, LiquidityEvent, LiquidityExecutor,
+    LiquidityReport, LiquidityRequest, PositionId, Range, TokenPair,
 };
 use crate::Provenance;
 use std::collections::HashSet;
@@ -41,145 +42,209 @@ pub async fn dex_executor_contract(executor: &dyn DexExecutor, fixture: DexContr
     );
 }
 
-/// Inputs for one run of [`liquidity_executor_contract`]: the range to
-/// mint in, who acts, and the desired `(amount0, amount1)` for the mint and
-/// for the increase that follows it.
+/// Inputs for one run of [`liquidity_executor_contract`]: the range to open,
+/// who acts, the deposit maxima for the open and for the add that follows
+/// it, and the sqrt-price band (Q64.64) a venue that enforces one is given.
 #[derive(Debug, Clone)]
 pub struct LiquidityContractFixture {
-    pub range: RangeSpec,
+    pub range: Range,
     pub request: LiquidityRequest,
-    pub mint: (ChainAmount, ChainAmount),
-    pub increase: (ChainAmount, ChainAmount),
+    pub open: TokenPair,
+    pub add: TokenPair,
+    pub sqrt_price_band_x64: (u128, u128),
 }
 
-/// The shape rules every `LiquidityExecutor` outcome must satisfy
-/// (`SPEC.md` §5b): the position, liquidity delta and both amounts are all
-/// `Some` exactly when the outcome is `Success`, and `tx_ref` is `Some`
-/// exactly when the provenance is `Landed`.
-pub fn assert_liquidity_shape(realised: &LiquidityRealised) {
-    let success = matches!(realised.outcome, Outcome::Success);
-    assert_eq!(realised.position.is_some(), success, "{realised:?}");
-    assert_eq!(realised.liquidity_delta.is_some(), success, "{realised:?}");
-    assert_eq!(realised.amount0.is_some(), success, "{realised:?}");
-    assert_eq!(realised.amount1.is_some(), success, "{realised:?}");
+/// The shape rules every liquidity report must satisfy (`SPEC.md` §5b):
+/// `event` is `Some` exactly when the outcome is `Success`, and `tx_ref` is
+/// `Some` exactly when the provenance is `Landed`.
+pub fn assert_liquidity_shape(report: &LiquidityReport) {
+    let success = matches!(report.outcome, Outcome::Success);
+    assert_eq!(report.event.is_some(), success, "{report:?}");
     assert_eq!(
-        realised.tx_ref.is_some(),
-        realised.provenance == Provenance::Landed,
-        "{realised:?}"
+        report.tx_ref.is_some(),
+        report.provenance == crate::Provenance::Landed,
+        "{report:?}"
     );
 }
 
-/// Prepares and executes one action, asserts the shape rules, and requires
-/// `Success`: the contract suite drives a life that only succeeds.
+/// Prepares and executes one command, asserts the shape rules, and requires
+/// `Success`: the sequence only succeeds. Returns its event.
 async fn succeed(
     executor: &dyn LiquidityExecutor,
-    action: LiquidityAction,
+    cmd: LiquidityCommand,
     request: &LiquidityRequest,
-) -> LiquidityRealised {
-    let kind = action.kind();
+) -> LiquidityEvent {
+    let kind = cmd.kind();
     let prepared = executor
-        .prepare(&action, request)
+        .prepare(&cmd, request)
         .await
-        .unwrap_or_else(|err| panic!("prepare({kind}) failed: {err:#}"));
-    let realised = executor
+        .unwrap_or_else(|err| panic!("prepare({kind}) on {} failed: {err:#}", executor.label()));
+    let report = executor
         .execute(&prepared)
         .await
-        .unwrap_or_else(|err| panic!("execute({kind}) failed: {err:#}"));
-    assert_liquidity_shape(&realised);
+        .unwrap_or_else(|err| panic!("execute({kind}) on {} failed: {err:#}", executor.label()));
+    assert_liquidity_shape(&report);
     assert!(
-        matches!(realised.outcome, Outcome::Success),
-        "{kind} did not succeed: {realised:?}"
+        matches!(report.outcome, Outcome::Success),
+        "{kind} on {} did not succeed: {report:?}",
+        executor.label()
     );
-    realised
+    report.event.expect("a success carries its event")
 }
 
-/// One whole position life against any `LiquidityExecutor` (`SPEC.md` §7):
-/// mint, increase, decrease all of it, collect everything (`u128::MAX`
-/// caps), burn — with the shape rules at every step, and across the steps:
+/// A command the position cannot take is an `Err` from `prepare`, with
+/// nothing sent.
+async fn refused(executor: &dyn LiquidityExecutor, cmd: LiquidityCommand, request: &LiquidityRequest) {
+    let kind = cmd.kind();
+    assert!(
+        executor.prepare(&cmd, request).await.is_err(),
+        "{kind} should have been refused before sending on {}",
+        executor.label()
+    );
+}
+
+/// One sequence against any liquidity venue (`SPEC.md` §7, V5 §8), with no
+/// swap during it:
 ///
-/// - mint gives a position and liquidity above zero, and every later step
-///   returns that same position;
-/// - decrease removes exactly the sum of what mint and increase added;
-/// - collect returns, per token, at least what decrease credited (the
-///   principal plus fees of zero or more);
-/// - collect and burn change no liquidity, and burn moves no tokens.
+/// 1. `Open`, then `Add`, then `Remove` of all the liquidity, then
+///    `Collect`, then `Close` — answered `Opened`, `Added`, `Removed`,
+///    `Collected`, `Closed` on every venue.
+/// 2. `Close` while the position holds liquidity, and `Remove` above what it
+///    holds, are each refused before sending.
+/// 3. The accounting: `Removed.released` is what `Opened` and `Added` paid,
+///    less at most one unit per token per deposit (each venue rounds a
+///    deposit up and a withdrawal down); everything `Removed` and
+///    `Collected` transferred is at least what was released; and the
+///    liquidity `Removed` takes out is what `Opened` and `Added` put in.
+/// 4. The shape rules on every report.
+///
+/// The guard is built from the venue's capabilities, the one branch a
+/// caller makes: no minimum on a `MinAmounts` venue, the fixture's band on a
+/// `SqrtPriceBand` one.
 pub async fn liquidity_executor_contract(
     executor: &dyn LiquidityExecutor,
     fixture: LiquidityContractFixture,
 ) {
     let request = &fixture.request;
-    let mint = succeed(
+    let guard = match executor.capabilities().deposit_guard {
+        DepositGuardKind::MinAmounts => DepositGuard::MinAmounts(TokenPair::default()),
+        DepositGuardKind::SqrtPriceBand => DepositGuard::SqrtPriceBand {
+            min_sqrt_price_x64: fixture.sqrt_price_band_x64.0,
+            max_sqrt_price_x64: fixture.sqrt_price_band_x64.1,
+        },
+    };
+    let deposit = |max| Deposit {
+        max,
+        guard: guard.clone(),
+    };
+
+    let LiquidityEvent::Opened {
+        position,
+        liquidity: opened,
+        paid: paid_open,
+    } = succeed(
         executor,
-        LiquidityAction::Mint {
+        LiquidityCommand::Open {
             range: fixture.range.clone(),
-            amount0_desired: fixture.mint.0,
-            amount1_desired: fixture.mint.1,
-            amount0_min: 0,
-            amount1_min: 0,
+            deposit: deposit(fixture.open),
         },
         request,
     )
-    .await;
-    let position: PositionRef = mint.position.clone().unwrap();
-    let minted = mint.liquidity_delta.unwrap();
-    assert!(minted > 0, "mint added no liquidity: {mint:?}");
-
-    let increase = succeed(
+    .await
+    else {
+        panic!("Open on {} did not answer Opened", executor.label());
+    };
+    assert!(opened > 0, "Open added no liquidity on {}", executor.label());
+    let position: PositionId = position;
+    refused(
         executor,
-        LiquidityAction::Increase {
+        LiquidityCommand::Close {
             position: position.clone(),
-            amount0_desired: fixture.increase.0,
-            amount1_desired: fixture.increase.1,
-            amount0_min: 0,
-            amount1_min: 0,
         },
         request,
     )
     .await;
-    assert_eq!(increase.position.as_ref(), Some(&position));
-    let total = minted + increase.liquidity_delta.unwrap();
 
-    let decrease = succeed(
+    let LiquidityEvent::Added {
+        liquidity: added,
+        paid: paid_add,
+    } = succeed(
         executor,
-        LiquidityAction::Decrease {
+        LiquidityCommand::Add {
+            position: position.clone(),
+            deposit: deposit(fixture.add),
+        },
+        request,
+    )
+    .await
+    else {
+        panic!("Add on {} did not answer Added", executor.label());
+    };
+    let total = opened + added;
+    refused(
+        executor,
+        LiquidityCommand::Remove {
+            position: position.clone(),
+            liquidity: total + 1,
+            min_out: TokenPair::default(),
+        },
+        request,
+    )
+    .await;
+
+    let LiquidityEvent::Removed {
+        liquidity: removed,
+        released,
+        transferred: transferred_remove,
+    } = succeed(
+        executor,
+        LiquidityCommand::Remove {
             position: position.clone(),
             liquidity: total,
-            amount0_min: 0,
-            amount1_min: 0,
+            min_out: TokenPair::default(),
         },
         request,
     )
-    .await;
-    assert_eq!(decrease.position.as_ref(), Some(&position));
-    assert_eq!(decrease.liquidity_delta, Some(total));
+    .await
+    else {
+        panic!("Remove on {} did not answer Removed", executor.label());
+    };
+    assert_eq!(removed, total, "liquidity is conserved on {}", executor.label());
 
-    let collect = succeed(
+    let LiquidityEvent::Collected {
+        transferred: transferred_collect,
+    } = succeed(
         executor,
-        LiquidityAction::Collect {
-            position: position.clone(),
-            amount0_max: u128::MAX,
-            amount1_max: u128::MAX,
-        },
-        request,
-    )
-    .await;
-    assert_eq!(collect.position.as_ref(), Some(&position));
-    assert_eq!(collect.liquidity_delta, Some(0));
-    assert!(collect.amount0.unwrap() >= decrease.amount0.unwrap());
-    assert!(collect.amount1.unwrap() >= decrease.amount1.unwrap());
-
-    let burn = succeed(
-        executor,
-        LiquidityAction::Burn {
+        LiquidityCommand::Collect {
             position: position.clone(),
         },
         request,
     )
-    .await;
-    assert_eq!(burn.position.as_ref(), Some(&position));
-    assert_eq!(
-        (burn.liquidity_delta, burn.amount0, burn.amount1),
-        (Some(0), Some(0), Some(0))
+    .await
+    else {
+        panic!("Collect on {} did not answer Collected", executor.label());
+    };
+
+    let closed = succeed(executor, LiquidityCommand::Close { position }, request).await;
+    assert_eq!(closed, LiquidityEvent::Closed, "on {}", executor.label());
+
+    // Two deposits, each rounded up, and one withdrawal rounded down.
+    let paid = paid_open.saturating_add(paid_add);
+    for (name, paid, released) in [
+        ("token0", paid.token0, released.token0),
+        ("token1", paid.token1, released.token1),
+    ] {
+        assert!(
+            released <= paid && paid - released <= 2,
+            "{name} on {}: paid {paid}, released {released}",
+            executor.label()
+        );
+    }
+    let transferred = transferred_remove.saturating_add(transferred_collect);
+    assert!(
+        transferred.token0 >= released.token0 && transferred.token1 >= released.token1,
+        "on {}: transferred {transferred:?}, released {released:?}",
+        executor.label()
     );
 }
 
@@ -326,52 +391,83 @@ mod tests {
         dex_executor_contract(&DexStub::new(), dex_fixture()).await;
     }
 
-    /// The stub, programmed with one consistent life: the suite asserts
-    /// the shape and the relations between steps, so the programmed numbers
-    /// must agree with each other the way a real manager's would.
+    /// The stub, programmed with one consistent life: the suite asserts the
+    /// events and the relations between them, so the programmed numbers must
+    /// agree with each other the way a real venue's would.
     #[tokio::test]
     async fn liquidity_stub_satisfies_the_contract() {
-        use crate::liquidity::{unix_now, LiquidityStub, PoolKey};
+        use crate::liquidity::{unix_now, LiquidityCapabilities, LiquidityStub};
 
-        let range = RangeSpec {
-            chain_id: 1,
-            manager: vec![0x11; 20],
-            token0: vec![0xA0; 20],
-            token1: vec![0xB0; 20],
-            pool_key: PoolKey::Fee(3_000),
-            tick_lower: -600,
-            tick_upper: 600,
-        };
-        let position = PositionRef {
-            chain_id: 1,
-            manager: range.manager.clone(),
-            id: {
-                let mut id = vec![0; 32];
-                id[31] = 7;
-                id
-            },
-        };
-        let stub = LiquidityStub::new();
-        stub.program_success(position.clone(), 1_000, 50, 60, 10);
-        stub.program_success(position.clone(), 500, 25, 30, 11);
-        stub.program_success(position.clone(), 1_500, 74, 89, 12);
-        stub.program_success(position.clone(), 0, 75, 90, 13);
-        stub.program_success(position, 0, 0, 0, 14);
-
-        liquidity_executor_contract(
-            &stub,
-            LiquidityContractFixture {
-                range,
-                request: LiquidityRequest {
-                    owner: vec![0xCC; 20],
-                    deadline_unix_secs: unix_now() + 600,
+        for capabilities in [
+            LiquidityCapabilities::UNISWAP_V3,
+            LiquidityCapabilities::WHIRLPOOL,
+        ] {
+            let position = PositionId {
+                network: Network::evm(1),
+                bytes: vec![7; 32],
+            };
+            let released = TokenPair::new(74, 89);
+            // On a venue whose Remove transfers, the principal leaves at once
+            // and Collect pays only the fees; otherwise Collect pays both.
+            let (on_remove, on_collect) = if capabilities.remove_transfers {
+                (released, TokenPair::default())
+            } else {
+                (TokenPair::default(), released)
+            };
+            let stub = LiquidityStub::new(capabilities);
+            stub.program_event(
+                LiquidityEvent::Opened {
+                    position: position.clone(),
+                    liquidity: 1_000,
+                    paid: TokenPair::new(50, 60),
                 },
-                mint: (50, 60),
-                increase: (25, 30),
-            },
-        )
-        .await;
-        assert_eq!(stub.calls().len(), 10);
+                10,
+            );
+            stub.program_event(
+                LiquidityEvent::Added {
+                    liquidity: 500,
+                    paid: TokenPair::new(25, 30),
+                },
+                11,
+            );
+            stub.program_event(
+                LiquidityEvent::Removed {
+                    liquidity: 1_500,
+                    released,
+                    transferred: on_remove,
+                },
+                12,
+            );
+            stub.program_event(
+                LiquidityEvent::Collected {
+                    transferred: on_collect,
+                },
+                13,
+            );
+            stub.program_event(LiquidityEvent::Closed, 14);
+
+            liquidity_executor_contract(
+                &stub,
+                LiquidityContractFixture {
+                    range: Range {
+                        network: Network::evm(1),
+                        pool: vec![0x22; 20],
+                        tick_lower: -600,
+                        tick_upper: 600,
+                    },
+                    request: LiquidityRequest {
+                        owner: vec![0xCC; 20],
+                        deadline_unix_secs: unix_now() + 600,
+                    },
+                    open: TokenPair::new(50, 60),
+                    add: TokenPair::new(25, 30),
+                    sqrt_price_band_x64: (1 << 63, 1 << 65),
+                },
+            )
+            .await;
+            // Five commands prepared and run, two refused.
+            assert_eq!(stub.calls().len(), 12);
+        }
     }
 
     #[tokio::test]

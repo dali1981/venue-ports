@@ -12,16 +12,12 @@
 //! ([`TxCost::none_for`]); [`DexStub::program_execute`] sets one exactly.
 
 use crate::dex::{
-    ChainAmount, DexExecutor, EvmCall, Outcome, Prepared, Realised, RouteQuote,
-    SolanaTransaction, SwapRequest, TxCost,
+    ChainAmount, DexExecutor, EvmCall, Outcome, Prepared, Realised, RouteQuote, SwapRequest,
+    TxCost,
 };
 use crate::{Network, Provenance};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use solana_address::Address;
-use solana_hash::Hash;
-use solana_message::{v0, MessageHeader, VersionedMessage};
-use solana_transaction::versioned::VersionedTransaction;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
@@ -112,31 +108,6 @@ impl DexStub {
     }
 }
 
-/// An unsigned v0 transaction with the sender as its fee payer and no
-/// instructions. Its blockhash carries `index`, so each prepared value is
-/// distinct and `execute` can find the call it came from.
-fn stub_transaction(sender: &[u8], index: usize) -> VersionedTransaction {
-    let payer = <[u8; 32]>::try_from(sender)
-        .map(Address::new_from_array)
-        .unwrap_or_default();
-    let mut blockhash = [0u8; 32];
-    blockhash[24..].copy_from_slice(&(index as u64).to_be_bytes());
-    VersionedTransaction {
-        signatures: Vec::new(),
-        message: VersionedMessage::V0(v0::Message {
-            header: MessageHeader {
-                num_required_signatures: 1,
-                num_readonly_signed_accounts: 0,
-                num_readonly_unsigned_accounts: 0,
-            },
-            account_keys: vec![payer],
-            recent_blockhash: Hash::new_from_array(blockhash),
-            instructions: Vec::new(),
-            address_table_lookups: Vec::new(),
-        }),
-    }
-}
-
 #[async_trait]
 impl DexExecutor for DexStub {
     async fn prepare(&self, route: &RouteQuote, req: &SwapRequest) -> Result<Prepared> {
@@ -147,10 +118,9 @@ impl DexExecutor for DexStub {
                 calldata: route.payload.clone(),
                 value: req.min_amount_out,
             }),
-            Network::Solana { .. } => Prepared::Solana(SolanaTransaction {
-                transaction: stub_transaction(&req.sender, calls.len()),
-                last_valid_block_height: 0,
-            }),
+            Network::Solana { .. } => {
+                Prepared::offline(route.network, &req.sender, calls.len() as u64)
+            }
         };
         calls.push(RecordedCall {
             route: route.clone(),
@@ -205,6 +175,7 @@ impl DexExecutor for DexStub {
 mod tests {
     use super::*;
     use crate::dex::{EvmCost, SolanaCost};
+    use solana_address::Address;
 
     fn route() -> RouteQuote {
         RouteQuote {
