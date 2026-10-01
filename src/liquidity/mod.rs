@@ -279,10 +279,10 @@ pub struct LiquidityCapabilities {
     /// A Remove transfers the principal at once. Otherwise it stays owed
     /// until Collect.
     pub remove_transfers: bool,
-    /// Opening a range may create accounts whose rent never returns
-    /// (`NativeCost.spent`).
+    /// Opening a range may create accounts whose rent the owner cannot
+    /// close (`NativeCost.spent`).
     pub open_may_spend_rent: bool,
-    /// Close returns a deposit (`NativeCost.returned`).
+    /// Close returns a deposit (a negative `NativeCost.deposit`).
     pub close_returns_deposit: bool,
 }
 

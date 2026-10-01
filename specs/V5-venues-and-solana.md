@@ -128,21 +128,29 @@ pub struct EvmCost {
 pub struct SolanaCost {
     pub fee_lamports: u64,             // signature fee + priority fee, from the transaction's meta
     pub units_consumed: u64,
-    pub rent_deposited_lamports: u64,  // paid into accounts that return it when closed (a position)
-    pub rent_spent_lamports: u64,      // paid into accounts that never return it (a tick array)
-    pub rent_returned_lamports: u64,   // given back by an account this transaction closed
+    pub rent_deposit_lamports: i64,    // net change in accounts the owner closes (a position's)
+    pub rent_spent_lamports: i64,      // net change in accounts not the owner's to close (a tick array)
 }
 
 impl TxCost {
-    /// The same four figures for every family, in the chain's smallest native unit (wei,
+    /// The same three figures for every family, in the chain's smallest native unit (wei,
     /// lamports): what a caller records without branching on the family.
     pub fn native(&self) -> NativeCost;
 }
-pub struct NativeCost { pub fee: u128, pub deposited: u128, pub spent: u128, pub returned: u128 }
+pub struct NativeCost { pub fee: u128, pub deposit: i128, pub spent: i128 }
 ```
 
 Both ports' outcomes carry `cost: TxCost` whenever something ran, a revert included. On EVM,
-`deposited`, `spent` and `returned` are zero.
+`deposit` and `spent` are zero.
+
+*Amended 1 October 2026 (Mo).* The rent was first three unsigned figures (`deposited`, `spent`,
+`returned`), on the premise that rent spent never returns. A Whirlpool dynamic tick array breaks it:
+when `Remove` releases a tick, the array gives the tick's rent back into the position, and `Close`
+returns it. The unsigned figures kept the net over a life exact but not the split between rent locked
+and rent lost. So each figure is now the signed net change in its kind of account: over a life
+`deposit` sums to zero once the position is closed, and `spent` to what the tick arrays kept (which
+can be negative, if a `Remove` releases a tick someone else paid for). Per transaction the payer's
+lamports move by `−(fee + deposit + spent)`.
 
 ## 4. The liquidity port: commands, events, capabilities
 
@@ -364,8 +372,9 @@ src/
   every venue: re-centre is `Remove`, `Collect`, `Close`, the swap, then `Open`.
 - **Paper** (`LiquidityPaper`) implements the same contract, with each venue's capabilities taken from
   the venue it models. It passes §8's suite. This is W6.3's paper run on a Whirlpool.
-- **Costs to rows.** `TxCost::native()` gives the LP rows `rent_deposit_native` and `rent_native` (W6.3)
-  with no family branch.
+- **Costs to rows.** `TxCost::native()` gives the LP rows `rent_deposit_native` (from `deposit`: rent
+  locked, positive, or given back, negative) and `rent_native` (from `spent`: rent lost, or given back
+  by a tick array) (W6.3), both signed, with no family branch.
 - **Swaps.** `SwapExecutor::SolanaSimulated` wraps `JupiterSimulated`. Amounts convert at that boundary:
   `U256` in arb-searcher, `u128` in the port, `u64` on Solana. `execution/solana.rs` is deleted.
 - **The gates.** `lp_golden`, `lp_fork` (anvil) and the replay goldens pin that no EVM number moves.

@@ -194,33 +194,36 @@ pub struct SolanaCost {
     /// Signature fee + priority fee, from the transaction's meta.
     pub fee_lamports: u64,
     pub units_consumed: u64,
-    /// Paid into accounts that return it when closed (a position).
-    pub rent_deposited_lamports: u64,
-    /// Paid into accounts that are not the owner's to close (a tick array).
-    pub rent_spent_lamports: u64,
-    /// Given back: by an account this transaction closed, or by a dynamic
-    /// tick array releasing a tick, whose rent goes into the position (and
-    /// is deposited there in the same transaction). Per transaction the
-    /// payer's lamports move by `returned − fee − deposited − spent`; over a
-    /// position's life, `deposited + spent − returned` is the rent it costs.
-    pub rent_returned_lamports: u64,
+    /// The net change in the lamports of accounts the owner closes (a
+    /// position's): positive when rent is locked in them, negative when it
+    /// comes back. Over a position's life it sums to the rent still locked,
+    /// zero once the position is closed.
+    pub rent_deposit_lamports: i64,
+    /// The net change in the lamports of accounts that are not the owner's
+    /// to close (a tick array): positive when rent is paid into them,
+    /// negative when one gives rent back (a dynamic tick array releasing a
+    /// tick, whose rent goes into the position). Over a position's life it
+    /// sums to the rent the life cost. Per transaction the payer's lamports
+    /// move by `−(fee + deposit + spent)`.
+    pub rent_spent_lamports: i64,
 }
 
-/// The same four figures for every family, in the chain's smallest native
-/// unit (wei, lamports).
+/// The same three figures for every family, in the chain's smallest native
+/// unit (wei, lamports). `deposit` and `spent` are signed: each is the net
+/// change in its kind of account, so a sum over any run of transactions is
+/// exact.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NativeCost {
     pub fee: u128,
-    pub deposited: u128,
-    pub spent: u128,
-    pub returned: u128,
+    pub deposit: i128,
+    pub spent: i128,
 }
 
 impl TxCost {
-    /// The same four figures for every family: what a caller records
-    /// without branching on the family. On EVM, `deposited`, `spent` and
-    /// `returned` are zero, and `fee` is `gas_used × effective_gas_price +
-    /// l1_fee`, counting a missing figure as zero.
+    /// The same three figures for every family: what a caller records
+    /// without branching on the family. On EVM, `deposit` and `spent` are
+    /// zero, and `fee` is `gas_used × effective_gas_price + l1_fee`,
+    /// counting a missing figure as zero.
     pub fn native(&self) -> NativeCost {
         match self {
             TxCost::Evm(cost) => NativeCost {
@@ -231,9 +234,8 @@ impl TxCost {
             },
             TxCost::Solana(cost) => NativeCost {
                 fee: u128::from(cost.fee_lamports),
-                deposited: u128::from(cost.rent_deposited_lamports),
-                spent: u128::from(cost.rent_spent_lamports),
-                returned: u128::from(cost.rent_returned_lamports),
+                deposit: i128::from(cost.rent_deposit_lamports),
+                spent: i128::from(cost.rent_spent_lamports),
             },
         }
     }
@@ -316,21 +318,21 @@ mod tests {
     }
 
     #[test]
-    fn native_cost_carries_the_rent_on_solana() {
+    fn native_cost_carries_the_signed_rent_on_solana() {
+        // A Remove releasing two ticks of a dynamic tick array: their rent
+        // moves out of the array and into the position.
         let cost = TxCost::Solana(SolanaCost {
             fee_lamports: 5_000,
             units_consumed: 180_000,
-            rent_deposited_lamports: 2_000_000,
-            rent_spent_lamports: 70_000_000,
-            rent_returned_lamports: 0,
+            rent_deposit_lamports: 1_559_040,
+            rent_spent_lamports: -1_559_040,
         });
         assert_eq!(
             cost.native(),
             NativeCost {
                 fee: 5_000,
-                deposited: 2_000_000,
-                spent: 70_000_000,
-                returned: 0,
+                deposit: 1_559_040,
+                spent: -1_559_040,
             }
         );
     }

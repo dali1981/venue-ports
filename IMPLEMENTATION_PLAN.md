@@ -576,9 +576,19 @@ Order of work, each step compiled and tested before the next (V5 §11):
       The owner is out of pocket 1,920,960, exactly what the empty array still holds. So V5 §3.4's
       "rent spent never returns" does not hold for a dynamic tick array: `SolanaCost`'s docs now say
       what is measured, and the per-life identity (`deposited + spent − returned`) is the exact one.
+      *Superseded the same day (Mo): the rent is signed, see below.*
     - Fees: 10,000 lamports for `Open` (two signatures), 5,000 for each other command; 65,000 to
       80,000 compute units for `Open`, 10,000 to 20,000 for the others.
     202 unit tests pass; clippy is clean.
+  - **Signed rent (1 October 2026, Mo's decision).** `SolanaCost` carries `rent_deposit_lamports` and
+    `rent_spent_lamports`, each the signed net change in its kind of account (the position's three
+    accounts; the range's tick arrays), and `rent_returned_lamports` is gone; `NativeCost` is
+    `{fee, deposit, spent}`, the two rent figures `i128`. The split is now exact per life, not just
+    the net. On Surfpool, on a new array (deposit / spent): `Open` +6,765,120 / +3,480,000, `Remove`
+    +1,559,040 / −1,559,040, `Collect` 0 / 0, `Close` −8,324,160 / 0; on existing arrays `Open`
+    +8,324,160 / 0 and `Close` −8,324,160 / 0. The two rent tests now assert the deposits sum to zero
+    over a life and the spent rent equals what the new array holds. All three Whirlpool Surfpool tests
+    pass; 202 unit tests pass; clippy is clean.
 
 ## Tracking
 

@@ -36,14 +36,14 @@
 //! the pool's vaults. A mismatch or a missing event is [`LandedUnread`],
 //! never a guessed number.
 //!
-//! **Rent** is read from the same meta's lamports ([`rent`]): what the
-//! position's three accounts (the position, its mint, the owner's token
-//! account for it) gain is `rent_deposited_lamports`, what the range's tick
-//! arrays gain `rent_spent_lamports`, and what any of them gives back
-//! `rent_returned_lamports`. A dynamic tick array gives a released tick's
-//! rent back into the position, which returns it at `Close`. Every landed
-//! transaction is checked: the owner's lamports moved by exactly the
-//! returned rent less the fee and the rent paid.
+//! **Rent** is read from the same meta's lamports ([`rent`]), signed: the
+//! net change in the position's three accounts (the position, its mint, the
+//! owner's token account for it) is `rent_deposit_lamports`, and in the
+//! range's tick arrays `rent_spent_lamports`. A dynamic tick array gives a
+//! released tick's rent back into the position (spent down, deposit up by
+//! the same), which returns it at `Close`. Every landed transaction is
+//! checked: the owner's lamports moved by exactly `−(fee + deposit +
+//! spent)`.
 //!
 //! **Not supported**: a Token-2022 mint with a transfer hook (its extra
 //! accounts are not passed, so the program refuses), and closing a position
@@ -512,21 +512,19 @@ fn read_event(
     }
 }
 
-/// The rent a transaction moved, `(deposited, spent, returned)`, read from
-/// its meta's lamports, account by account: what the position's accounts
-/// gain is deposited, what the range's tick arrays gain is spent, and what
-/// any of them loses is returned.
+/// The rent a transaction moved, `(deposit, spent)`, read from its meta's
+/// lamports: the net change in the position's accounts, and in the range's
+/// tick arrays.
 ///
 /// A dynamic tick array gives a tick's rent back when the tick is released
 /// (the last liquidity on it removed), into the position's account, which
-/// hands it to the owner at `Close`: so a `Remove` can show the same amount
-/// returned by a tick array and deposited into the position, and `Close`
-/// can return more than `Open` deposited. Over a position's life,
-/// `deposited + spent − returned` is exactly the rent the owner is out of
-/// pocket; per transaction, the owner's lamports move by `returned − fee −
-/// deposited − spent` ([`check_lamports`]).
-fn rent(ctx: &PendingCommand, meta: &TxMeta) -> (u64, u64, u64) {
-    let (mut deposited, mut spent, mut returned) = (0u64, 0u64, 0u64);
+/// hands it to the owner at `Close`: so a `Remove` can show `spent` down and
+/// `deposit` up by the same amount, and `Close` can return more than `Open`
+/// deposited. Over a position's life `deposit` sums to zero and `spent` to
+/// the rent the owner is out of pocket; per transaction, the owner's
+/// lamports move by `−(fee + deposit + spent)` ([`check_lamports`]).
+fn rent(ctx: &PendingCommand, meta: &TxMeta) -> std::result::Result<(i64, i64), String> {
+    let (mut deposit, mut spent) = (0i128, 0i128);
     let mut seen = Vec::new();
     let position_accounts = [ctx.position, ctx.position_mint, ctx.position_token_account];
     for (account, is_tick_array) in position_accounts
@@ -541,14 +539,16 @@ fn rent(ctx: &PendingCommand, meta: &TxMeta) -> (u64, u64, u64) {
         let Some(delta) = meta.lamports_delta(account) else {
             continue;
         };
-        let amount = u64::try_from(delta.unsigned_abs()).unwrap_or(u64::MAX);
-        match (delta > 0, is_tick_array) {
-            (true, false) => deposited += amount,
-            (true, true) => spent += amount,
-            (false, _) => returned += amount,
+        if is_tick_array {
+            spent += delta;
+        } else {
+            deposit += delta;
         }
     }
-    (deposited, spent, returned)
+    let lamports = |name: &str, v: i128| {
+        i64::try_from(v).map_err(|_| format!("the rent {name} ({v}) is beyond an i64 of lamports"))
+    };
+    Ok((lamports("deposit", deposit)?, lamports("spent", spent)?))
 }
 
 /// The owner paid the fee and the rent, and received what was returned,
@@ -557,20 +557,17 @@ fn rent(ctx: &PendingCommand, meta: &TxMeta) -> (u64, u64, u64) {
 fn check_lamports(
     ctx: &PendingCommand,
     meta: &TxMeta,
-    rent: (u64, u64, u64),
+    rent: (i64, i64),
 ) -> std::result::Result<(), String> {
-    let (deposited, spent, returned) = rent;
-    let expected = i128::from(returned)
-        - i128::from(meta.fee_lamports)
-        - i128::from(deposited)
-        - i128::from(spent);
+    let (deposit, spent) = rent;
+    let expected = -(i128::from(meta.fee_lamports) + i128::from(deposit) + i128::from(spent));
     let moved = meta
         .lamports_delta(&ctx.owner)
         .ok_or("the owner is not in the transaction")?;
     if moved != expected {
         return Err(format!(
-            "the owner's lamports moved by {moved}, but the fee ({}) and the rent deposited ({deposited}), \
-             spent ({spent}) and returned ({returned}) account for {expected}",
+            "the owner's lamports moved by {moved}, but the fee ({}) and the rent deposit ({deposit}) \
+             and spent ({spent}) account for {expected}",
             meta.fee_lamports
         ));
     }
@@ -994,15 +991,14 @@ impl LiquidityExecutor for WhirlpoolLiquidity {
                     reason,
                 };
                 let event = read_event(self.network(), &ctx, &meta).map_err(unread)?;
-                let (deposited, spent, returned) = rent(&ctx, &meta);
-                check_lamports(&ctx, &meta, (deposited, spent, returned)).map_err(unread)?;
+                let (deposit, spent) = rent(&ctx, &meta).map_err(unread)?;
+                check_lamports(&ctx, &meta, (deposit, spent)).map_err(unread)?;
                 Ok(LiquidityReport {
                     outcome: Outcome::Success,
                     event: Some(event),
                     cost: TxCost::Solana(SolanaCost {
-                        rent_deposited_lamports: deposited,
+                        rent_deposit_lamports: deposit,
                         rent_spent_lamports: spent,
-                        rent_returned_lamports: returned,
                         ..cost
                     }),
                     at: slot,
@@ -1234,14 +1230,14 @@ mod tests {
         );
         // Position accounts gained a deposit; one tick array was created.
         assert_eq!(
-            rent(&ctx, &m),
-            (2_394_240 + 3_000_000 + 2_000_000, 1_000_000, 0)
+            rent(&ctx, &m).unwrap(),
+            (2_394_240 + 3_000_000 + 2_000_000, 1_000_000)
         );
-        check_lamports(&ctx, &m, rent(&ctx, &m)).unwrap();
+        check_lamports(&ctx, &m, rent(&ctx, &m).unwrap()).unwrap();
         // A lamport the figures do not account for.
         let mut off = m.clone();
         off.post_balances[0] -= 1;
-        assert!(check_lamports(&ctx, &off, rent(&ctx, &off))
+        assert!(check_lamports(&ctx, &off, rent(&ctx, &off).unwrap())
             .unwrap_err()
             .contains("moved by"));
 
@@ -1296,8 +1292,8 @@ mod tests {
         );
 
         // A released tick's rent moves from its dynamic tick array into the
-        // position: returned by one, deposited into the other, and the owner
-        // pays only the fee.
+        // position: spent down, deposit up by the same, and the owner pays
+        // only the fee.
         let keys = vec![ctx.owner, ctx.position, ctx.tick_arrays[0]];
         let m = meta(
             keys,
@@ -1309,8 +1305,8 @@ mod tests {
             vec![],
             vec![],
         );
-        assert_eq!(rent(&ctx, &m), (1_559_040, 0, 1_559_040));
-        check_lamports(&ctx, &m, rent(&ctx, &m)).unwrap();
+        assert_eq!(rent(&ctx, &m).unwrap(), (1_559_040, -1_559_040));
+        check_lamports(&ctx, &m, rent(&ctx, &m).unwrap()).unwrap();
 
         let ctx = PendingCommand {
             kind: Kind::Close,
@@ -1337,8 +1333,8 @@ mod tests {
             read_event(NETWORK, &ctx, &m).unwrap(),
             LiquidityEvent::Closed
         );
-        assert_eq!(rent(&ctx, &m), (0, 0, 7_394_240));
-        check_lamports(&ctx, &m, rent(&ctx, &m)).unwrap();
+        assert_eq!(rent(&ctx, &m).unwrap(), (-7_394_240, 0));
+        check_lamports(&ctx, &m, rent(&ctx, &m).unwrap()).unwrap();
     }
 
     #[test]

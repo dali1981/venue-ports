@@ -247,33 +247,36 @@ pub struct SolanaCost {
     /// Signature fee + priority fee, from the transaction's meta.
     pub fee_lamports: u64,
     pub units_consumed: u64,
-    /// Paid into accounts that return it when closed (a position).
-    pub rent_deposited_lamports: u64,
-    /// Paid into accounts that are not the owner's to close (a tick array).
-    pub rent_spent_lamports: u64,
-    /// Given back: by an account this transaction closed, or by a dynamic
-    /// tick array releasing a tick, whose rent goes into the position (and
-    /// is deposited there in the same transaction). Per transaction the
-    /// payer's lamports move by `returned − fee − deposited − spent`; over a
-    /// position's life, `deposited + spent − returned` is the rent it costs.
-    pub rent_returned_lamports: u64,
+    /// The net change in the lamports of accounts the owner closes (a
+    /// position's): positive when rent is locked in them, negative when it
+    /// comes back. Over a position's life it sums to the rent still locked,
+    /// zero once the position is closed.
+    pub rent_deposit_lamports: i64,
+    /// The net change in the lamports of accounts that are not the owner's
+    /// to close (a tick array): positive when rent is paid into them,
+    /// negative when one gives rent back (a dynamic tick array releasing a
+    /// tick, whose rent goes into the position). Over a position's life it
+    /// sums to the rent the life cost. Per transaction the payer's lamports
+    /// move by `−(fee + deposit + spent)`.
+    pub rent_spent_lamports: i64,
 }
 
 impl TxCost {
-    /// The same four figures for every family, in the chain's smallest
+    /// The same three figures for every family, in the chain's smallest
     /// native unit (wei, lamports): what a caller records without
-    /// branching on the family. On EVM, `deposited`, `spent` and
-    /// `returned` are zero, and `fee` is `gas_used × effective_gas_price +
-    /// l1_fee`, counting a missing figure as zero.
+    /// branching on the family. On EVM, `deposit` and `spent` are zero, and
+    /// `fee` is `gas_used × effective_gas_price + l1_fee`, counting a
+    /// missing figure as zero.
     pub fn native(&self) -> NativeCost;
 }
 
+/// `deposit` and `spent` are signed: each is the net change in its kind of
+/// account, so a sum over any run of transactions is exact.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NativeCost {
     pub fee: u128,
-    pub deposited: u128,
-    pub spent: u128,
-    pub returned: u128,
+    pub deposit: i128,
+    pub spent: i128,
 }
 
 #[derive(Debug, Clone)]
@@ -666,9 +669,9 @@ pub struct LiquidityCapabilities {
     pub deposit_guard: DepositGuardKind,
     /// A Remove transfers the principal at once. Otherwise it stays owed until Collect.
     pub remove_transfers: bool,
-    /// Opening a range may create accounts whose rent never returns (`NativeCost.spent`).
+    /// Opening a range may create accounts whose rent the owner cannot close (`NativeCost.spent`).
     pub open_may_spend_rent: bool,
-    /// Close returns a deposit (`NativeCost.returned`).
+    /// Close returns a deposit (a negative `NativeCost.deposit`).
     pub close_returns_deposit: bool,
 }
 
@@ -785,16 +788,18 @@ and Simulated and Live share every line of encoding and decoding.
 - **`WhirlpoolLiquidity`** — one implementation over an `Arc<SolanaSender>`, constructed with the
   Whirlpool program id. Over a fork sender (Surfpool) it is Simulated; over a signing sender it would be
   Live, which is not built until the owner asks. `Open` creates the range's missing tick arrays in the
-  same transaction (dynamic tick arrays, `initialize_dynamic_tick_array`) and reports their rent in
-  `rent_spent_lamports`, and the position's in `rent_deposited_lamports`; `Close` reports the position's
-  rent in `rent_returned_lamports`. A dynamic tick array gives a tick's rent back into the position when
-  `Remove` releases the tick (returned by the array and deposited into the position, in the same
-  report), and `Close` returns it with the rest, so `Close` can return more than `Open` deposited
-  (measured on Surfpool, 1 October 2026: a new array took 3,480,000 lamports, 1,559,040 of them the two
-  ticks', which came back at `Close`; the empty array's 1,920,960 stays spent). Amounts are read from the
+  same transaction (dynamic tick arrays, `initialize_dynamic_tick_array`). Rent is signed, one figure per
+  kind of account: the net change in the tick arrays is `rent_spent_lamports`, and in the position's
+  three accounts `rent_deposit_lamports`; `Close` reports the position's rent as a negative deposit. A
+  dynamic tick array gives a tick's rent back into the position when `Remove` releases the tick (spent
+  down, deposit up by the same, in one report), and `Close` returns it with the rest. So over a life the
+  deposits sum to zero and the spent rent is what the arrays kept. Measured on Surfpool, 1 October 2026,
+  on a new array (deposit / spent, lamports): `Open` +6,765,120 / +3,480,000, `Remove` +1,559,040 /
+  −1,559,040, `Collect` 0 / 0, `Close` −8,324,160 / 0; spent 1,920,960 over the life, the empty array's
+  rent. On existing arrays: `Open` +8,324,160 / 0 and `Close` −8,324,160 / 0. Amounts are read from the
   program's events and checked against the owner's token accounts' balance changes; the rent figures
-  are checked against the owner's lamports (they moved by exactly the returned rent less the fee and
-  the rent paid). Either mismatch is `LandedUnread`. A position is named by its mint; `Open` mints it
+  are checked against the owner's lamports (they moved by exactly `−(fee + deposit + spent)`). Either
+  mismatch is `LandedUnread`. A position is named by its mint; `Open` mints it
   under Token-2022 with a key generated at `prepare`, which co-signs the transaction. `Collect` sends
   `update_fees_and_rewards` only while the position holds liquidity (the program refuses it on an empty
   one, whose fees the `Remove` brought up to date). Not supported: a Token-2022 mint with a transfer

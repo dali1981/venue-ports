@@ -75,8 +75,9 @@ async fn against_surfpool_whirlpool_satisfies_the_liquidity_contract() {
     liquidity_executor_contract(&venue, fixture).await;
 }
 
-/// One life, its costs read: `Open` deposits the position's rent, `Close`
-/// returns exactly that, and every report carries its fee.
+/// One life, its costs read: `Open` deposits the position's rent, the life's
+/// deposits sum to zero (`Close` gives back everything locked), and every
+/// report carries its fee.
 #[tokio::test]
 async fn against_surfpool_whirlpool_rent_is_deposited_on_open_and_returned_on_close() {
     let Some(rpc) = surfpool() else {
@@ -117,22 +118,25 @@ async fn against_surfpool_whirlpool_rent_is_deposited_on_open_and_returned_on_cl
     else {
         panic!("{opened:?}")
     };
-    assert!(open_cost.rent_deposited_lamports > 0, "{open_cost:?}");
-    let (removed, _) = run(LiquidityCommand::Remove {
+    assert!(open_cost.rent_deposit_lamports > 0, "{open_cost:?}");
+    let (removed, remove_cost) = run(LiquidityCommand::Remove {
         position: position.clone(),
         liquidity,
         min_out: TokenPair::default(),
     })
     .await;
-    let (collected, _) = run(LiquidityCommand::Collect {
+    let (collected, collect_cost) = run(LiquidityCommand::Collect {
         position: position.clone(),
     })
     .await;
     let (closed, close_cost) = run(LiquidityCommand::Close { position }).await;
     assert_eq!(closed, LiquidityEvent::Closed);
+    let life = [&open_cost, &remove_cost, &collect_cost, &close_cost];
+    assert!(close_cost.rent_deposit_lamports < 0, "{close_cost:?}");
     assert_eq!(
-        close_cost.rent_returned_lamports, open_cost.rent_deposited_lamports,
-        "Close returns what Open deposited"
+        life.iter().map(|c| c.rent_deposit_lamports).sum::<i64>(),
+        0,
+        "Close gives back everything the life locked: {life:?}"
     );
     eprintln!(
         "whirlpool on the fork: opened L {liquidity} for {paid:?}; {removed:?}; {collected:?}; \
@@ -142,10 +146,10 @@ async fn against_surfpool_whirlpool_rent_is_deposited_on_open_and_returned_on_cl
 
 /// A range whose tick array does not exist yet: `Open` creates it and spends
 /// its rent. The dynamic array gives the two ticks' rent back into the
-/// position when `Remove` releases them, and `Close` returns it with the
-/// deposit, so over the life the owner is out of pocket exactly what the
-/// array still holds. The range lies above the price, so only token A goes
-/// in.
+/// position when `Remove` releases them (spent down, deposit up by the
+/// same), and `Close` returns it with the deposit. So over the life the
+/// deposits sum to zero and the rent spent is exactly what the array still
+/// holds. The range lies above the price, so only token A goes in.
 #[tokio::test]
 async fn against_surfpool_whirlpool_open_creates_a_missing_tick_array_and_spends_its_rent() {
     let Some(rpc) = surfpool() else {
@@ -226,8 +230,15 @@ async fn against_surfpool_whirlpool_open_creates_a_missing_tick_array_and_spends
         };
         costs.push(cost);
     }
-    // Out of pocket over the life: exactly what the tick array the Open
-    // created still holds (the ticks' rent came back through the position).
+    // The Remove moved the released ticks' rent from the array into the
+    // position.
+    assert!(costs[1].rent_spent_lamports < 0, "{costs:?}");
+    assert_eq!(
+        costs[1].rent_deposit_lamports, -costs[1].rent_spent_lamports,
+        "{costs:?}"
+    );
+    // Over the life: nothing left locked, and spent exactly what the tick
+    // array the Open created still holds.
     let (array, _) =
         orca_whirlpools_client::get_tick_array_address(&pool, start, Some(WHIRLPOOL_PROGRAM))
             .unwrap();
@@ -235,13 +246,15 @@ async fn against_surfpool_whirlpool_open_creates_a_missing_tick_array_and_spends
         .clone()
         .unwrap()
         .lamports;
-    let net: i128 = costs
-        .iter()
-        .map(|c| {
-            i128::from(c.rent_deposited_lamports) + i128::from(c.rent_spent_lamports)
-                - i128::from(c.rent_returned_lamports)
-        })
-        .sum();
     eprintln!("tick array at {start} created, holding {held}: {costs:?}");
-    assert_eq!(net, i128::from(held), "{costs:?}");
+    assert_eq!(
+        costs.iter().map(|c| c.rent_deposit_lamports).sum::<i64>(),
+        0,
+        "{costs:?}"
+    );
+    assert_eq!(
+        costs.iter().map(|c| c.rent_spent_lamports).sum::<i64>(),
+        i64::try_from(held).unwrap(),
+        "{costs:?}"
+    );
 }
