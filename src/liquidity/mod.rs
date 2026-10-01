@@ -4,7 +4,8 @@
 //! contract; do not diverge from it without updating the spec first.
 //!
 //! A venue is an adapter behind the port: Uniswap v3's position managers
-//! ([`EvmLiquidity`]), Orca's Whirlpool, a consumer's paper model. A venue's
+//! ([`EvmLiquidity`]), Orca's Whirlpool ([`WhirlpoolLiquidity`]), a
+//! consumer's paper model. A venue's
 //! own types — its ABI, its instructions, its accounts, its events — never
 //! cross the port. The caller sends a [`LiquidityCommand`], reads a
 //! [`LiquidityEvent`], and branches only on
@@ -22,9 +23,11 @@ use async_trait::async_trait;
 
 mod stub;
 pub mod uniswap_v3;
+pub mod whirlpool;
 
 pub use stub::{LiquidityCall, LiquidityStub};
 pub use uniswap_v3::{EvmLiquidity, ManagerAbi};
+pub use whirlpool::{WhirlpoolLiquidity, WHIRLPOOL_PROGRAM};
 
 /// What the caller asks of a position (`SPEC.md` §5b).
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -249,9 +249,13 @@ pub struct SolanaCost {
     pub units_consumed: u64,
     /// Paid into accounts that return it when closed (a position).
     pub rent_deposited_lamports: u64,
-    /// Paid into accounts that never return it (a tick array).
+    /// Paid into accounts that are not the owner's to close (a tick array).
     pub rent_spent_lamports: u64,
-    /// Given back by an account this transaction closed.
+    /// Given back: by an account this transaction closed, or by a dynamic
+    /// tick array releasing a tick, whose rent goes into the position (and
+    /// is deposited there in the same transaction). Per transaction the
+    /// payer's lamports move by `returned − fee − deposited − spent`; over a
+    /// position's life, `deposited + spent − returned` is the rent it costs.
     pub rent_returned_lamports: u64,
 }
 
@@ -781,10 +785,20 @@ and Simulated and Live share every line of encoding and decoding.
 - **`WhirlpoolLiquidity`** — one implementation over an `Arc<SolanaSender>`, constructed with the
   Whirlpool program id. Over a fork sender (Surfpool) it is Simulated; over a signing sender it would be
   Live, which is not built until the owner asks. `Open` creates the range's missing tick arrays in the
-  same transaction and reports their rent in `rent_spent_lamports`, and the position's in
-  `rent_deposited_lamports`; `Close` reports the position's rent in `rent_returned_lamports`. Amounts are
-  read from the program's events and checked against the owner's token accounts' balance changes, with
-  `LandedUnread` on a mismatch.
+  same transaction (dynamic tick arrays, `initialize_dynamic_tick_array`) and reports their rent in
+  `rent_spent_lamports`, and the position's in `rent_deposited_lamports`; `Close` reports the position's
+  rent in `rent_returned_lamports`. A dynamic tick array gives a tick's rent back into the position when
+  `Remove` releases the tick (returned by the array and deposited into the position, in the same
+  report), and `Close` returns it with the rest, so `Close` can return more than `Open` deposited
+  (measured on Surfpool, 1 October 2026: a new array took 3,480,000 lamports, 1,559,040 of them the two
+  ticks', which came back at `Close`; the empty array's 1,920,960 stays spent). Amounts are read from the
+  program's events and checked against the owner's token accounts' balance changes; the rent figures
+  are checked against the owner's lamports (they moved by exactly the returned rent less the fee and
+  the rent paid). Either mismatch is `LandedUnread`. A position is named by its mint; `Open` mints it
+  under Token-2022 with a key generated at `prepare`, which co-signs the transaction. `Collect` sends
+  `update_fees_and_rewards` only while the position holds liquidity (the program refuses it on an empty
+  one, whose fees the `Remove` brought up to date). Not supported: a Token-2022 mint with a transfer
+  hook, and closing a position minted under SPL Token.
 
 The EVM sender gains a fork backend for this mode:
 

@@ -194,9 +194,13 @@ pub struct SolanaCost {
     pub units_consumed: u64,
     /// Paid into accounts that return it when closed (a position).
     pub rent_deposited_lamports: u64,
-    /// Paid into accounts that never return it (a tick array).
+    /// Paid into accounts that are not the owner's to close (a tick array).
     pub rent_spent_lamports: u64,
-    /// Given back by an account this transaction closed.
+    /// Given back: by an account this transaction closed, or by a dynamic
+    /// tick array releasing a tick, whose rent goes into the position (and
+    /// is deposited there in the same transaction). Per transaction the
+    /// payer's lamports move by `returned − fee − deposited − spent`; over a
+    /// position's life, `deposited + spent − returned` is the rent it costs.
     pub rent_returned_lamports: u64,
 }
 

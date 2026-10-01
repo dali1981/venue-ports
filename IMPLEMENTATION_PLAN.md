@@ -561,6 +561,24 @@ Order of work, each step compiled and tested before the next (V5 §11):
       writes the slot's index within the epoch into the `Clock` sysvar's slot, after which a lookup
       table's entries read as inactive ("Transaction address table lookup uses an invalid index").
     193 unit tests pass; the four Surfpool tests pass together on a fresh fork.
+  - **Step 6 done.** `liquidity/whirlpool/`: `WhirlpoolLiquidity` over a `SolanaSender`, built with
+    the program id, on `orca_whirlpools_client` 8.0.0 (no default features) for the instructions,
+    accounts, PDAs and event types. On Surfpool forking mainnet, 1 October 2026, on Orca's USDC/USDT
+    Whirlpool (tick spacing 1), from a fork sender the fork funds:
+    - `liquidity_executor_contract` passes: the five events in order, both refusals before sending,
+      the accounting (8,352,275 USDC units and 10,000,000 USDT units paid for liquidity
+      22,945,629,930; 8,352,274 and 9,999,999 released, one unit each under the deposit).
+    - Rent, checked on every landed transaction against the owner's lamports: on a range whose tick
+      arrays exist, `Open` deposits 8,324,160 lamports into the position's three accounts and `Close`
+      returns all of it. On a range whose array did not exist, `Open` creates it (a dynamic array,
+      3,480,000 spent, 1,559,040 of them the two ticks') and deposits 6,765,120; `Remove` releases the
+      ticks and the array gives their 1,559,040 back into the position; `Close` returns 8,324,160.
+      The owner is out of pocket 1,920,960, exactly what the empty array still holds. So V5 §3.4's
+      "rent spent never returns" does not hold for a dynamic tick array: `SolanaCost`'s docs now say
+      what is measured, and the per-life identity (`deposited + spent − returned`) is the exact one.
+    - Fees: 10,000 lamports for `Open` (two signatures), 5,000 for each other command; 65,000 to
+      80,000 compute units for `Open`, 10,000 to 20,000 for the others.
+    202 unit tests pass; clippy is clean.
 
 ## Tracking
 
