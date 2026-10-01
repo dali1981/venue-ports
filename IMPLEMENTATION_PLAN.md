@@ -488,7 +488,25 @@ Order of work, each step compiled and tested before the next (V5 §11):
 
 - Done when: steps 1–6 pass as stated, every EVM test here passes with no number changed, and the
   consumer's gates are green on the new rev.
-- **Status: in progress.**
+- **Status: in progress.** Step 1 done, 1 October 2026, in a scratch crate outside this repository:
+  - **The line** is the one `solana-sdk` 5.0 pins: `solana-transaction` 5.1.0, `solana-message`
+    5.1.0, `solana-instruction` 4.0.0, `solana-hash` 4.7.0, `solana-keypair` 4.0.0, `solana-signer`
+    4.0.0, `solana-pubkey` 4.4.0 (`solana-address` 2.8.0), `solana-signature` 3.6.0. V5 read
+    `solana-transaction` 3.0.2; the crates had moved on.
+  - **Measured:** a v0 memo transaction built, signed, verified and round-tripped through bincode; a
+    transaction Jupiter built (`api.jup.ag/swap/v1`, 0.01 SOL to USDC, v0, one lookup table, 599
+    bytes) decoded and re-encoded byte-identical, then signed by its payer and verified with its
+    message unchanged.
+  - **§12.3: Orca's client builds the instructions.** `orca_whirlpools_client` 8.0 asks for
+    `solana-pubkey` ^3 and `solana-instruction` ^3, which resolve to `solana-pubkey` 3.0.0 (on
+    `solana-address` 1.1.0, whose source is `pub use solana_address_v2::*`) and `solana-instruction`
+    3.5.1 (`pub use solana_instruction_v4::*`). So its `Pubkey` and `Instruction` are the line's own:
+    its `IncreaseLiquidityByTokenAmountsV2` and `UpdateFeesAndRewards` builders compiled into a signed
+    v0 transaction with no conversion. A lockfile that held `solana-address` at 1.0.0 would split the
+    types, which fails to compile rather than silently.
+  - **Its cost:** taken with `default-features = false` (no `orca_whirlpools_core`), it takes the
+    line's graph from 112 crates to 236, bringing `solana-program` 3.0 and its sysvars; beside this
+    crate the total is 393, with one `k256` (0.13.4, the version this crate pins).
 
 ## Tracking
 
