@@ -47,10 +47,6 @@ impl JupiterLive {
         &self.sender
     }
 
-    fn tx_ref(&self, signature: [u8; 64]) -> Option<Vec<u8>> {
-        (self.sender.provenance() == Provenance::Landed).then(|| signature.to_vec())
-    }
-
     fn unsettled(
         &self,
         outcome: Outcome,
@@ -64,7 +60,7 @@ impl JupiterLive {
             cost: TxCost::Solana(cost),
             at,
             provenance: self.sender.provenance(),
-            tx_ref: self.tx_ref(signature),
+            tx_ref: Some(signature.to_vec()),
         }
     }
 }
@@ -144,7 +140,7 @@ impl DexExecutor for JupiterLive {
                     cost: TxCost::Solana(cost),
                     at: slot,
                     provenance: self.sender.provenance(),
-                    tx_ref: self.tx_ref(signature),
+                    tx_ref: Some(signature.to_vec()),
                 })
             }
             SolanaTxOutcome::Failed {

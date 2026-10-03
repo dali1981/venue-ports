@@ -15,6 +15,42 @@ use crate::liquidity::{
 use crate::Provenance;
 use std::collections::HashSet;
 
+/// Whether the executor under test sends a transaction for each command,
+/// which decides whether its reports carry a `tx_ref` (`SPEC.md` §7). The
+/// report alone cannot say: a send to a fork and a throwaway run are both
+/// `Simulated`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sends {
+    /// A throwaway run (an `eth_call`, `simulateTransaction`), a stub, or a
+    /// consumer's paper model. No report carries a `tx_ref`.
+    Nothing,
+    /// A transaction, to the chain (`Landed`) or to a fork (`Simulated`).
+    /// Every report carries its hash or signature.
+    Transactions,
+}
+
+/// The `tx_ref` shape rule: `Some` exactly when a transaction was sent, so
+/// always on a `Landed` report.
+fn assert_tx_ref_shape(
+    tx_ref: &Option<Vec<u8>>,
+    provenance: Provenance,
+    sends: Sends,
+    report: &dyn std::fmt::Debug,
+) {
+    assert_eq!(
+        tx_ref.is_some(),
+        sends == Sends::Transactions,
+        "tx_ref against {sends:?}: {report:?}"
+    );
+    if provenance == Provenance::Landed {
+        assert_eq!(
+            sends,
+            Sends::Transactions,
+            "Landed with nothing sent: {report:?}"
+        );
+    }
+}
+
 /// Inputs for one run of [`dex_executor_contract`] against a given
 /// executor.
 #[derive(Debug, Clone)]
@@ -24,8 +60,13 @@ pub struct DexContractFixture {
 }
 
 /// Shape assertions every `DexExecutor` implementation must satisfy,
-/// regardless of mode (`SPEC.md` §7).
-pub async fn dex_executor_contract(executor: &dyn DexExecutor, fixture: DexContractFixture) {
+/// regardless of mode (`SPEC.md` §7). `sends` is what the executor does with
+/// the swap.
+pub async fn dex_executor_contract(
+    executor: &dyn DexExecutor,
+    sends: Sends,
+    fixture: DexContractFixture,
+) {
     let prepared = executor
         .prepare(&fixture.route, &fixture.request)
         .await
@@ -36,10 +77,7 @@ pub async fn dex_executor_contract(executor: &dyn DexExecutor, fixture: DexContr
         realised.amount_out.is_some(),
         matches!(realised.outcome, Outcome::Success)
     );
-    assert_eq!(
-        realised.tx_ref.is_some(),
-        realised.provenance == Provenance::Landed
-    );
+    assert_tx_ref_shape(&realised.tx_ref, realised.provenance, sends, &realised);
 }
 
 /// Inputs for one run of [`liquidity_executor_contract`]: the range to open,
@@ -56,21 +94,18 @@ pub struct LiquidityContractFixture {
 
 /// The shape rules every liquidity report must satisfy (`SPEC.md` §5b):
 /// `event` is `Some` exactly when the outcome is `Success`, and `tx_ref` is
-/// `Some` exactly when the provenance is `Landed`.
-pub fn assert_liquidity_shape(report: &LiquidityReport) {
+/// `Some` exactly when a transaction was sent, which `sends` says.
+pub fn assert_liquidity_shape(report: &LiquidityReport, sends: Sends) {
     let success = matches!(report.outcome, Outcome::Success);
     assert_eq!(report.event.is_some(), success, "{report:?}");
-    assert_eq!(
-        report.tx_ref.is_some(),
-        report.provenance == crate::Provenance::Landed,
-        "{report:?}"
-    );
+    assert_tx_ref_shape(&report.tx_ref, report.provenance, sends, report);
 }
 
 /// Prepares and executes one command, asserts the shape rules, and requires
 /// `Success`: the sequence only succeeds. Returns its event.
 async fn succeed(
     executor: &dyn LiquidityExecutor,
+    sends: Sends,
     cmd: LiquidityCommand,
     request: &LiquidityRequest,
 ) -> LiquidityEvent {
@@ -83,7 +118,7 @@ async fn succeed(
         .execute(&prepared)
         .await
         .unwrap_or_else(|err| panic!("execute({kind}) on {} failed: {err:#}", executor.label()));
-    assert_liquidity_shape(&report);
+    assert_liquidity_shape(&report, sends);
     assert!(
         matches!(report.outcome, Outcome::Success),
         "{kind} on {} did not succeed: {report:?}",
@@ -120,13 +155,15 @@ async fn refused(
 ///    deposit up and a withdrawal down); everything `Removed` and
 ///    `Collected` transferred is at least what was released; and the
 ///    liquidity `Removed` takes out is what `Opened` and `Added` put in.
-/// 4. The shape rules on every report.
+/// 4. The shape rules on every report, `tx_ref` by `sends`: what the
+///    executor does with each command.
 ///
 /// The guard is built from the venue's capabilities, the one branch a
 /// caller makes: no minimum on a `MinAmounts` venue, the fixture's band on a
 /// `SqrtPriceBand` one.
 pub async fn liquidity_executor_contract(
     executor: &dyn LiquidityExecutor,
+    sends: Sends,
     fixture: LiquidityContractFixture,
 ) {
     let request = &fixture.request;
@@ -148,6 +185,7 @@ pub async fn liquidity_executor_contract(
         paid: paid_open,
     } = succeed(
         executor,
+        sends,
         LiquidityCommand::Open {
             range: fixture.range.clone(),
             deposit: deposit(fixture.open),
@@ -178,6 +216,7 @@ pub async fn liquidity_executor_contract(
         paid: paid_add,
     } = succeed(
         executor,
+        sends,
         LiquidityCommand::Add {
             position: position.clone(),
             deposit: deposit(fixture.add),
@@ -206,6 +245,7 @@ pub async fn liquidity_executor_contract(
         transferred: transferred_remove,
     } = succeed(
         executor,
+        sends,
         LiquidityCommand::Remove {
             position: position.clone(),
             liquidity: total,
@@ -228,6 +268,7 @@ pub async fn liquidity_executor_contract(
         transferred: transferred_collect,
     } = succeed(
         executor,
+        sends,
         LiquidityCommand::Collect {
             position: position.clone(),
         },
@@ -238,7 +279,13 @@ pub async fn liquidity_executor_contract(
         panic!("Collect on {} did not answer Collected", executor.label());
     };
 
-    let closed = succeed(executor, LiquidityCommand::Close { position }, request).await;
+    let closed = succeed(
+        executor,
+        sends,
+        LiquidityCommand::Close { position },
+        request,
+    )
+    .await;
     assert_eq!(closed, LiquidityEvent::Closed, "on {}", executor.label());
 
     // Two deposits, each rounded up, and one withdrawal rounded down.
@@ -402,7 +449,7 @@ mod tests {
 
     #[tokio::test]
     async fn dex_stub_satisfies_the_contract() {
-        dex_executor_contract(&DexStub::new(), dex_fixture()).await;
+        dex_executor_contract(&DexStub::new(), Sends::Nothing, dex_fixture()).await;
     }
 
     /// The stub, programmed with one consistent life: the suite asserts the
@@ -462,6 +509,7 @@ mod tests {
 
             liquidity_executor_contract(
                 &stub,
+                Sends::Nothing,
                 LiquidityContractFixture {
                     range: Range {
                         network: Network::evm(1),

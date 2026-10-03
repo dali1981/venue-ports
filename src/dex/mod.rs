@@ -279,7 +279,8 @@ pub struct Realised {
     /// The block (or slot) the outcome was observed at.
     pub at: u64,
     pub provenance: Provenance,
-    /// Set if and only if `provenance == Provenance::Landed`.
+    /// Set if and only if a transaction was sent: to the chain (`Landed`) or
+    /// to a fork (`Simulated`). A throwaway run sets none.
     pub tx_ref: Option<Vec<u8>>, // a transaction hash / signature, chain-specific encoding
 }
 

@@ -374,10 +374,6 @@ impl WhirlpoolLiquidity {
         })
     }
 
-    fn tx_ref(&self, signature: [u8; 64]) -> Option<Vec<u8>> {
-        (self.sender.provenance() == Provenance::Landed).then(|| signature.to_vec())
-    }
-
     fn unsettled(
         &self,
         outcome: Outcome,
@@ -391,7 +387,7 @@ impl WhirlpoolLiquidity {
             cost: TxCost::Solana(cost),
             at,
             provenance: self.sender.provenance(),
-            tx_ref: self.tx_ref(signature),
+            tx_ref: Some(signature.to_vec()),
         }
     }
 }
@@ -1003,7 +999,7 @@ impl LiquidityExecutor for WhirlpoolLiquidity {
                     }),
                     at: slot,
                     provenance: self.sender.provenance(),
-                    tx_ref: self.tx_ref(signature),
+                    tx_ref: Some(signature.to_vec()),
                 })
             }
             SolanaTxOutcome::Failed {

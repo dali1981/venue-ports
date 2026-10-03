@@ -323,8 +323,8 @@ impl EvmSender {
     }
 
     /// `Simulated` for a fork sender, `Landed` for a signing one. Adapters
-    /// take their provenance from this, and set `tx_ref` only when it is
-    /// `Landed`.
+    /// take their provenance from this. Either way a transaction was sent,
+    /// so they set `tx_ref` to its hash.
     pub fn provenance(&self) -> Provenance {
         match self.backend {
             Backend::Signing(_) => Provenance::Landed,

@@ -258,10 +258,6 @@ impl EvmLiquidity {
         })
     }
 
-    fn tx_ref(&self, tx_hash: B256) -> Option<Vec<u8>> {
-        (self.sender.provenance() == Provenance::Landed).then(|| tx_hash.as_slice().to_vec())
-    }
-
     fn unsettled(
         &self,
         outcome: Outcome,
@@ -275,7 +271,7 @@ impl EvmLiquidity {
             cost: TxCost::Evm(cost),
             at,
             provenance: self.sender.provenance(),
-            tx_ref: self.tx_ref(tx_hash),
+            tx_ref: Some(tx_hash.as_slice().to_vec()),
         }
     }
 
@@ -701,7 +697,7 @@ impl LiquidityExecutor for EvmLiquidity {
                     cost: TxCost::Evm(cost),
                     at: block,
                     provenance: self.sender.provenance(),
-                    tx_ref: self.tx_ref(tx_hash),
+                    tx_ref: Some(tx_hash.as_slice().to_vec()),
                 })
             }
             TxOutcome::Reverted {
@@ -1237,7 +1233,10 @@ mod tests {
         let prepared = liquidity.prepare(&remove, &request(owner)).await.unwrap();
         let report = liquidity.execute(&prepared).await.unwrap();
 
-        crate::testkit::contract::assert_liquidity_shape(&report);
+        crate::testkit::contract::assert_liquidity_shape(
+            &report,
+            crate::testkit::contract::Sends::Transactions,
+        );
         match &report.outcome {
             Outcome::Reverted { reason } => assert_eq!(reason, "Price slippage check"),
             other => panic!("expected Reverted, got {other:?}"),

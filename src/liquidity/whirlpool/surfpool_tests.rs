@@ -10,7 +10,7 @@ use crate::liquidity::{
     Range, TokenPair, WhirlpoolLiquidity, WHIRLPOOL_PROGRAM,
 };
 use crate::solana::{SolanaRpc, SolanaSender};
-use crate::testkit::contract::{liquidity_executor_contract, LiquidityContractFixture};
+use crate::testkit::contract::{liquidity_executor_contract, LiquidityContractFixture, Sends};
 use solana_address::Address;
 
 /// Orca's USDC/USDT Whirlpool: tick spacing 1, token A USDC, token B USDT.
@@ -72,7 +72,7 @@ async fn against_surfpool_whirlpool_satisfies_the_liquidity_contract() {
     let venue = WhirlpoolLiquidity::new(sender.clone(), WHIRLPOOL_PROGRAM);
     assert_eq!(venue.label(), "whirlpool-liquidity-fork");
     let fixture = fixture(&rpc, &sender).await;
-    liquidity_executor_contract(&venue, fixture).await;
+    liquidity_executor_contract(&venue, Sends::Transactions, fixture).await;
 }
 
 /// One life, its costs read: `Open` deposits the position's rent, the life's

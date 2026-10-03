@@ -308,7 +308,8 @@ pub struct Realised {
     /// The block (or slot) the outcome was observed at.
     pub at: u64,
     pub provenance: Provenance,
-    /// Set if and only if `provenance == Provenance::Landed`.
+    /// Set if and only if a transaction was sent: to the chain (`Landed`) or
+    /// to a fork (`Simulated`). A throwaway run sets none.
     pub tx_ref: Option<Vec<u8>>, // a transaction hash / signature, chain-specific encoding
 }
 
@@ -357,7 +358,8 @@ pub trait DexExecutor: Send + Sync {
   the venue from its own balance, and the amount out is still the output's `Transfer` to the recipient.
   `prepare` refuses a `RouteQuote` whose `network` is not the sender's. Given a fork sender (§5b)
   instead of a signing one, `EvmLive` becomes a swap simulator whose state persists between calls: its
-  provenance is then `Simulated` and it sets no `tx_ref`. Its `cost` is `TxCost::Evm` with the
+  provenance is then `Simulated`, and its `tx_ref` is the fork transaction's hash, as a live send's is
+  (amended 3 October 2026: a fork send used to set none). Its `cost` is `TxCost::Evm` with the
   receipt's `gasUsed`, `effectiveGasPrice` and, on a rollup, `l1Fee`.
 - **`EvmSimulated`** — runs the prepared call against current (or a specified historical) chain state
   through a read-only simulation endpoint (an `eth_call`-equivalent), with no transaction ever
@@ -670,7 +672,8 @@ pub struct LiquidityReport {
     /// The block or slot the outcome was observed at.
     pub at: u64,
     pub provenance: Provenance,
-    /// `Some` exactly when `provenance` is `Landed`.
+    /// `Some` exactly when a transaction was sent: to the chain (`Landed`)
+    /// or to a fork (`Simulated`).
     pub tx_ref: Option<Vec<u8>>,
 }
 
@@ -734,10 +737,10 @@ Each holds on every venue, and `liquidity_executor_contract` (§7) checks it:
 - **A passed deadline** is refused without sending. On Solana, the blockhash also bounds the
   transaction once sent (`Outcome::Expired`).
 - **A transaction that ran and whose effect cannot be read** is `LandedUnread`, on every venue.
-- **The shape rules**: `event` is `Some` exactly on `Success`; `tx_ref` is `Some` exactly when
-  `Landed`; `cost` is set whenever something ran. An `Err` means nothing was sent for the command
-  itself, unless it is `LandedUnread`. A failed approval is an `Err`: it is setup, and no position
-  changed.
+- **The shape rules**: `event` is `Some` exactly on `Success`; `tx_ref` is `Some` exactly when a
+  transaction was sent, to the chain or to a fork; `cost` is set whenever something ran. An `Err`
+  means nothing was sent for the command itself, unless it is `LandedUnread`. A failed approval is an
+  `Err`: it is setup, and no position changed.
 
 ### The venues
 
@@ -842,8 +845,8 @@ impl EvmSender {
     pub async fn fork(rpc: EvmRpc, owner: Address, chain_id: u64) -> Result<Arc<Self>>;
 
     /// `Simulated` for a fork sender, `Landed` for a signing one. Adapters
-    /// take their provenance from this, and set `tx_ref` only when it is
-    /// `Landed`.
+    /// take their provenance from this. Either way a transaction was sent,
+    /// so they set `tx_ref` to its hash.
     pub fn provenance(&self) -> Provenance;
 
     /// Checks that `holder` holds at least `amount` of `token`: the owner,
@@ -1083,16 +1086,25 @@ The rule that prevents it: **one shared test suite per port, written generically
 
 ```rust
 // sketch — the real suite lives in `src/testkit/contract.rs`
-pub async fn dex_executor_contract(executor: &dyn DexExecutor, fixture: ContractFixture) {
+pub async fn dex_executor_contract(executor: &dyn DexExecutor, sends: Sends, fixture: ContractFixture) {
     let prepared = executor.prepare(&fixture.route, &fixture.request).await.unwrap();
     let realised = executor.execute(&prepared, None).await.unwrap();
 
     // Shape assertions every implementation must satisfy, regardless of
     // mode:
     assert_eq!(realised.amount_out.is_some(), matches!(realised.outcome, Outcome::Success));
-    assert_eq!(realised.tx_ref.is_some(), realised.provenance == Provenance::Landed);
+    assert_eq!(realised.tx_ref.is_some(), sends == Sends::Transactions);
+    if realised.provenance == Provenance::Landed {
+        assert_eq!(sends, Sends::Transactions);
+    }
 }
 ```
+
+`sends` is what the executor under test does with a command, and the caller states it: `Sends::Nothing`
+for a stub, a throwaway run (`EvmSimulated`, `JupiterSimulated`) or a consumer's paper model;
+`Sends::Transactions` for an adapter over a sender, signing or fork. A report cannot say which by
+itself, because a fork send and an `eth_call` are both `Simulated`. `liquidity_executor_contract` and
+`assert_liquidity_shape` take it too.
 
 The suites, all in `src/testkit/contract.rs`:
 
@@ -1123,7 +1135,7 @@ things of each:
    before `Collect` is not tested. On Uniswap's managers the principal is still owed, so it is
    refused. On a Whirlpool that earned no fees, the position is already empty.)
 5. **The shape rules on every report**: `event` is `Some` exactly on `Success`, and `tx_ref` is `Some`
-   exactly when `Landed`. Cost is set whenever something ran.
+   exactly when a transaction was sent. Cost is set whenever something ran.
 
 Run three ways, at different points in the development cycle:
 

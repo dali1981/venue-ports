@@ -229,7 +229,8 @@ impl LiquidityEvent {
 
 /// One per command executed. **Shape rules**, asserted for every venue by
 /// `liquidity_executor_contract`: `event` is `Some` exactly when `outcome`
-/// is `Success`; `tx_ref` is `Some` exactly when `provenance` is `Landed`;
+/// is `Success`; `tx_ref` is `Some` exactly when a transaction was sent (to
+/// the chain, `Landed`, or to a fork, `Simulated`);
 /// `cost` is set whenever something ran, a revert included.
 #[derive(Debug, Clone)]
 pub struct LiquidityReport {

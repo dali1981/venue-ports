@@ -15,7 +15,7 @@ use crate::dex::jupiter::{slippage_bps_for, JupiterConfig, JupiterLive, JupiterS
 use crate::dex::{DexExecutor, Outcome, Payer, RouteQuote, SwapRequest, TxCost};
 use crate::solana::token::{associated_token_account, token_account_amount, TOKEN_PROGRAM};
 use crate::solana::{SolanaRpc, SolanaSender};
-use crate::testkit::contract::{dex_executor_contract, DexContractFixture};
+use crate::testkit::contract::{dex_executor_contract, DexContractFixture, Sends};
 use crate::{Network, Provenance};
 use serde_json::Value;
 use solana_address::Address;
@@ -118,6 +118,7 @@ async fn against_surfpool_jupiter_simulated_satisfies_the_dex_contract() {
     let min = r.expected_amount_out * 99 / 100;
     dex_executor_contract(
         &adapter,
+        Sends::Nothing,
         DexContractFixture {
             route: r.clone(),
             request: request(&funded.pubkey(), min),
@@ -178,7 +179,11 @@ async fn against_surfpool_jupiter_live_swaps_on_the_fork() {
     let realised = adapter.execute(&prepared, None).await.unwrap();
     assert_eq!(realised.outcome, Outcome::Success, "{realised:?}");
     assert_eq!(realised.provenance, Provenance::Simulated);
-    assert_eq!(realised.tx_ref, None);
+    assert_eq!(
+        realised.tx_ref.as_ref().map(Vec::len),
+        Some(64),
+        "a fork send carries its signature"
+    );
     let out = realised.amount_out.unwrap();
     assert!(out >= min, "{out} below the minimum {min}");
     // The fork's own state agrees with what the adapter read from the meta.
@@ -201,6 +206,7 @@ async fn against_surfpool_jupiter_live_swaps_on_the_fork() {
     let min = r.expected_amount_out * 99 / 100;
     dex_executor_contract(
         &adapter,
+        Sends::Transactions,
         DexContractFixture {
             route: r,
             request: request(&sender.pubkey(), min),

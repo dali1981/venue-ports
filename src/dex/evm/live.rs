@@ -41,9 +41,10 @@
 //! `Transfer` to `SwapRequest.recipient`.
 //!
 //! **Over a fork sender** (`SPEC.md` §5b), this adapter is a swap simulator
-//! whose state persists between calls: its provenance is `Simulated` and it
-//! sets no `tx_ref`. The payer must hold the input token on the fork;
-//! [`EvmSender::ensure_balance`] writes it there.
+//! whose state persists between calls: its provenance is `Simulated`, and its
+//! `tx_ref` is the fork transaction's hash, as a live send's is. The payer
+//! must hold the input token on the fork; [`EvmSender::ensure_balance`]
+//! writes it there.
 
 use crate::dex::{
     ChainAmount, DexExecutor, EvmCall, EvmCost, Outcome, Payer, Prepared, Realised, RouteQuote,
@@ -90,11 +91,6 @@ impl EvmLive {
 
     pub fn sender(&self) -> &Arc<EvmSender> {
         &self.sender
-    }
-
-    /// `tx_ref` is set if and only if the provenance is `Landed`.
-    fn tx_ref(&self, tx_hash: B256) -> Option<Vec<u8>> {
-        (self.sender.provenance() == Provenance::Landed).then(|| tx_hash.as_slice().to_vec())
     }
 }
 
@@ -223,7 +219,7 @@ impl DexExecutor for EvmLive {
                     cost: TxCost::Evm(cost),
                     at: block,
                     provenance: self.sender.provenance(),
-                    tx_ref: self.tx_ref(tx_hash),
+                    tx_ref: Some(tx_hash.as_slice().to_vec()),
                 })
             }
             TxOutcome::Reverted {
@@ -237,7 +233,7 @@ impl DexExecutor for EvmLive {
                 cost: TxCost::Evm(cost),
                 at: block,
                 provenance: self.sender.provenance(),
-                tx_ref: self.tx_ref(tx_hash),
+                tx_ref: Some(tx_hash.as_slice().to_vec()),
             }),
             TxOutcome::TimedOut { tx_hash } => {
                 let at = self.sender.rpc().block_number().await.unwrap_or(0);
@@ -247,7 +243,7 @@ impl DexExecutor for EvmLive {
                     cost: TxCost::Evm(EvmCost::default()),
                     at,
                     provenance: self.sender.provenance(),
-                    tx_ref: self.tx_ref(tx_hash),
+                    tx_ref: Some(tx_hash.as_slice().to_vec()),
                 })
             }
         }
@@ -544,6 +540,83 @@ mod tests {
         assert_eq!(count("eth_call"), 0, "no allowance read");
     }
 
+    /// Over a fork sender the swap is `Simulated`, and carries the fork
+    /// transaction's hash all the same: a transaction was sent (`SPEC.md`
+    /// §5's shape rule, amended 3 October 2026).
+    #[tokio::test]
+    async fn over_a_fork_sender_the_swap_is_simulated_and_carries_its_hash() {
+        let server = MockServer::start().await;
+        let owner = Address::from([0xCC; 20]);
+        let contract = Address::from([0x11; 20]);
+        let token_in = Address::from([0xAA; 20]);
+        let token_out = Address::from([0xBB; 20]);
+        let tx_hash = B256::repeat_byte(0xAB);
+        for (rpc_method, result) in [
+            ("web3_clientVersion", json!("anvil/v1.3.0")),
+            ("eth_chainId", json!(format!("0x{SEPOLIA:x}"))),
+            (
+                "eth_getBalance",
+                json!(format_u256(U256::from(10u128.pow(20)))),
+            ),
+            ("anvil_impersonateAccount", Value::Null),
+            ("eth_getTransactionCount", json!("0x5")),
+            ("eth_estimateGas", json!("0x5208")),
+            ("eth_sendTransaction", json!(tx_hash.to_string())),
+            ("eth_blockNumber", json!("0x2a")),
+        ] {
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({ "method": rpc_method })))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({ "jsonrpc": "2.0", "id": 1, "result": result })),
+                )
+                .mount(&server)
+                .await;
+        }
+        let transfer_log = json!({
+            "address": token_out.to_string(),
+            "topics": [
+                transfer_topic().to_string(),
+                hex_data(&pad_address(Address::from([0x22; 20]))),
+                hex_data(&pad_address(owner)),
+            ],
+            "data": format_u256(U256::from(4_200u64)),
+        });
+        mount_receipt(
+            &server,
+            json!({ "status": "0x1", "blockNumber": "0x2a", "logs": [transfer_log] }),
+        )
+        .await;
+
+        let sender = EvmSender::fork(EvmRpc::new(server.uri()), owner, SEPOLIA)
+            .await
+            .unwrap();
+        let live = EvmLive::new(sender);
+        assert_eq!(live.label(), "evm-live-fork");
+        let fixture = crate::testkit::contract::DexContractFixture {
+            route: route(contract, token_in, token_out, &[0xCA, 0xFE]),
+            request: SwapRequest {
+                payer: Payer::CalledContract,
+                ..request(owner, owner)
+            },
+        };
+        let prepared = live
+            .prepare(&fixture.route, &fixture.request)
+            .await
+            .unwrap();
+        let realised = live.execute(&prepared, None).await.unwrap();
+        assert_eq!(realised.amount_out, Some(4_200));
+        assert_eq!(realised.provenance, Provenance::Simulated);
+        assert_eq!(realised.tx_ref, Some(tx_hash.as_slice().to_vec()));
+
+        crate::testkit::contract::dex_executor_contract(
+            &live,
+            crate::testkit::contract::Sends::Transactions,
+            fixture,
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn satisfies_the_dex_contract() {
         let server = MockServer::start().await;
@@ -572,7 +645,12 @@ mod tests {
             route: route(router, Address::from([0xAA; 20]), token_out, &[0xCA, 0xFE]),
             request: request(live.address(), recipient),
         };
-        crate::testkit::contract::dex_executor_contract(&live, fixture).await;
+        crate::testkit::contract::dex_executor_contract(
+            &live,
+            crate::testkit::contract::Sends::Transactions,
+            fixture,
+        )
+        .await;
     }
 
     #[tokio::test]

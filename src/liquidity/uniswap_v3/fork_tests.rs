@@ -32,7 +32,7 @@ use crate::liquidity::{
     LiquidityExecutor, LiquidityReport, LiquidityRequest, ManagerAbi, PositionId, Range, TokenPair,
 };
 use crate::testkit::contract::{
-    assert_liquidity_shape, liquidity_executor_contract, LiquidityContractFixture,
+    assert_liquidity_shape, liquidity_executor_contract, LiquidityContractFixture, Sends,
 };
 use crate::{Network, Provenance};
 use alloy_primitives::aliases::{U160, U24};
@@ -331,7 +331,11 @@ impl Fork {
         assert!(matches!(realised.outcome, Outcome::Success), "{realised:?}");
         assert!(realised.amount_out.unwrap() > 0);
         assert_eq!(realised.provenance, Provenance::Simulated);
-        assert_eq!(realised.tx_ref, None);
+        assert_eq!(
+            realised.tx_ref.as_ref().map(Vec::len),
+            Some(32),
+            "a fork send carries its hash"
+        );
     }
 }
 
@@ -349,7 +353,7 @@ async fn run(
 ) -> LiquidityReport {
     let prepared = liquidity.prepare(&cmd, request).await.unwrap();
     let report = liquidity.execute(&prepared).await.unwrap();
-    assert_liquidity_shape(&report);
+    assert_liquidity_shape(&report, Sends::Transactions);
     assert_eq!(report.provenance, Provenance::Simulated);
     report
 }
@@ -376,6 +380,7 @@ async fn against_anvil_evm_liquidity_satisfies_the_contract() {
 
     liquidity_executor_contract(
         &liquidity,
+        Sends::Transactions,
         LiquidityContractFixture {
             range: fork.range(tick - 10 * fork.spacing, tick + 10 * fork.spacing),
             request: fork.request(owner),
@@ -693,7 +698,7 @@ async fn against_anvil_injected_failures_end_in_the_right_shape() {
         .unwrap();
 
     let timed_out = timed_out.unwrap();
-    assert_liquidity_shape(&timed_out);
+    assert_liquidity_shape(&timed_out, Sends::Transactions);
     assert!(matches!(timed_out.outcome, Outcome::TimedOut));
     assert!(blocked.unwrap_err().to_string().contains("unresolved"));
     assert!(still_pending.unwrap().is_none());

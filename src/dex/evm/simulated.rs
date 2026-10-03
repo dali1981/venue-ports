@@ -723,6 +723,7 @@ mod tests {
 
         crate::testkit::contract::dex_executor_contract(
             &EvmSimulated::new(EvmRpc::new(server.uri())),
+            crate::testkit::contract::Sends::Nothing,
             crate::testkit::contract::DexContractFixture {
                 route: route(payload_for(router, &calldata)),
                 request: request(),
