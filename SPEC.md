@@ -371,8 +371,13 @@ pub trait DexExecutor: Send + Sync {
   can be simulated on the chain's real state before it exists. `amount_out` is decoded from the **first 32-byte word**
   of the router's return data: `SwapRouter02.exactInputSingle` returns one word, and KyberSwap's
   `MetaAggregationRouterV2.swap` and the other common aggregator routers put the output amount first.
-  Fewer than 32 bytes is an error, never a panic. A router whose output is not its first word needs its
-  own adapter. Its `cost` is `TxCost::Evm` with every figure `None`: an `eth_call` reports no gas.
+  Fewer than 32 bytes is an error, never a panic. A router whose output is not its first word is read by a
+  return rule set for its address, `EvmSimulated::with_return_rule(address, ReturnRule)`:
+  `ReturnRule::FirstWord` (the default) or `ReturnRule::LastOfArray`, the last element of one returned
+  `uint256[]`, as Uniswap v2's and Aerodrome's `swapExactTokensForTokens` return every hop's amount with
+  the amount out last. Return data the rule cannot decode (an offset or a length past the data, an empty
+  array) is an error, never a figure; `EvmLive` needs no rule, since it reads the output's `Transfer`. The
+  simulation's `cost` is `TxCost::Evm` with every figure `None`: an `eth_call` reports no gas.
 - **`DexStub`** (today's `EvmStub`, renamed: it was never EVM-specific) — an in-process fake with no
   network calls at all. Must let a test program the exact `Realised` (or error) a given `execute()` call
   returns, including reverts with a specific reason, a forced `TimedOut` and an `Expired`. Must record

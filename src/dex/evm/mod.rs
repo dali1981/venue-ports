@@ -7,4 +7,4 @@ mod live;
 mod simulated;
 
 pub use live::EvmLive;
-pub use simulated::{CodeOverride, EvmSimulated};
+pub use simulated::{CodeOverride, EvmSimulated, ReturnRule};

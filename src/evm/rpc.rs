@@ -5,7 +5,7 @@
 
 use crate::dex::EvmCost;
 use alloy_primitives::{Address, B256, U256};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -476,6 +476,38 @@ pub fn first_word(data: &[u8]) -> Result<U256> {
     Ok(U256::from_be_slice(word))
 }
 
+/// The last element of ABI-encoded return data that is one `uint256[]`: the
+/// head's single word is the array's offset, then its length, then its
+/// elements. A router that returns every hop's amount (Uniswap v2's and
+/// Aerodrome's `swapExactTokensForTokens`) puts the amount out last. An
+/// offset or a length that points past the data, or an empty array, is an
+/// error, never a panic.
+pub fn last_of_uint_array(data: &[u8]) -> Result<U256> {
+    let word = |at: usize| -> Result<U256> {
+        let end = at.checked_add(32).filter(|end| *end <= data.len()).ok_or_else(|| {
+            anyhow!(
+                "expected a 32-byte word at byte {at} of the uint256[] return data, which is {} bytes",
+                data.len()
+            )
+        })?;
+        Ok(U256::from_be_slice(&data[at..end]))
+    };
+    let offset: usize = word(0)?
+        .try_into()
+        .map_err(|_| anyhow!("the uint256[] offset does not fit the return data"))?;
+    let len: usize = word(offset)?
+        .try_into()
+        .map_err(|_| anyhow!("the uint256[] length does not fit the return data"))?;
+    if len == 0 {
+        bail!("the router returned an empty uint256[]: it names no amount out");
+    }
+    let last = len
+        .checked_mul(32)
+        .and_then(|n| n.checked_add(offset))
+        .ok_or_else(|| anyhow!("the uint256[] length {len} does not fit the return data"))?;
+    word(last)
+}
+
 /// Best-effort decode of a Solidity revert reason from a JSON-RPC error's
 /// `data` field: the standard `Error(string)` `require`/`revert` encoding
 /// when present. Any other revert data (a custom error, a `Panic(uint256)`)
@@ -536,7 +568,7 @@ pub(crate) fn encode_error_string(reason: &str) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -548,6 +580,41 @@ mod tests {
         assert_eq!(first_word(&data).unwrap(), U256::from(777u64));
 
         assert!(first_word(&[0u8; 31]).is_err());
+    }
+
+    /// `[amountIn, amountOut]` as Aerodrome's router returns it for one hop.
+    pub(crate) fn uint_array(items: &[u64]) -> Vec<u8> {
+        let mut data = U256::from(32u64).to_be_bytes::<32>().to_vec();
+        data.extend_from_slice(&U256::from(items.len()).to_be_bytes::<32>());
+        for item in items {
+            data.extend_from_slice(&U256::from(*item).to_be_bytes::<32>());
+        }
+        data
+    }
+
+    #[test]
+    fn last_of_uint_array_reads_the_amount_out_and_refuses_what_points_past_the_data() {
+        assert_eq!(
+            last_of_uint_array(&uint_array(&[20_000_000, 25_100_000])).unwrap(),
+            U256::from(25_100_000u64)
+        );
+        assert_eq!(
+            last_of_uint_array(&uint_array(&[1, 2, 3])).unwrap(),
+            U256::from(3u64)
+        );
+
+        let empty = last_of_uint_array(&uint_array(&[])).unwrap_err();
+        assert!(empty.to_string().contains("empty"), "{empty}");
+        let mut short = uint_array(&[1, 2]);
+        short.truncate(short.len() - 1);
+        assert!(last_of_uint_array(&short).is_err());
+        let mut far = uint_array(&[1, 2]);
+        far[..32].copy_from_slice(&U256::MAX.to_be_bytes::<32>());
+        assert!(last_of_uint_array(&far).is_err());
+        let mut long = uint_array(&[1, 2]);
+        long[32..64].copy_from_slice(&U256::from(u64::MAX).to_be_bytes::<32>());
+        assert!(last_of_uint_array(&long).is_err());
+        assert!(last_of_uint_array(&[0u8; 16]).is_err());
     }
 
     #[test]

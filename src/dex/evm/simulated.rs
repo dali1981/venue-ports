@@ -34,12 +34,16 @@
 //! produces its `RouteQuote`s.
 //!
 //! **Return-value convention:** `amount_out` is the **first 32-byte word**
-//! of the router's return data. `SwapRouter02.exactInputSingle` returns one
-//! word; KyberSwap's `MetaAggregationRouterV2.swap` returns
+//! of the router's return data unless a [`ReturnRule`] is set for the
+//! address called. `SwapRouter02.exactInputSingle` returns one word;
+//! KyberSwap's `MetaAggregationRouterV2.swap` returns
 //! `(uint256 returnAmount, uint256 gasUsed)`, and the other common
-//! aggregator routers likewise put the output amount first. Fewer than 32
-//! bytes is an error, never a panic. A router whose output is not its first
-//! word needs its own adapter.
+//! aggregator routers likewise put the output amount first. A router that
+//! returns every hop's amount as one `uint256[]` (Uniswap v2's and
+//! Aerodrome's `swapExactTokensForTokens`) has its first word read as the
+//! array's offset, so its caller sets [`ReturnRule::LastOfArray`] for it
+//! with [`EvmSimulated::with_return_rule`]. Return data the rule cannot
+//! decode is an error, never a panic.
 
 use crate::dex::{
     ChainAmount, DexExecutor, EvmCall, EvmCost, Outcome, Payer, Prepared, Realised, RouteQuote,
@@ -48,7 +52,8 @@ use crate::dex::{
 use crate::evm::erc20::{self, SlotCache};
 use crate::evm::prepared_key;
 use crate::evm::rpc::{
-    address_from_slice, first_word, format_u256, hex_data, BlockTag, EvmRpc, RpcError,
+    address_from_slice, first_word, format_u256, hex_data, last_of_uint_array, BlockTag, EvmRpc,
+    RpcError,
 };
 use crate::{Network, Provenance};
 use alloy_primitives::{Address, B256, U256};
@@ -77,11 +82,33 @@ pub struct CodeOverride {
     pub storage: Vec<(B256, B256)>,
 }
 
+/// Where the amount out is in a call's return data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReturnRule {
+    /// The first 32-byte word: one `uint256`, or a tuple that puts the
+    /// amount out first.
+    #[default]
+    FirstWord,
+    /// The last element of a returned `uint256[]`: a router that returns
+    /// every hop's amount, the amount out last.
+    LastOfArray,
+}
+
+impl ReturnRule {
+    fn amount_out(self, data: &[u8]) -> Result<U256> {
+        match self {
+            ReturnRule::FirstWord => first_word(data),
+            ReturnRule::LastOfArray => last_of_uint_array(data),
+        }
+    }
+}
+
 pub struct EvmSimulated {
     rpc: EvmRpc,
     pending: Mutex<HashMap<B256, PendingSimulation>>,
     slots: SlotCache,
     code: HashMap<Address, CodeOverride>,
+    returns: HashMap<Address, ReturnRule>,
 }
 
 impl EvmSimulated {
@@ -91,7 +118,15 @@ impl EvmSimulated {
             pending: Mutex::new(HashMap::new()),
             slots: SlotCache::default(),
             code: HashMap::new(),
+            returns: HashMap::new(),
         }
+    }
+
+    /// Reads the amount out of a call to `address` by `rule` rather than
+    /// from its first word.
+    pub fn with_return_rule(mut self, address: Address, rule: ReturnRule) -> Self {
+        self.returns.insert(address, rule);
+        self
     }
 
     /// Runs every call with `code` placed at `address`, whatever the chain
@@ -242,8 +277,10 @@ impl DexExecutor for EvmSimulated {
             .await
         {
             Ok(data) => {
-                let amount_out: u128 = first_word(&data)
-                    .context("decoding the router's return data")?
+                let rule = self.returns.get(&router).copied().unwrap_or_default();
+                let amount_out: u128 = rule
+                    .amount_out(&data)
+                    .with_context(|| format!("decoding {router}'s return data by {rule:?}"))?
                     .try_into()
                     .context("amount_out overflowed u128")?;
                 Ok(Realised {
@@ -561,6 +598,89 @@ mod tests {
         let realised = adapter.execute(&prepared, Some(1)).await.unwrap();
 
         assert_eq!(realised.amount_out, Some(123_456));
+    }
+
+    /// Aerodrome's router returns `[amountIn, amountOut]`: read by its first
+    /// word, the answer is the array's offset (32), which is not an amount.
+    #[tokio::test]
+    async fn a_router_returning_every_hops_amount_is_read_by_its_return_rule() {
+        let server = MockServer::start().await;
+        let router = [0x11; 20];
+        let calldata = vec![0x0d, 0x0e];
+        let amounts = crate::evm::rpc::tests::uint_array(&[1_000, 1_234]);
+        mount_router(&server, router, &calldata, amounts).await;
+
+        let by_first_word = EvmSimulated::new(EvmRpc::new(server.uri()));
+        let prepared = by_first_word
+            .prepare(&route(payload_for(router, &calldata)), &request())
+            .await
+            .unwrap();
+        let realised = by_first_word.execute(&prepared, Some(1)).await.unwrap();
+        assert_eq!(
+            realised.amount_out,
+            Some(32),
+            "the offset word, not an amount"
+        );
+
+        let by_rule = EvmSimulated::new(EvmRpc::new(server.uri()))
+            .with_return_rule(Address::from(router), ReturnRule::LastOfArray);
+        let prepared = by_rule
+            .prepare(&route(payload_for(router, &calldata)), &request())
+            .await
+            .unwrap();
+        let realised = by_rule.execute(&prepared, Some(1)).await.unwrap();
+        assert_eq!(realised.amount_out, Some(1_234));
+        assert!(matches!(realised.outcome, Outcome::Success));
+    }
+
+    /// A rule belongs to the address it was set for: another router called
+    /// through the same adapter is still read by its first word.
+    #[tokio::test]
+    async fn a_return_rule_applies_only_to_its_own_address() {
+        let server = MockServer::start().await;
+        let router = [0x11; 20];
+        let calldata = vec![0x0f];
+        mount_router(
+            &server,
+            router,
+            &calldata,
+            U256::from(4_321u64).to_be_bytes::<32>().to_vec(),
+        )
+        .await;
+
+        let adapter = EvmSimulated::new(EvmRpc::new(server.uri()))
+            .with_return_rule(Address::from([0x22; 20]), ReturnRule::LastOfArray);
+        let prepared = adapter
+            .prepare(&route(payload_for(router, &calldata)), &request())
+            .await
+            .unwrap();
+        let realised = adapter.execute(&prepared, Some(1)).await.unwrap();
+        assert_eq!(realised.amount_out, Some(4_321));
+    }
+
+    /// A one-word answer read as an array points past the data: an error
+    /// that names the rule, never a figure.
+    #[tokio::test]
+    async fn return_data_its_rule_cannot_decode_is_an_error() {
+        let server = MockServer::start().await;
+        let router = [0x11; 20];
+        let calldata = vec![0x10];
+        mount_router(
+            &server,
+            router,
+            &calldata,
+            U256::from(4_321u64).to_be_bytes::<32>().to_vec(),
+        )
+        .await;
+
+        let adapter = EvmSimulated::new(EvmRpc::new(server.uri()))
+            .with_return_rule(Address::from(router), ReturnRule::LastOfArray);
+        let prepared = adapter
+            .prepare(&route(payload_for(router, &calldata)), &request())
+            .await
+            .unwrap();
+        let err = adapter.execute(&prepared, Some(1)).await.unwrap_err();
+        assert!(format!("{err:#}").contains("LastOfArray"), "{err:#}");
     }
 
     #[tokio::test]
