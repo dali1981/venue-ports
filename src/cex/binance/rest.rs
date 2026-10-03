@@ -103,8 +103,10 @@ pub struct CommissionDiscount {
     pub enabled_for_account: bool,
     #[serde(rename = "enabledForSymbol")]
     pub enabled_for_symbol: bool,
+    /// `None` where the venue names none: the spot testnet answered
+    /// `"discountAsset": null`, with a discount of zero, on 3 October 2026.
     #[serde(rename = "discountAsset")]
-    pub asset: String,
+    pub asset: Option<String>,
     /// The fraction the standard rate is reduced by (`0.25` is a quarter).
     #[serde(rename = "discount")]
     pub rate: Decimal,

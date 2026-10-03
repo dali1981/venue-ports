@@ -1022,6 +1022,13 @@ no fill is ever returned with a guessed commission.
   matching engine, so a test order has no fill, no order id and no provenance, and any failure,
   a lost answer included, is a plain error. It is what a shadow stage calls.
 
+  Both are checked on the spot testnet by the ignored `binance_spot_testnet`, which refuses any other
+  host. Run on 3 October 2026 (AEROUSDT): the test endpoint accepted 7.6 AERO and refused 1.3 with
+  `-1013 Filter failure: NOTIONAL`; a market buy and a market sell of 7.6 each filled in one trade,
+  naming its client order id, `transactTime` and trade id. The testnet charges nothing and answers
+  `"discountAsset": null`, which the documentation does not show, so `CommissionDiscount.asset` is
+  optional.
+
   Every wait a live CEX adapter makes (request timeout, `recvWindow`, clock refresh, status polling,
   how long trade lines may lag a fill) is one `CexTimings` value, so a test can make them short. A
   failed call is sorted by whether the venue may have acted on it: a connection never opened is not

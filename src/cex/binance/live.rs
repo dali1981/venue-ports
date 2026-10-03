@@ -210,7 +210,7 @@ mod tests {
     use super::*;
     use crate::cex::binance::clock::local_now_ms;
     use crate::cex::binance::rest::BinanceConfig;
-    use crate::cex::{CexTimings, CexTrade, MakerTaker, OrderStateUnknown};
+    use crate::cex::{CexTimings, CexTrade, CommissionRates, MakerTaker, OrderStateUnknown};
     use std::str::FromStr;
     use std::time::Duration;
     use wiremock::matchers::{method, path};
@@ -757,11 +757,11 @@ mod tests {
         let discount = check.rates.discount.unwrap();
         assert_eq!(
             (
-                discount.asset.as_str(),
+                discount.asset.as_deref(),
                 discount.rate,
                 discount.enabled_for_account
             ),
-            ("BNB", decimal("0.25"), true)
+            (Some("BNB"), decimal("0.25"), true)
         );
 
         let requests = server.received_requests().await.unwrap();
@@ -778,6 +778,19 @@ mod tests {
             param(tested, "newClientOrderId"),
             Some(check.client_order_id)
         );
+    }
+
+    #[test]
+    fn the_spot_testnets_own_answer_reads_with_no_discount_asset() {
+        // Its answer to an order test, 3 October 2026: every rate zero and a
+        // null discount asset, which the documentation does not show.
+        let rates: CommissionRates = serde_json::from_str(
+            r#"{"standardCommissionForOrder":{"maker":"0.00000000","taker":"0.00000000"},"specialCommissionForOrder":{"maker":"0.00000000","taker":"0.00000000"},"taxCommissionForOrder":{"maker":"0.00000000","taker":"0.00000000"},"discount":{"enabledForAccount":true,"enabledForSymbol":true,"discountAsset":null,"discount":"0.00000000"}}"#,
+        )
+        .unwrap();
+        let discount = rates.discount.unwrap();
+        assert_eq!((discount.asset, discount.rate), (None, Decimal::ZERO));
+        assert_eq!(rates.standard.taker, Decimal::ZERO);
     }
 
     #[tokio::test]
@@ -853,5 +866,152 @@ mod tests {
             .to_string()
             .contains("rounded down to zero"));
         // `expect(0)` is verified when `server` drops.
+    }
+
+    // ---- The spot testnet (plan V3 of arb-searcher's execution blotter) ----
+    //
+    // Ignored: it places real orders on Binance's spot testnet. Run with
+    //   cargo test --lib binance_spot_testnet -- --ignored --nocapture
+    // and BINANCE_API_KEY / BINANCE_API_SECRET holding a spot *testnet* key.
+    // It refuses any host but the testnet's, whatever BINANCE_BASE_URL says.
+    // BINANCE_SPOT_TEST_SYMBOL picks the symbol (AEROUSDT by default); the
+    // symbol's step and minimum notional are read from the testnet itself.
+
+    /// The `LOT_SIZE` step and the `NOTIONAL` (or `MIN_NOTIONAL`) minimum of
+    /// `symbol`, from `GET /api/v3/exchangeInfo`.
+    async fn spot_rules(rest: &BinanceRest, symbol: &str) -> (Decimal, Decimal) {
+        let info: serde_json::Value = rest
+            .client()
+            .public_get("/api/v3/exchangeInfo", &[("symbol", symbol.to_string())])
+            .await
+            .unwrap_or_else(|err| panic!("reading {symbol}'s rules: {err}"));
+        let filters = info["symbols"][0]["filters"]
+            .as_array()
+            .expect("the symbol's filters");
+        let filter = |kind: &str, key: &str| {
+            filters
+                .iter()
+                .find(|f| f["filterType"] == kind)
+                .and_then(|f| f[key].as_str())
+                .map(decimal)
+        };
+        let step = filter("LOT_SIZE", "stepSize").expect("a LOT_SIZE step");
+        let minimum = filter("NOTIONAL", "minNotional")
+            .or_else(|| filter("MIN_NOTIONAL", "minNotional"))
+            .expect("a minimum notional");
+        (step, minimum)
+    }
+
+    async fn spot_price(rest: &BinanceRest, symbol: &str) -> Decimal {
+        let ticker: serde_json::Value = rest
+            .client()
+            .public_get("/api/v3/ticker/price", &[("symbol", symbol.to_string())])
+            .await
+            .unwrap_or_else(|err| panic!("reading {symbol}'s price: {err}"));
+        decimal(ticker["price"].as_str().expect("a price"))
+    }
+
+    /// The smallest whole number of steps worth at least `usd` at `price`.
+    fn steps_worth(usd: Decimal, price: Decimal, step: Decimal) -> Decimal {
+        (usd / price / step).ceil() * step
+    }
+
+    /// What every testnet fill must name, and that it traded `qty`.
+    fn assert_landed(fill: &CexFill, qty: Decimal, side: &str) {
+        crate::testkit::contract::assert_fill_shape(fill, "binance-spot-testnet");
+        assert_eq!(
+            fill.provenance,
+            Provenance::Landed,
+            "{side}: a testnet order is landed"
+        );
+        assert_eq!(
+            fill.filled_qty, qty,
+            "{side}: a market order this small fills in full"
+        );
+        assert!(
+            fill.client_order_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("vp-")),
+            "{side}: {:?}",
+            fill.client_order_id
+        );
+        let now = local_now_ms() as i128;
+        let at = fill.venue_time_ms.expect("the venue's transactTime") as i128;
+        assert!(
+            (now - at).abs() < 60_000,
+            "{side}: transactTime {at} against local {now}"
+        );
+        assert!(!fill.trades.is_empty(), "{side}: its trades are listed");
+        assert!(
+            fill.trades.iter().all(|t| t.trade_id.is_some()),
+            "{side}: every trade has its id"
+        );
+        assert!(
+            !fill.commission_asset.is_empty(),
+            "{side}: a commission asset"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "places orders on Binance's spot testnet; needs a testnet key"]
+    async fn binance_spot_testnet() {
+        let config = BinanceConfig::from_env()
+            .expect("BINANCE_API_KEY and BINANCE_API_SECRET must hold a spot testnet key");
+        assert!(
+            config.base_url.trim_end_matches('/') == "https://testnet.binance.vision",
+            "refusing to place orders anywhere but the spot testnet: {}",
+            config.base_url
+        );
+        let symbol =
+            std::env::var("BINANCE_SPOT_TEST_SYMBOL").unwrap_or_else(|_| "AEROUSDT".to_string());
+        let rest = BinanceRest::new(config);
+        let (step, minimum) = spot_rules(&rest, &symbol).await;
+        let price = spot_price(&rest, &symbol).await;
+        let live = BinanceLive::new(rest, HashMap::from([(symbol.clone(), step)]));
+        let order = |side, quantity| OrderRequest {
+            symbol: symbol.clone(),
+            side,
+            quantity,
+            quoted_price: price,
+            reduce_only: false,
+        };
+        let qty = steps_worth(minimum + Decimal::ONE, price, step);
+        eprintln!(
+            "{symbol}: step {step}, minimum notional {minimum}, price {price}; trading {qty}"
+        );
+
+        // 1. The test endpoint: an order over the minimum is accepted with
+        //    its rates, one under it is refused, and neither is placed.
+        let check = live
+            .test_order(&order(OrderSide::Buy, qty))
+            .await
+            .expect("the order test");
+        assert_eq!(check.quantity, qty);
+        eprintln!("order test: {:?}", check.rates);
+        let dust = steps_worth(minimum / Decimal::from(5), price, step);
+        let refused = live
+            .test_order(&order(OrderSide::Buy, dust))
+            .await
+            .expect_err("an order under the minimum notional is refused");
+        eprintln!("order test under the minimum ({dust}): {refused:#}");
+        assert!(
+            format!("{refused:#}").contains("-1013"),
+            "a filter failure: {refused:#}"
+        );
+
+        // 2. A market buy, then a market sell of the same quantity.
+        let bought = live
+            .execute(&order(OrderSide::Buy, qty))
+            .await
+            .expect("the market buy");
+        eprintln!("buy: {bought:?}");
+        assert_landed(&bought, qty, "buy");
+        let sold = live
+            .execute(&order(OrderSide::Sell, qty))
+            .await
+            .expect("the market sell");
+        eprintln!("sell: {sold:?}");
+        assert_landed(&sold, qty, "sell");
+        assert_ne!(bought.client_order_id, sold.client_order_id);
     }
 }
