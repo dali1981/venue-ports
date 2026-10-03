@@ -176,7 +176,7 @@ impl DexExecutor for DexStub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dex::{EvmCost, SolanaCost};
+    use crate::dex::{EvmCost, Payer, SolanaCost};
     use solana_address::Address;
 
     fn route() -> RouteQuote {
@@ -203,6 +203,7 @@ mod tests {
         SwapRequest {
             sender: vec![3],
             recipient: vec![4],
+            payer: Payer::Sender,
             min_amount_out: 90,
             deadline_unix_secs: 0,
         }

@@ -27,7 +27,7 @@ mod surfpool_tests;
 pub use live::JupiterLive;
 pub use simulated::JupiterSimulated;
 
-use crate::dex::{RouteQuote, SwapRequest};
+use crate::dex::{Payer, RouteQuote, SwapRequest};
 use crate::solana::rpc::{address_from_slice, SolanaRpc};
 use crate::solana::token::{associated_token_account, token_account_amount, token_program_of};
 use crate::Network;
@@ -167,6 +167,13 @@ fn check_request(
             route.network
         );
     }
+    match req.payer {
+        Payer::Sender => {}
+        Payer::CalledContract => bail!(
+            "a Jupiter swap is paid by the account that signs it: SwapRequest.payer must be \
+             Payer::Sender, not Payer::CalledContract"
+        ),
+    }
     let sender = address_from_slice(&req.sender).context("SwapRequest.sender")?;
     let recipient = address_from_slice(&req.recipient).context("SwapRequest.recipient")?;
     if req.deadline_unix_secs == 0 {
@@ -274,6 +281,35 @@ fn message_key(transaction: &VersionedTransaction) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_contract_payer_is_refused_by_name() {
+        let network = Network::Solana {
+            genesis_hash: [7; 32],
+        };
+        let route = RouteQuote {
+            network,
+            token_in: vec![1; 32],
+            token_out: vec![2; 32],
+            amount_in: 1_000,
+            expected_amount_out: 900,
+            payload: Vec::new(),
+        };
+        let req = SwapRequest {
+            sender: vec![3; 32],
+            recipient: vec![3; 32],
+            payer: Payer::CalledContract,
+            min_amount_out: 900,
+            deadline_unix_secs: u64::MAX,
+        };
+        let err = check_request(network, &route, &req).unwrap_err();
+        assert!(err.to_string().contains("Payer::CalledContract"), "{err}");
+        let paid_by_sender = SwapRequest {
+            payer: Payer::Sender,
+            ..req
+        };
+        assert!(check_request(network, &route, &paid_by_sender).is_ok());
+    }
 
     #[test]
     fn the_bps_keep_the_on_chain_minimum_at_or_above_the_literal_one() {

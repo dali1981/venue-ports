@@ -41,11 +41,26 @@ pub struct RouteQuote {
     pub payload: Vec<u8>,
 }
 
+/// Who holds a swap's input and pays it to the venue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Payer {
+    /// The sender holds the input, and the address it calls takes it from
+    /// the sender: on EVM through an allowance the adapter grants. Every
+    /// router and aggregator works this way.
+    Sender,
+    /// The contract the call is made to holds the input and pays the venue
+    /// from it, so the sender grants nothing: a contract that keeps its own
+    /// inventory. EVM only; a Solana adapter refuses it.
+    CalledContract,
+}
+
 /// What the caller wants built on top of a `RouteQuote`.
 #[derive(Debug, Clone)]
 pub struct SwapRequest {
     pub sender: ChainAddress,
     pub recipient: ChainAddress,
+    /// Who holds the input: the sender, or the contract the route calls.
+    pub payer: Payer,
     /// The minimum acceptable output, as a literal amount. Never a
     /// percentage or basis-point tolerance recomputed at build time — the
     /// caller has already decided the number that makes this worth doing,

@@ -35,13 +35,18 @@
 //! router's current allowance and, only if it's short, sends an `approve`
 //! capped to exactly `route.amount_in` — never `U256::MAX`.
 //!
+//! **A contract payer** (`Payer::CalledContract`): the contract called holds
+//! the input and pays the venue itself, so nothing is approved and no
+//! allowance is read. The amount out is read the same way, from the output's
+//! `Transfer` to `SwapRequest.recipient`.
+//!
 //! **Over a fork sender** (`SPEC.md` §5b), this adapter is a swap simulator
 //! whose state persists between calls: its provenance is `Simulated` and it
-//! sets no `tx_ref`. The owner must hold the input token on the fork;
+//! sets no `tx_ref`. The payer must hold the input token on the fork;
 //! [`EvmSender::ensure_balance`] writes it there.
 
 use crate::dex::{
-    ChainAmount, DexExecutor, EvmCall, EvmCost, Outcome, Prepared, Realised, RouteQuote,
+    ChainAmount, DexExecutor, EvmCall, EvmCost, Outcome, Payer, Prepared, Realised, RouteQuote,
     SwapRequest, TxCost,
 };
 use crate::evm::erc20;
@@ -59,6 +64,7 @@ struct PendingLive {
     token_in: Address,
     token_out: Address,
     recipient: Address,
+    payer: Payer,
     amount_in: ChainAmount,
     deadline_unix_secs: u64,
 }
@@ -145,6 +151,7 @@ impl DexExecutor for EvmLive {
                 token_in,
                 token_out,
                 recipient,
+                payer: req.payer,
                 amount_in: route.amount_in,
                 deadline_unix_secs: req.deadline_unix_secs,
             },
@@ -182,9 +189,15 @@ impl DexExecutor for EvmLive {
             );
         }
 
-        self.sender
-            .ensure_allowance(ctx.token_in, router, U256::from(ctx.amount_in))
-            .await?;
+        match ctx.payer {
+            Payer::Sender => {
+                self.sender
+                    .ensure_allowance(ctx.token_in, router, U256::from(ctx.amount_in))
+                    .await?
+            }
+            // The contract pays the venue from its own balance: nothing to approve.
+            Payer::CalledContract => {}
+        }
 
         match self
             .sender
@@ -298,6 +311,7 @@ mod tests {
         SwapRequest {
             sender: sender.as_slice().to_vec(),
             recipient: recipient.as_slice().to_vec(),
+            payer: Payer::Sender,
             min_amount_out: 900,
             deadline_unix_secs: 9_999_999_999,
         }
@@ -464,6 +478,70 @@ mod tests {
         assert_eq!(realised.provenance, Provenance::Landed);
         assert!(realised.tx_ref.is_some());
         assert_eq!(realised.at, 42);
+    }
+
+    /// A contract that keeps its own inventory pays the pool itself: no
+    /// allowance is read and no `approve` is sent, so the swap is the only
+    /// transaction. Its output is the `Transfer` to the contract.
+    #[tokio::test]
+    async fn a_contract_payer_sends_the_swap_and_nothing_else() {
+        let server = MockServer::start().await;
+        let contract = Address::from([0x11; 20]);
+        let token_in = Address::from([0xAA; 20]);
+        let token_out = Address::from([0xBB; 20]);
+        let pool = Address::from([0x22; 20]);
+
+        mount_send_plumbing(&server).await;
+        // An allowance read here would find none, and send an approve.
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "eth_call"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1, "result": format_u256(U256::ZERO),
+            })))
+            .mount(&server)
+            .await;
+        let transfer_log = json!({
+            "address": token_out.to_string(),
+            "topics": [
+                transfer_topic().to_string(),
+                hex_data(&pad_address(pool)),
+                hex_data(&pad_address(contract)),
+            ],
+            "data": format_u256(U256::from(4_200u64)),
+        });
+        mount_receipt(
+            &server,
+            json!({ "status": "0x1", "blockNumber": "0x2a", "logs": [transfer_log] }),
+        )
+        .await;
+
+        let live = EvmLive::new(connect(&server).await);
+        let req = SwapRequest {
+            payer: Payer::CalledContract,
+            ..request(live.address(), contract)
+        };
+        let prepared = live
+            .prepare(&route(contract, token_in, token_out, &[0xCA, 0xFE]), &req)
+            .await
+            .unwrap();
+        let realised = live.execute(&prepared, None).await.unwrap();
+        assert_eq!(realised.amount_out, Some(4_200));
+        assert!(matches!(realised.outcome, Outcome::Success));
+
+        let bodies: Vec<Value> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.body_json().unwrap())
+            .collect();
+        let count = |rpc_method: &str| bodies.iter().filter(|b| b["method"] == rpc_method).count();
+        assert_eq!(
+            count("eth_sendRawTransaction"),
+            1,
+            "the swap alone, no approve"
+        );
+        assert_eq!(count("eth_call"), 0, "no allowance read");
     }
 
     #[tokio::test]
@@ -707,6 +785,7 @@ mod tests {
         let sim_request = SwapRequest {
             sender: me.as_slice().to_vec(),
             recipient: me.as_slice().to_vec(),
+            payer: Payer::Sender,
             min_amount_out: 0,
             deadline_unix_secs: 0,
         };
@@ -723,6 +802,7 @@ mod tests {
         let live_request = SwapRequest {
             sender: me.as_slice().to_vec(),
             recipient: me.as_slice().to_vec(),
+            payer: Payer::Sender,
             min_amount_out: 0,
             deadline_unix_secs: deadline,
         };

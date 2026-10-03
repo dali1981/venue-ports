@@ -165,11 +165,26 @@ pub struct RouteQuote {
     pub payload: Vec<u8>,
 }
 
+/// Who holds a swap's input and pays it to the venue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Payer {
+    /// The sender holds the input, and the address it calls takes it from
+    /// the sender: on EVM through an allowance the adapter grants. Every
+    /// router and aggregator works this way.
+    Sender,
+    /// The contract the call is made to holds the input and pays the venue
+    /// from it, so the sender grants nothing: a contract that keeps its own
+    /// inventory. EVM only; a Solana adapter refuses it.
+    CalledContract,
+}
+
 /// What the caller wants built on top of a `RouteQuote`.
 #[derive(Debug, Clone)]
 pub struct SwapRequest {
     pub sender: ChainAddress,
     pub recipient: ChainAddress,
+    /// Who holds the input: the sender, or the contract the route calls.
+    pub payer: Payer,
     /// The minimum acceptable output, as a literal amount. Never a
     /// percentage or basis-point tolerance recomputed at build time — the
     /// caller has already decided the number that makes this worth doing,
@@ -338,6 +353,8 @@ pub trait DexExecutor: Send + Sync {
   }
   ```
 
+  With `Payer::CalledContract` it reads no allowance and sends no `approve`: the contract called pays
+  the venue from its own balance, and the amount out is still the output's `Transfer` to the recipient.
   `prepare` refuses a `RouteQuote` whose `network` is not the sender's. Given a fork sender (§5b)
   instead of a signing one, `EvmLive` becomes a swap simulator whose state persists between calls: its
   provenance is then `Simulated` and it sets no `tx_ref`. Its `cost` is `TxCost::Evm` with the
@@ -347,7 +364,11 @@ pub trait DexExecutor: Send + Sync {
   broadcast. Where the simulated sender does not actually hold the input token or the router's
   allowance, the adapter is responsible for overriding just enough state (balance, allowance) to make
   the call possible — and for granting that allowance *to the router the route actually calls*, not to
-  whatever address happens to be probing it. `amount_out` is decoded from the **first 32-byte word**
+  whatever address happens to be probing it. With `Payer::CalledContract` the balance goes on the
+  contract called and no allowance is written. A contract not yet deployed is placed by a code override,
+  `EvmSimulated::with_code_override(address, CodeOverride { runtime_code, storage })`: its runtime code
+  and the storage its constructor would have written, in every call the adapter makes, so a contract
+  can be simulated on the chain's real state before it exists. `amount_out` is decoded from the **first 32-byte word**
   of the router's return data: `SwapRouter02.exactInputSingle` returns one word, and KyberSwap's
   `MetaAggregationRouterV2.swap` and the other common aggregator routers put the output amount first.
   Fewer than 32 bytes is an error, never a panic. A router whose output is not its first word needs its
@@ -369,6 +390,7 @@ pub trait DexExecutor: Send + Sync {
   `simulateTransaction`'s returned accounts (dry run), or from the landed transaction's post token
   balances.
 - **The cost** is `TxCost::Solana`, carrying the run's `unitsConsumed`.
+- **The payer** is the account that signs. Both adapters refuse `Payer::CalledContract` by name.
 
 | Mode | Adapter |
 | --- | --- |
@@ -819,12 +841,14 @@ impl EvmSender {
     /// `Landed`.
     pub fn provenance(&self) -> Provenance;
 
-    /// Checks that the owner holds at least `amount` of `token`. A signing
-    /// sender returns an error when it does not, so a transaction that would
-    /// revert with STF is never sent. A fork sender instead writes the balance
-    /// slot with `anvil_setStorageAt` (the slot comes from `evm::erc20`'s
-    /// probing), exactly as `EvmSimulated` overrides state.
-    pub async fn ensure_balance(&self, token: Address, amount: U256) -> Result<()>;
+    /// Checks that `holder` holds at least `amount` of `token`: the owner,
+    /// or a contract that pays a swap from its own inventory (a swap's
+    /// payer). A signing sender returns an error when it does not, so a
+    /// transaction that would revert with STF is never sent. A fork sender
+    /// instead writes the holder's balance slot with `anvil_setStorageAt`
+    /// (the slot comes from `evm::erc20`'s probing), exactly as
+    /// `EvmSimulated` overrides state.
+    pub async fn ensure_balance(&self, token: Address, holder: Address, amount: U256) -> Result<()>;
 }
 ```
 

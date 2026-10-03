@@ -12,7 +12,7 @@
 //! swap needs; `scripts/rpc-pacer.py` paces them (its docs say how).
 
 use crate::dex::jupiter::{slippage_bps_for, JupiterConfig, JupiterLive, JupiterSimulated};
-use crate::dex::{DexExecutor, Outcome, RouteQuote, SwapRequest, TxCost};
+use crate::dex::{DexExecutor, Outcome, Payer, RouteQuote, SwapRequest, TxCost};
 use crate::solana::token::{associated_token_account, token_account_amount, TOKEN_PROGRAM};
 use crate::solana::{SolanaRpc, SolanaSender};
 use crate::testkit::contract::{dex_executor_contract, DexContractFixture};
@@ -71,6 +71,7 @@ fn request(owner: &Address, min_amount_out: u128) -> SwapRequest {
     SwapRequest {
         sender: owner.to_bytes().to_vec(),
         recipient: owner.to_bytes().to_vec(),
+        payer: Payer::Sender,
         min_amount_out,
         deadline_unix_secs: crate::liquidity::unix_now() + 300,
     }

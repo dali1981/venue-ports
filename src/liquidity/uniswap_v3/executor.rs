@@ -669,7 +669,9 @@ impl LiquidityExecutor for EvmLiquidity {
                     continue;
                 }
                 let amount = U256::from(max);
-                self.sender.ensure_balance(token, amount).await?;
+                self.sender
+                    .ensure_balance(token, self.sender.address(), amount)
+                    .await?;
                 self.sender
                     .ensure_allowance(token, self.manager, amount)
                     .await?;

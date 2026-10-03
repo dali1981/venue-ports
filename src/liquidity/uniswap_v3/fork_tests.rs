@@ -21,7 +21,7 @@
 //! onto a plain anvil node and prints them, for when no fork RPC is at hand.
 
 use crate::dex::evm::EvmLive;
-use crate::dex::{DexExecutor, Outcome, RouteQuote, SwapRequest};
+use crate::dex::{DexExecutor, Outcome, Payer, RouteQuote, SwapRequest};
 use crate::evm::erc20;
 use crate::evm::rpc::{BlockTag, EvmRpc};
 use crate::evm::tx::tests::anvil;
@@ -292,7 +292,7 @@ impl Fork {
             (self.token1, self.token0)
         };
         live.sender()
-            .ensure_balance(token_in, U256::from(amount_in))
+            .ensure_balance(token_in, live.address(), U256::from(amount_in))
             .await
             .unwrap();
         let deadline = unix_now() + 3_600;
@@ -322,6 +322,7 @@ impl Fork {
         let request = SwapRequest {
             sender: owner.as_slice().to_vec(),
             recipient: owner.as_slice().to_vec(),
+            payer: Payer::Sender,
             min_amount_out: 0,
             deadline_unix_secs: deadline,
         };
@@ -656,7 +657,7 @@ async fn against_anvil_injected_failures_end_in_the_right_shape() {
     // first, so the only transaction left in flight is the mint itself.
     for (token, amount) in [(fork.token0, a0), (fork.token1, a1)] {
         sender
-            .ensure_balance(token, U256::from(amount))
+            .ensure_balance(token, sender.address(), U256::from(amount))
             .await
             .unwrap();
         sender

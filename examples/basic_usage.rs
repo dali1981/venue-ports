@@ -11,7 +11,7 @@ use std::str::FromStr;
 
 use rust_decimal::Decimal;
 use venue_ports::cex::{CexExecutor, CexStub, OrderRequest, OrderSide, OrderStateUnknown};
-use venue_ports::dex::{DexExecutor, DexStub, Outcome, RouteQuote, SwapRequest};
+use venue_ports::dex::{DexExecutor, DexStub, Outcome, Payer, RouteQuote, SwapRequest};
 use venue_ports::Network;
 
 #[tokio::main]
@@ -36,6 +36,7 @@ async fn run_dex_leg() -> anyhow::Result<()> {
     let req = SwapRequest {
         sender: vec![0xC2; 20],
         recipient: vec![0xC2; 20],
+        payer: Payer::Sender,
         min_amount_out: 900_000,
         deadline_unix_secs: 0,
     };

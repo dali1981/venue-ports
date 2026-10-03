@@ -364,7 +364,7 @@ pub async fn cex_account_contract(account: &dyn CexAccount, fixture: CexAccountC
 mod tests {
     use super::*;
     use crate::cex::{CexStub, OrderSide};
-    use crate::dex::DexStub;
+    use crate::dex::{DexStub, Payer};
     use crate::Network;
     use std::str::FromStr;
 
@@ -381,6 +381,7 @@ mod tests {
             request: SwapRequest {
                 sender: vec![3],
                 recipient: vec![4],
+                payer: Payer::Sender,
                 min_amount_out: 90,
                 deadline_unix_secs: 0,
             },
