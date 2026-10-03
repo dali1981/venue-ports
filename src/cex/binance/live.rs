@@ -41,7 +41,9 @@
 //! (README defect 4 asks for this check).
 
 use crate::cex::binance::order::{settled, single_commission, trade_lines, unreadable_fill};
-use crate::cex::binance::rest::{BinanceOrderResponse, BinanceRest, MY_TRADES_PATH, ORDER_PATH};
+use crate::cex::binance::rest::{
+    BinanceOrderResponse, BinanceRest, OrderCheck, MY_TRADES_PATH, ORDER_PATH,
+};
 use crate::cex::{new_client_order_id, CexExecutor, CexFill, OrderRequest, OrderSide};
 use crate::Provenance;
 use anyhow::{anyhow, bail, Result};
@@ -118,13 +120,16 @@ impl BinanceLive {
             commission_asset,
             provenance: Provenance::Landed,
             order_ref: Some(order.order_id),
+            client_order_id: Some(client_order_id.to_string()),
+            venue_time_ms: order.transact_time.or(order.update_time),
+            trades: lines.iter().map(|line| line.trade()).collect(),
         })
     }
-}
 
-#[async_trait]
-impl CexExecutor for BinanceLive {
-    async fn execute(&self, req: &OrderRequest) -> Result<CexFill> {
+    /// The side and the venue-ready quantity of `req`, or why it is refused
+    /// before anything is sent: `execute` and `test_order` refuse the same
+    /// orders.
+    fn market_order(&self, req: &OrderRequest) -> Result<(&'static str, Decimal)> {
         if req.reduce_only {
             bail!(
                 "reduce_only is not supported on Binance spot, which holds no positions — \
@@ -144,7 +149,39 @@ impl CexExecutor for BinanceLive {
                 req.symbol
             );
         }
+        Ok((side, quantity))
+    }
 
+    /// Checks `req` as [`CexExecutor::execute`] would place it, at
+    /// `POST /api/v3/order/test` with `computeCommissionRates=true`: the
+    /// venue validates the order and states the commission its trades would
+    /// pay. Nothing is sent to the matching engine, so nothing can trade and
+    /// any failure, a lost answer included, is a plain error.
+    pub async fn test_order(&self, req: &OrderRequest) -> Result<OrderCheck> {
+        let (side, quantity) = self.market_order(req)?;
+        let client_order_id = new_client_order_id();
+        let rates = self
+            .rest
+            .test_market_order(&req.symbol, side, quantity, &client_order_id)
+            .await
+            .map_err(|err| {
+                anyhow!(
+                    "the test of {side} {quantity} {} ({client_order_id}) failed: {err}",
+                    req.symbol
+                )
+            })?;
+        Ok(OrderCheck {
+            quantity,
+            client_order_id,
+            rates,
+        })
+    }
+}
+
+#[async_trait]
+impl CexExecutor for BinanceLive {
+    async fn execute(&self, req: &OrderRequest) -> Result<CexFill> {
+        let (side, quantity) = self.market_order(req)?;
         let client_order_id = new_client_order_id();
         let what = format!("{side} {quantity} {} ({client_order_id})", req.symbol);
         let placed = self
@@ -173,7 +210,7 @@ mod tests {
     use super::*;
     use crate::cex::binance::clock::local_now_ms;
     use crate::cex::binance::rest::BinanceConfig;
-    use crate::cex::{CexTimings, OrderStateUnknown};
+    use crate::cex::{CexTimings, CexTrade, MakerTaker, OrderStateUnknown};
     use std::str::FromStr;
     use std::time::Duration;
     use wiremock::matchers::{method, path};
@@ -459,16 +496,20 @@ mod tests {
                 .set_delay(Duration::from_millis(600)),
         )
         .await;
+        // The status query carries `updateTime` and no `transactTime`, and
+        // `myTrades` names each trade `id`.
+        let mut queried = filled_order("FILLED", "10.03");
+        queried["updateTime"] = serde_json::json!(1_700_000_000_123u64);
         Mock::given(method("GET"))
             .and(path("/api/v3/order"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(filled_order("FILLED", "10.03")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(queried))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path("/api/v3/myTrades"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"orderId": 42, "price": "150", "qty": "10", "commission": "0.015", "commissionAsset": "USDT"},
-                {"orderId": 42, "price": "151", "qty": "0.03", "commission": "0.00005", "commissionAsset": "USDT"}
+                {"id": 901, "orderId": 42, "price": "150", "qty": "10", "commission": "0.015", "commissionAsset": "USDT"},
+                {"id": 902, "orderId": 42, "price": "151", "qty": "0.03", "commission": "0.00005", "commissionAsset": "USDT"}
             ])))
             .mount(&server)
             .await;
@@ -479,6 +520,12 @@ mod tests {
         assert_eq!(fill.filled_qty, decimal("10.03"));
         assert_eq!(fill.commission, decimal("0.01505"));
         assert_eq!(fill.order_ref, Some(42));
+        assert_eq!(fill.venue_time_ms, Some(1_700_000_000_123));
+        assert_eq!(
+            fill.trades.iter().map(|t| t.trade_id).collect::<Vec<_>>(),
+            vec![Some(901), Some(902)]
+        );
+        crate::testkit::contract::assert_fill_shape(&fill, adapter.label());
 
         let requests = server.received_requests().await.unwrap();
         let sent = requests
@@ -493,6 +540,7 @@ mod tests {
             param(asked, "origClientOrderId"),
             param(sent, "newClientOrderId")
         );
+        assert_eq!(fill.client_order_id, param(sent, "newClientOrderId"));
     }
 
     #[tokio::test]
@@ -595,6 +643,215 @@ mod tests {
             crate::testkit::contract::CexContractFixture { request: request() },
         )
         .await;
+        // `expect(0)` is verified when `server` drops.
+    }
+
+    fn placed_with_its_trades() -> serde_json::Value {
+        serde_json::json!({
+            "orderId": 42, "status": "FILLED", "executedQty": "10.03", "transactTime": 1_507_725_176_595u64,
+            "fills": [
+                {"price": "150.0", "qty": "5.00", "commission": "0.01", "commissionAsset": "USDT", "tradeId": 56},
+                {"price": "150.2", "qty": "5.03", "commission": "0.01", "commissionAsset": "USDT", "tradeId": 57}
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn a_landed_fill_names_the_client_order_id_sent_the_venues_time_and_each_trade() {
+        let server = venue().await;
+        mount_placing(
+            &server,
+            ResponseTemplate::new(200).set_body_json(placed_with_its_trades()),
+        )
+        .await;
+
+        let adapter = live(&server, decimal("0.01"));
+        let fill = adapter.execute(&request()).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let sent = requests
+            .iter()
+            .find(|r| r.method.as_str() == "POST")
+            .unwrap();
+        assert_eq!(fill.client_order_id, param(sent, "newClientOrderId"));
+        assert_eq!(fill.venue_time_ms, Some(1_507_725_176_595));
+        assert_eq!(
+            fill.trades,
+            vec![
+                CexTrade {
+                    trade_id: Some(56),
+                    price: decimal("150.0"),
+                    qty: decimal("5.00"),
+                    commission: decimal("0.01"),
+                    commission_asset: "USDT".into()
+                },
+                CexTrade {
+                    trade_id: Some(57),
+                    price: decimal("150.2"),
+                    qty: decimal("5.03"),
+                    commission: decimal("0.01"),
+                    commission_asset: "USDT".into()
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn binance_spot_passes_the_cex_contract() {
+        let server = venue().await;
+        mount_placing(
+            &server,
+            ResponseTemplate::new(200).set_body_json(placed_with_its_trades()),
+        )
+        .await;
+
+        let adapter = live(&server, decimal("0.01"));
+        crate::testkit::contract::cex_executor_contract(
+            &adapter,
+            crate::testkit::contract::CexContractFixture { request: request() },
+        )
+        .await;
+    }
+
+    async fn mount_order_test(server: &MockServer, response: ResponseTemplate) {
+        Mock::given(method("POST"))
+            .and(path("/api/v3/order/test"))
+            .respond_with(response)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn an_order_test_sends_the_same_order_with_commission_rates_asked_and_reads_them() {
+        let server = venue().await;
+        mount_order_test(
+            &server,
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "standardCommissionForOrder": {"maker": "0.00100000", "taker": "0.00100000"},
+                "specialCommissionForOrder": {"maker": "0.00000000", "taker": "0.00000000"},
+                "taxCommissionForOrder": {"maker": "0.00000000", "taker": "0.00000000"},
+                "discount": {"enabledForAccount": true, "enabledForSymbol": true, "discountAsset": "BNB", "discount": "0.25000000"}
+            })),
+        )
+        .await;
+
+        let adapter = live(&server, decimal("0.01"));
+        let check = adapter.test_order(&request()).await.unwrap();
+
+        assert_eq!(check.quantity, decimal("10.03"));
+        assert_eq!(
+            check.rates.standard,
+            MakerTaker {
+                maker: decimal("0.001"),
+                taker: decimal("0.001")
+            }
+        );
+        assert_eq!(
+            check.rates.special,
+            Some(MakerTaker {
+                maker: Decimal::ZERO,
+                taker: Decimal::ZERO
+            })
+        );
+        assert_eq!(check.rates.tax.taker, Decimal::ZERO);
+        let discount = check.rates.discount.unwrap();
+        assert_eq!(
+            (
+                discount.asset.as_str(),
+                discount.rate,
+                discount.enabled_for_account
+            ),
+            ("BNB", decimal("0.25"), true)
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        let tested = requests
+            .iter()
+            .find(|r| r.method.as_str() == "POST")
+            .unwrap();
+        assert_eq!(tested.url.path(), "/api/v3/order/test", "nothing is placed");
+        assert_eq!(param(tested, "computeCommissionRates").unwrap(), "true");
+        assert_eq!(param(tested, "type").unwrap(), "MARKET");
+        assert_eq!(param(tested, "side").unwrap(), "BUY");
+        assert_eq!(param(tested, "quantity").unwrap(), "10.03");
+        assert_eq!(
+            param(tested, "newClientOrderId"),
+            Some(check.client_order_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_order_test_without_special_or_discount_rates_still_reads() {
+        let server = venue().await;
+        mount_order_test(
+            &server,
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "standardCommissionForOrder": {"maker": "0.00000112", "taker": "0.00000114"},
+                "taxCommissionForOrder": {"maker": "0.00000112", "taker": "0.00000114"}
+            })),
+        )
+        .await;
+
+        let check = live(&server, decimal("0.01"))
+            .test_order(&request())
+            .await
+            .unwrap();
+        assert_eq!((check.rates.special, check.rates.discount), (None, None));
+        assert_eq!(check.rates.standard.taker, decimal("0.00000114"));
+    }
+
+    #[tokio::test]
+    async fn an_order_test_the_venue_refuses_is_an_error_carrying_its_code() {
+        let server = venue().await;
+        mount_order_test(
+            &server,
+            ResponseTemplate::new(400).set_body_json(
+                serde_json::json!({"code": -1013, "msg": "Filter failure: NOTIONAL"}),
+            ),
+        )
+        .await;
+
+        let err = live(&server, decimal("0.01"))
+            .test_order(&request())
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("-1013") && text.contains("NOTIONAL"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_order_test_refuses_what_execute_refuses_before_sending() {
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let adapter = live(&server, decimal("0.01"));
+        let reduce_only = OrderRequest {
+            reduce_only: true,
+            ..request()
+        };
+        assert!(adapter
+            .test_order(&reduce_only)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("reduce_only"));
+        let dust = OrderRequest {
+            quantity: decimal("0.001"),
+            ..request()
+        };
+        assert!(adapter
+            .test_order(&dust)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("rounded down to zero"));
         // `expect(0)` is verified when `server` drops.
     }
 }

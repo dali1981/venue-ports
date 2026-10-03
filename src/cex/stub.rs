@@ -76,6 +76,9 @@ impl CexStub {
             commission_asset: commission_asset.into(),
             provenance: Provenance::Simulated,
             order_ref: None,
+            client_order_id: None,
+            venue_time_ms: None,
+            trades: Vec::new(),
         }));
     }
 
@@ -174,6 +177,9 @@ impl CexExecutor for CexStub {
                 commission_asset: String::new(),
                 provenance: Provenance::Simulated,
                 order_ref: None,
+                client_order_id: None,
+                venue_time_ms: None,
+                trades: Vec::new(),
             }),
         };
         if let Ok(fill) = &result {

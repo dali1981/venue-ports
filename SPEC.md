@@ -925,6 +925,21 @@ pub struct CexFill {
     pub provenance: Provenance,
     /// Set if and only if `provenance == Provenance::Landed`.
     pub order_ref: Option<u64>,
+    /// The id this crate gave the order. Set if and only if `Landed`.
+    pub client_order_id: Option<String>,
+    /// The venue's own time for the order, ms since the epoch. `None` when nothing was sent.
+    pub venue_time_ms: Option<u64>,
+    /// The order's trades as the venue listed them; empty when nothing was sent, or where the
+    /// adapter does not read them. When listed, their quantities add up to `filled_qty`.
+    pub trades: Vec<CexTrade>,
+}
+
+pub struct CexTrade {
+    pub trade_id: Option<u64>, // Binance: the public trade stream's id for the same trade
+    pub price: Decimal,
+    pub qty: Decimal,
+    pub commission: Decimal,
+    pub commission_asset: String,
 }
 
 #[async_trait]
@@ -985,6 +1000,27 @@ no fill is ever returned with a guessed commission.
   `CexFill`, reads commission from the order's trades (exactly one asset, or `OrderStateUnknown`), and
   recovers a lost placing response by its client order id. `provenance` is `Landed`, on the testnet
   too.
+
+  **What a fill names (amended 3 October 2026).** A landed `CexFill` names the client order id it
+  was sent with, the venue's time for it and, where the adapter reads them, its trades:
+
+  | Adapter | `venue_time_ms` | `trades` |
+  | --- | --- | --- |
+  | `BinanceLive` (spot) | `transactTime`; `updateTime` when the order was found by a status query | the `fills` of the `FULL` answer, or `myTrades`; each with its `tradeId` (`id` there) |
+  | `BinanceFuturesLive` | the order's `updateTime` | `userTrades`, each with its `id` |
+  | `BybitLive` | the order's `updatedTime` | none: it reads the order, not its executions |
+
+  A stub or a paper model sends nothing, so its fill names no client order id, no venue time and no
+  trades. `testkit::contract::assert_fill_shape` asserts these rules, and `cex_executor_contract`
+  runs it on every adapter it is given.
+
+  **`BinanceLive::test_order`** checks an order without placing it: the same `MARKET` request,
+  rounded and refused as `execute` would, sent to `POST /api/v3/order/test` with
+  `computeCommissionRates=true`. The answer is an `OrderCheck`: the quantity checked, the client
+  order id it carried, and the `CommissionRates` Binance states for that order (standard, special
+  where given, tax, and the BNB discount), each a fraction of the traded amount. Nothing reaches the
+  matching engine, so a test order has no fill, no order id and no provenance, and any failure,
+  a lost answer included, is a plain error. It is what a shadow stage calls.
 
   Every wait a live CEX adapter makes (request timeout, `recvWindow`, clock refresh, status polling,
   how long trade lines may lag a fill) is one `CexTimings` value, so a test can make them short. A

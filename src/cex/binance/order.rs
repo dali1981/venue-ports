@@ -10,7 +10,7 @@
 //! See `SPEC.md` §6.
 
 use crate::cex::binance::client::{ApiError, BinanceClient, NO_SUCH_ORDER};
-use crate::cex::OrderStateUnknown;
+use crate::cex::{CexTrade, OrderStateUnknown};
 use anyhow::{anyhow, bail};
 use reqwest::Method;
 use rust_decimal::Decimal;
@@ -133,6 +133,22 @@ pub(crate) struct TradeLine {
     /// Present on `myTrades`/`userTrades` rows, absent on `fills`.
     #[serde(rename = "orderId", default)]
     pub order_id: Option<u64>,
+    /// The trade's id: `tradeId` on a `fills` entry, `id` on a
+    /// `myTrades`/`userTrades` row.
+    #[serde(rename = "tradeId", alias = "id", default)]
+    pub trade_id: Option<u64>,
+}
+
+impl TradeLine {
+    pub(crate) fn trade(&self) -> CexTrade {
+        CexTrade {
+            trade_id: self.trade_id,
+            price: self.price,
+            qty: self.qty,
+            commission: self.commission,
+            commission_asset: self.commission_asset.clone(),
+        }
+    }
 }
 
 /// Reads `trades_path` for `order_id` until its lines add up to
@@ -323,7 +339,25 @@ mod tests {
             commission: Decimal::from_str(commission).unwrap(),
             commission_asset: asset.to_string(),
             order_id: None,
+            trade_id: None,
         }
+    }
+
+    #[test]
+    fn a_trade_id_is_read_from_a_fill_and_from_a_trade_list_row() {
+        let fill: TradeLine = serde_json::from_str(
+            r#"{"price":"4.0","qty":"1.0","commission":"0.004","commissionAsset":"USDT","tradeId":56}"#,
+        )
+        .unwrap();
+        let row: TradeLine = serde_json::from_str(
+            r#"{"symbol":"BNBBTC","id":28457,"orderId":100234,"orderListId":-1,"price":"4.0","qty":"12.0",
+                "quoteQty":"48.0","commission":"10.1","commissionAsset":"BNB","time":1499865549590,
+                "isBuyer":true,"isMaker":false,"isBestMatch":true}"#,
+        )
+        .unwrap();
+        assert_eq!((fill.trade_id, fill.order_id), (Some(56), None));
+        assert_eq!((row.trade_id, row.order_id), (Some(28457), Some(100234)));
+        assert_eq!(row.trade().commission_asset, "BNB");
     }
 
     #[test]

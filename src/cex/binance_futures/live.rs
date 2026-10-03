@@ -78,6 +78,10 @@ pub(crate) struct FuturesOrder {
     pub(crate) executed_qty: Decimal,
     #[serde(rename = "avgPrice")]
     pub(crate) avg_price: Decimal,
+    /// When the order last changed, which for a filled market order is its
+    /// fill.
+    #[serde(rename = "updateTime", default)]
+    pub(crate) update_time: Option<u64>,
 }
 
 impl VenueOrder for FuturesOrder {
@@ -177,6 +181,9 @@ impl BinanceFuturesLive {
             commission_asset,
             provenance: Provenance::Landed,
             order_ref: Some(order.order_id),
+            client_order_id: Some(client_order_id.to_string()),
+            venue_time_ms: order.update_time,
+            trades: lines.iter().map(|line| line.trade()).collect(),
         })
     }
 }
@@ -647,10 +654,20 @@ pub(super) mod tests {
         assert_eq!(fill.commission_asset, "USDT");
         assert_eq!(fill.provenance, Provenance::Landed);
         assert_eq!(fill.order_ref, Some(1001));
+        assert_eq!(fill.venue_time_ms, Some(1_700_000_000_000));
+        assert_eq!(
+            fill.trades
+                .iter()
+                .map(|t| (t.trade_id, t.qty))
+                .collect::<Vec<_>>(),
+            vec![(Some(0), d("0.004")), (Some(1), d("0.002"))]
+        );
 
         let read = requests_to(&server, "GET", USER_TRADES_PATH).await;
         assert_eq!(param(&read[0], "orderId").unwrap(), "1001");
         assert_eq!(param(&read[0], "symbol").unwrap(), "BTCUSDT");
+        let placed = requests_to(&server, "POST", ORDER_PATH).await;
+        assert_eq!(fill.client_order_id, param(&placed[0], "newClientOrderId"));
     }
 
     #[tokio::test]

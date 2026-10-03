@@ -6,7 +6,7 @@
 //! deliberate, human-triggered run (`SPEC.md` §7's table).
 
 use crate::cex::{CexAccount, MarginMode};
-use crate::cex::{CexExecutor, OrderRequest, OrderStateUnknown};
+use crate::cex::{CexExecutor, CexFill, OrderRequest, OrderStateUnknown};
 use crate::dex::{DexExecutor, Outcome, RouteQuote, SwapRequest};
 use crate::liquidity::{
     Deposit, DepositGuard, DepositGuardKind, LiquidityCommand, LiquidityEvent, LiquidityExecutor,
@@ -325,11 +325,32 @@ pub async fn cex_executor_contract(executor: &dyn CexExecutor, fixture: CexContr
         ..fixture.request
     };
     let fill = executor.execute(&request).await.unwrap();
+    assert_fill_shape(&fill, executor.label());
+}
 
+/// The shape rules of a `CexFill` (`SPEC.md` §6): what a landed fill names
+/// and a simulated one does not, and that listed trades add up to the fill.
+pub fn assert_fill_shape(fill: &CexFill, label: &str) {
+    let landed = fill.provenance == Provenance::Landed;
+    assert_eq!(fill.order_ref.is_some(), landed, "on {label}: order_ref");
     assert_eq!(
-        fill.order_ref.is_some(),
-        fill.provenance == Provenance::Landed
+        fill.client_order_id.is_some(),
+        landed,
+        "on {label}: client_order_id"
     );
+    if !landed {
+        assert!(
+            fill.venue_time_ms.is_none() && fill.trades.is_empty(),
+            "on {label}: nothing was sent, so no venue time and no trades: {fill:?}"
+        );
+    }
+    if !fill.trades.is_empty() {
+        let listed: rust_decimal::Decimal = fill.trades.iter().map(|trade| trade.qty).sum();
+        assert_eq!(
+            listed, fill.filled_qty,
+            "on {label}: the trades add up to the fill"
+        );
+    }
 }
 
 /// Every spot `CexExecutor` must refuse `reduce_only: true` with a plain
