@@ -478,7 +478,10 @@ pub fn first_word(data: &[u8]) -> Result<U256> {
 
 /// Best-effort decode of a Solidity revert reason from a JSON-RPC error's
 /// `data` field: the standard `Error(string)` `require`/`revert` encoding
-/// when present, the node's own error message otherwise.
+/// when present. Any other revert data (a custom error, a `Panic(uint256)`)
+/// follows the node's message as `<message> (revert data 0x…)`, so the
+/// caller that knows the contract can decode it. With no data, the node's
+/// own message.
 pub fn decode_revert_reason(error: &Value) -> String {
     let message = error
         .get("message")
@@ -495,6 +498,9 @@ pub fn decode_revert_reason(error: &Value) -> String {
                 if let Some(reason) = decode_abi_string(&bytes[4..]) {
                     return reason;
                 }
+            }
+            if bytes.len() >= 4 {
+                return format!("{message} (revert data {})", hex_data(&bytes));
             }
         }
     }
@@ -555,5 +561,25 @@ mod tests {
 
         let bare = json!({ "code": -32000, "message": "nonce too low" });
         assert_eq!(decode_revert_reason(&bare), "nonce too low");
+    }
+
+    /// A custom error is not decoded here, which does not know the contract:
+    /// its data follows the node's message, for the caller that does.
+    #[test]
+    fn keeps_a_custom_errors_data_beside_the_message() {
+        // `TooLittle(uint256,uint256)` with (5, 6).
+        let mut revert = vec![0x61, 0x8b, 0xc7, 0xc9];
+        revert.extend_from_slice(&U256::from(5u64).to_be_bytes::<32>());
+        revert.extend_from_slice(&U256::from(6u64).to_be_bytes::<32>());
+        let error =
+            json!({ "code": 3, "message": "execution reverted", "data": hex_data(&revert) });
+        assert_eq!(
+            decode_revert_reason(&error),
+            format!("execution reverted (revert data {})", hex_data(&revert))
+        );
+
+        let nested =
+            json!({ "code": -32000, "message": "execution reverted", "data": { "data": "0x" } });
+        assert_eq!(decode_revert_reason(&nested), "execution reverted");
     }
 }
