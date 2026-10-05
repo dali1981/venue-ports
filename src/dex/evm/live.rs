@@ -103,6 +103,7 @@ impl DexExecutor for EvmLive {
                 route.payload.len()
             );
         }
+        req.priority.policy_only("EvmLive")?;
         if route.network != Network::evm(self.sender.chain_id()) {
             bail!(
                 "route is for network {}, but this EvmLive's sender is on chain {}",
@@ -276,6 +277,7 @@ fn decode_transfer_amount(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dex::PriorityBid;
     use crate::evm::erc20::{transfer_topic, ALLOWANCE_SELECTOR};
     use crate::evm::rpc::{encode_error_string, format_u256, hex_data, pad_address};
     use crate::evm::tx::tests::{connect, mount_receipt, mount_send_plumbing, SEPOLIA};
@@ -310,6 +312,7 @@ mod tests {
             payer: Payer::Sender,
             min_amount_out: 900,
             deadline_unix_secs: 9_999_999_999,
+            priority: PriorityBid::Policy,
         }
     }
 
@@ -866,6 +869,7 @@ mod tests {
             payer: Payer::Sender,
             min_amount_out: 0,
             deadline_unix_secs: 0,
+            priority: PriorityBid::Policy,
         };
         let sim_prepared = simulated.prepare(&route, &sim_request).await.unwrap();
         let sim_realised = simulated.execute(&sim_prepared, None).await.unwrap();
@@ -883,6 +887,7 @@ mod tests {
             payer: Payer::Sender,
             min_amount_out: 0,
             deadline_unix_secs: deadline,
+            priority: PriorityBid::Policy,
         };
         let live_prepared = live.prepare(&route, &live_request).await.unwrap();
         let live_realised = live.execute(&live_prepared, None).await.unwrap();

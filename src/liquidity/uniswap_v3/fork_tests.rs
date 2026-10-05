@@ -21,7 +21,7 @@
 //! onto a plain anvil node and prints them, for when no fork RPC is at hand.
 
 use crate::dex::evm::EvmLive;
-use crate::dex::{DexExecutor, Outcome, Payer, RouteQuote, SwapRequest};
+use crate::dex::{DexExecutor, Outcome, Payer, PriorityBid, RouteQuote, SwapRequest};
 use crate::evm::erc20;
 use crate::evm::rpc::{BlockTag, EvmRpc};
 use crate::evm::tx::tests::anvil;
@@ -325,6 +325,7 @@ impl Fork {
             payer: Payer::Sender,
             min_amount_out: 0,
             deadline_unix_secs: deadline,
+            priority: PriorityBid::Policy,
         };
         let prepared = live.prepare(&route, &request).await.unwrap();
         let realised = live.execute(&prepared, None).await.unwrap();

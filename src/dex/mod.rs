@@ -54,6 +54,35 @@ pub enum Payer {
     CalledContract,
 }
 
+/// What a swap's transaction offers to be included ahead of others, above
+/// the priority fee its sender's own policy pays (`evm::FeePolicy`,
+/// `JupiterConfig::prioritization_fee_lamports`). In the network's own
+/// spelling: a price per unit of gas on EVM, lamports on Solana.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PriorityBid {
+    /// The sender's policy alone.
+    #[default]
+    Policy,
+    /// This many wei per unit of gas above the policy's priority fee. EVM.
+    AbovePolicyPerGas(u128),
+    /// This many lamports above the policy's priority fee. Solana.
+    AbovePolicyLamports(u64),
+}
+
+impl PriorityBid {
+    /// Refuses any bid above the policy, by name: for an adapter that sends
+    /// at its policy only. A bid it ignored would be one the caller counted
+    /// as paid and the chain never saw. A bid of nothing is the policy.
+    pub fn policy_only(&self, adapter: &str) -> Result<()> {
+        match *self {
+            PriorityBid::Policy
+            | PriorityBid::AbovePolicyPerGas(0)
+            | PriorityBid::AbovePolicyLamports(0) => Ok(()),
+            bid => bail!("{adapter} sends at its fee policy only, and cannot bid {bid:?} above it"),
+        }
+    }
+}
+
 /// What the caller wants built on top of a `RouteQuote`.
 #[derive(Debug, Clone)]
 pub struct SwapRequest {
@@ -70,6 +99,10 @@ pub struct SwapRequest {
     /// A swap without one that lands late still lands — a caller that
     /// cares when it lands must set this.
     pub deadline_unix_secs: u64,
+    /// What the transaction bids above its sender's fee policy. An adapter
+    /// that cannot send a bid refuses one ([`PriorityBid::policy_only`]),
+    /// never ignores it.
+    pub priority: PriorityBid,
 }
 
 /// A route or command bound to a request: ready to run, one way or
@@ -312,6 +345,30 @@ pub trait DexExecutor: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An adapter that sends at its fee policy takes the policy, and a bid of
+    /// nothing, and refuses any bid above it by name.
+    #[test]
+    fn a_bid_above_the_policy_is_refused_by_an_adapter_that_sends_at_its_policy() {
+        for bid in [
+            PriorityBid::Policy,
+            PriorityBid::AbovePolicyPerGas(0),
+            PriorityBid::AbovePolicyLamports(0),
+        ] {
+            assert!(bid.policy_only("Anyone").is_ok(), "{bid:?}");
+        }
+        for bid in [
+            PriorityBid::AbovePolicyPerGas(1),
+            PriorityBid::AbovePolicyLamports(1),
+        ] {
+            let err = bid.policy_only("Anyone").unwrap_err().to_string();
+            assert!(
+                err.contains("Anyone") && err.contains("fee policy only"),
+                "{err}"
+            );
+        }
+        assert_eq!(PriorityBid::default(), PriorityBid::Policy);
+    }
 
     #[test]
     fn native_cost_is_gas_times_price_plus_the_l1_fee_on_evm() {

@@ -174,6 +174,7 @@ fn check_request(
              Payer::Sender, not Payer::CalledContract"
         ),
     }
+    req.priority.policy_only("a Jupiter adapter")?;
     let sender = address_from_slice(&req.sender).context("SwapRequest.sender")?;
     let recipient = address_from_slice(&req.recipient).context("SwapRequest.recipient")?;
     if req.deadline_unix_secs == 0 {
@@ -281,6 +282,7 @@ fn message_key(transaction: &VersionedTransaction) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dex::PriorityBid;
 
     #[test]
     fn a_contract_payer_is_refused_by_name() {
@@ -301,6 +303,7 @@ mod tests {
             payer: Payer::CalledContract,
             min_amount_out: 900,
             deadline_unix_secs: u64::MAX,
+            priority: PriorityBid::Policy,
         };
         let err = check_request(network, &route, &req).unwrap_err();
         assert!(err.to_string().contains("Payer::CalledContract"), "{err}");
@@ -309,6 +312,14 @@ mod tests {
             ..req
         };
         assert!(check_request(network, &route, &paid_by_sender).is_ok());
+        // Jupiter's `/swap` puts its own priority fee in the transaction: no
+        // bid above it is sent, so one is refused rather than dropped.
+        let bidding = SwapRequest {
+            priority: PriorityBid::AbovePolicyLamports(5_000),
+            ..paid_by_sender
+        };
+        let err = check_request(network, &route, &bidding).unwrap_err();
+        assert!(err.to_string().contains("fee policy only"), "{err}");
     }
 
     #[test]

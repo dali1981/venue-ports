@@ -178,6 +178,21 @@ pub enum Payer {
     CalledContract,
 }
 
+/// What a swap's transaction offers to be included ahead of others, above
+/// the priority fee its sender's own policy pays (`evm::FeePolicy`,
+/// `JupiterConfig::prioritization_fee_lamports`). In the network's own
+/// spelling: a price per unit of gas on EVM, lamports on Solana.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PriorityBid {
+    /// The sender's policy alone.
+    #[default]
+    Policy,
+    /// This many wei per unit of gas above the policy's priority fee. EVM.
+    AbovePolicyPerGas(u128),
+    /// This many lamports above the policy's priority fee. Solana.
+    AbovePolicyLamports(u64),
+}
+
 /// What the caller wants built on top of a `RouteQuote`.
 #[derive(Debug, Clone)]
 pub struct SwapRequest {
@@ -194,6 +209,11 @@ pub struct SwapRequest {
     /// A swap without one that lands late still lands — a caller that
     /// cares when it lands must set this.
     pub deadline_unix_secs: u64,
+    /// What the transaction bids above its sender's fee policy. An adapter
+    /// that cannot send a bid refuses one by name (`PriorityBid::policy_only`),
+    /// never ignores it: no adapter in this crate sends one yet, and a paper
+    /// venue charges it.
+    pub priority: PriorityBid,
 }
 
 /// A route or command bound to a request: ready to run, one way or

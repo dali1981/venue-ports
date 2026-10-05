@@ -221,6 +221,7 @@ impl DexExecutor for EvmSimulated {
                 route.network
             );
         }
+        req.priority.policy_only("EvmSimulated")?;
         let (router_bytes, calldata) = route.payload.split_at(20);
         let token_in = address_from_slice(&route.token_in).context("route.token_in")?;
         let sender = address_from_slice(&req.sender).context("req.sender")?;
@@ -317,6 +318,7 @@ impl DexExecutor for EvmSimulated {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dex::PriorityBid;
     use crate::evm::erc20::tests::mount_slot_probe;
     use crate::evm::erc20::{
         allowance_slot, mapping_slot, ALLOWANCE_SELECTOR, BALANCE_OF_SELECTOR,
@@ -344,6 +346,7 @@ mod tests {
             payer: Payer::Sender,
             min_amount_out: 900,
             deadline_unix_secs: 0,
+            priority: PriorityBid::Policy,
         }
     }
 
@@ -393,6 +396,26 @@ mod tests {
             })
             .mount(server)
             .await;
+    }
+
+    /// A simulation runs the call at the sender's policy: a bid above it is
+    /// refused before anything is asked of the node.
+    #[tokio::test]
+    async fn prepare_refuses_a_bid_above_its_fee_policy() {
+        let adapter = EvmSimulated::new(EvmRpc::new("http://127.0.0.1:9".to_string()));
+        let bidding = SwapRequest {
+            priority: PriorityBid::AbovePolicyPerGas(1),
+            ..request()
+        };
+        let err = adapter
+            .prepare(&route(payload_for([0x11; 20], &[1, 2, 3, 4])), &bidding)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("EvmSimulated sends at its fee policy only"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -892,6 +915,7 @@ mod tests {
             payer: Payer::Sender,
             min_amount_out: 0,
             deadline_unix_secs: 0,
+            priority: PriorityBid::Policy,
         };
 
         let adapter = EvmSimulated::new(EvmRpc::new(rpc_url));
@@ -983,6 +1007,7 @@ mod tests {
                 payer: Payer::Sender,
                 min_amount_out: 0,
                 deadline_unix_secs: 0,
+                priority: PriorityBid::Policy,
             };
             let prepared = adapter.prepare(&route, &request).await.unwrap();
             let realised = adapter.execute(&prepared, None).await.unwrap();

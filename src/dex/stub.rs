@@ -176,7 +176,7 @@ impl DexExecutor for DexStub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dex::{EvmCost, Payer, SolanaCost};
+    use crate::dex::{EvmCost, Payer, PriorityBid, SolanaCost};
     use solana_address::Address;
 
     fn route() -> RouteQuote {
@@ -206,6 +206,7 @@ mod tests {
             payer: Payer::Sender,
             min_amount_out: 90,
             deadline_unix_secs: 0,
+            priority: PriorityBid::Policy,
         }
     }
 
@@ -312,5 +313,21 @@ mod tests {
         assert_eq!(calls[0].route.network, Network::evm(1));
         assert_eq!(calls[0].request.min_amount_out, 90);
         assert_eq!(calls[0].prepared.evm_call().unwrap().value, 90);
+    }
+
+    /// The stub sends nothing, so it takes any bid and records it: a test
+    /// reads what the caller asked to bid.
+    #[tokio::test]
+    async fn records_the_bid_asked() {
+        let stub = DexStub::new();
+        let bidding = SwapRequest {
+            priority: PriorityBid::AbovePolicyPerGas(250_313_333),
+            ..request()
+        };
+        stub.prepare(&route(), &bidding).await.unwrap();
+        assert_eq!(
+            stub.calls()[0].request.priority,
+            PriorityBid::AbovePolicyPerGas(250_313_333)
+        );
     }
 }

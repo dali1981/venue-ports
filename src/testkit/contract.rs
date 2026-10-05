@@ -432,7 +432,7 @@ pub async fn cex_account_contract(account: &dyn CexAccount, fixture: CexAccountC
 mod tests {
     use super::*;
     use crate::cex::{CexStub, OrderSide};
-    use crate::dex::{DexStub, Payer};
+    use crate::dex::{DexStub, Payer, PriorityBid};
     use crate::Network;
     use std::str::FromStr;
 
@@ -452,6 +452,7 @@ mod tests {
                 payer: Payer::Sender,
                 min_amount_out: 90,
                 deadline_unix_secs: 0,
+                priority: PriorityBid::Policy,
             },
         }
     }
