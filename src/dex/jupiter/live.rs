@@ -9,14 +9,15 @@
 //! the two are the same chain, and on a fork only the sender's node's
 //! blockhash is one the fork knows. The amount out is read from the landed
 //! transaction's meta: the destination token account's balance after, less
-//! before.
+//! before. The amount in is the route's: an `ExactIn` swap that landed took
+//! its whole offer.
 
 use crate::dex::jupiter::{
     build, check_request, http_client, message_key, Destination, JupiterConfig,
 };
 use crate::dex::{
-    DexExecutor, Outcome, Prepared, Realised, RouteQuote, SolanaCost, SolanaTransaction,
-    SwapRequest, TxCost,
+    ChainAmount, DexExecutor, Outcome, Prepared, Realised, RouteQuote, SolanaCost,
+    SolanaTransaction, SwapRequest, TxCost,
 };
 use crate::solana::{SolanaSender, SolanaTxOutcome};
 use crate::Provenance;
@@ -26,11 +27,18 @@ use solana_hash::Hash;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// What `prepare` stashes for `execute`.
+struct Pending {
+    destination: Destination,
+    /// The input an `ExactIn` route spends when it lands: its offer.
+    amount_in: ChainAmount,
+}
+
 pub struct JupiterLive {
     sender: Arc<SolanaSender>,
     config: JupiterConfig,
     http: reqwest::Client,
-    pending: Mutex<HashMap<Vec<u8>, Destination>>,
+    pending: Mutex<HashMap<Vec<u8>, Pending>>,
 }
 
 impl JupiterLive {
@@ -56,6 +64,7 @@ impl JupiterLive {
     ) -> Realised {
         Realised {
             amount_out: None,
+            amount_in: None,
             outcome,
             cost: TxCost::Solana(cost),
             at,
@@ -92,10 +101,13 @@ impl DexExecutor for JupiterLive {
             .message
             .set_recent_blockhash(Hash::new_from_array(blockhash));
         built.transaction.signatures.clear();
-        self.pending
-            .lock()
-            .unwrap()
-            .insert(message_key(&built.transaction), built.destination);
+        self.pending.lock().unwrap().insert(
+            message_key(&built.transaction),
+            Pending {
+                destination: built.destination,
+                amount_in: route.amount_in,
+            },
+        );
         Ok(Prepared::Solana(SolanaTransaction {
             transaction: built.transaction,
             last_valid_block_height,
@@ -105,7 +117,10 @@ impl DexExecutor for JupiterLive {
     /// `at` is ignored: a sent transaction only ever runs now.
     async fn execute(&self, prepared: &Prepared, _at: Option<u64>) -> Result<Realised> {
         let tx = prepared.solana_transaction()?;
-        let destination = self
+        let Pending {
+            destination,
+            amount_in,
+        } = self
             .pending
             .lock()
             .unwrap()
@@ -136,6 +151,7 @@ impl DexExecutor for JupiterLive {
                 let (before, after) = meta.token_amounts(&destination.account);
                 Ok(Realised {
                     amount_out: Some(u128::from(after.saturating_sub(before))),
+                    amount_in: Some(amount_in),
                     outcome: Outcome::Success,
                     cost: TxCost::Solana(cost),
                     at: slot,

@@ -307,6 +307,16 @@ pub struct Realised {
     /// timeout must never be represented as a zero amount — a zero is a
     /// real, terrible price; "no price" is a different fact.
     pub amount_out: Option<ChainAmount>,
+    /// The input the swap consumed, which can be less than the route's
+    /// `amount_in`: a V3 swap that reaches its price limit takes less than it
+    /// was given, and what the pool took is what is booked. `Some` exactly
+    /// when `outcome` is `Success`, as `amount_out` is: a swap that reverted,
+    /// timed out or expired consumed none that this reports, and no outcome
+    /// is represented as a zero input. A live adapter reads it from the
+    /// transaction (`EvmLive` from its `Transfer` logs); an adapter that
+    /// cannot observe it says in its docs what it reports instead
+    /// (`EvmSimulated`, `InputRule`).
+    pub amount_in: Option<ChainAmount>,
     pub outcome: Outcome,
     /// What it cost, whenever something ran, a revert included. A dry run's
     /// figures are what the run reported: an `eth_call` reports no gas, so

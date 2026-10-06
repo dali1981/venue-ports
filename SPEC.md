@@ -323,6 +323,15 @@ pub struct Realised {
     /// timeout must never be represented as a zero amount — a zero is a
     /// real, terrible price; "no price" is a different fact.
     pub amount_out: Option<ChainAmount>,
+    /// The input the swap consumed, which can be less than the route's
+    /// `amount_in`: a V3 swap that reaches its price limit takes less than it
+    /// was given, and what the pool took is what is booked. `Some` exactly
+    /// when `outcome` is `Success`, as `amount_out` is: a swap that reverted,
+    /// timed out or expired consumed none that this reports, and no outcome
+    /// is represented as a zero input. A live adapter reads it from the
+    /// transaction (`EvmLive` from its `Transfer` logs); an adapter that
+    /// cannot observe it says what it reports instead (below).
+    pub amount_in: Option<ChainAmount>,
     pub outcome: Outcome,
     /// What it cost, whenever something ran, a revert included. A dry
     /// run's figures are what the run reported (an `eth_call` reports no
@@ -410,10 +419,20 @@ pub trait DexExecutor: Send + Sync {
   asks the node's `eth_estimateGas` for the same call (same sender, block and overrides), and the
   simulation's `cost` is `TxCost::Evm` with that figure as `gas_used` and every other figure `None`. A swap
   that reverted reports no gas. An `eth_estimateGas` that refuses a swap `eth_call` just ran is an `Err`:
-  the node disagreed with itself, and neither answer is the swap's.
+  the node disagreed with itself, and neither answer is the swap's. An `eth_call` shows no transfers, so
+  `amount_in` is what the router says it took or else its offer: the dry run gives the payer exactly
+  `route.amount_in`, and the amount in is that unless an input rule is set for the address called,
+  `EvmSimulated::with_input_rule(address, InputRule::Word(n))` (the `n`th 32-byte word of the return data, as
+  `PoolSwapper.swapV3` returns `amountInUsed`; a word that is missing, does not fit a `u128`, or exceeds the
+  offer is an error). `InputRule::Offered` is the default, right for a router that spends the exact input it is
+  given and a guess for one that can take less without saying so. `EvmLive`'s amount in is the input token's
+  `Transfer`s out of the payer (the sender, or the contract called) less any back to it; a landed swap with none
+  is an error naming its transaction, as one with no output `Transfer` is.
 - **`DexStub`** (today's `EvmStub`, renamed: it was never EVM-specific) — an in-process fake with no
   network calls at all. Must let a test program the exact `Realised` (or error) a given `execute()` call
-  returns, including reverts with a specific reason, a forced `TimedOut` and an `Expired`. Must record
+  returns, including reverts with a specific reason, a forced `TimedOut` and an `Expired`. A programmed
+  success takes the whole offer of the route it was prepared from (`program_success`), or the input the
+  test names (`program_success_taking`, a swap that reached its price limit). Must record
   every call it received (route, request, prepared value) so a test can assert on what was actually
   sent to it, not just on what it returned.
 
@@ -427,6 +446,9 @@ pub trait DexExecutor: Send + Sync {
 - **The amount out** is the destination token account's balance after, less before. It is read from
   `simulateTransaction`'s returned accounts (dry run), or from the landed transaction's post token
   balances.
+- **The amount in** is the quote's `inAmount`, which is `route.amount_in`: an `ExactIn` route (the only mode
+  accepted) spends all of it or fails, and slippage is a minimum on the output alone, so a swap that succeeded
+  took the whole offer.
 - **The cost** is `TxCost::Solana`, carrying the run's `unitsConsumed`.
 - **The payer** is the account that signs. Both adapters refuse `Payer::CalledContract` by name.
 
@@ -1185,6 +1207,8 @@ pub async fn dex_executor_contract(executor: &dyn DexExecutor, sends: Sends, fix
     // Shape assertions every implementation must satisfy, regardless of
     // mode:
     assert_eq!(realised.amount_out.is_some(), matches!(realised.outcome, Outcome::Success));
+    assert_eq!(realised.amount_in.is_some(), matches!(realised.outcome, Outcome::Success));
+    assert!(realised.amount_in.map_or(true, |taken| taken <= fixture.route.amount_in));
     assert_eq!(realised.tx_ref.is_some(), sends == Sends::Transactions);
     if realised.provenance == Provenance::Landed {
         assert_eq!(sends, Sends::Transactions);

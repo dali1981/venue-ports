@@ -17,6 +17,15 @@
 //! `Realised::at` is that block's number: for `pending`, the number the node
 //! gives its pending block.
 //!
+//! **The amount in.** An `eth_call` shows no transfers, so what the swap
+//! consumed is what the router says it did, or else what it was offered: the
+//! dry run gives the payer exactly `route.amount_in`, and `Realised::amount_in`
+//! is that offer unless an [`InputRule`] is set for the address called. A
+//! contract that takes less than it was given when the pool's price limit is
+//! reached (`PoolSwapper.swapV3`) returns what it took, and its caller sets
+//! [`InputRule::Word`] for it with [`EvmSimulated::with_input_rule`]. A swap
+//! that reverted took none.
+//!
 //! **Gas.** A swap that ran is also put to the node's `eth_estimateGas`, with
 //! the same sender, block and overrides, and `EvmCost::gas_used` is its
 //! answer: what the swap needs, which is at least what it uses. A swap that
@@ -116,12 +125,56 @@ impl ReturnRule {
     }
 }
 
+/// Where the input a swap consumed is, for a router that returns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InputRule {
+    /// The router returns no such figure: the swap is taken to have consumed
+    /// its whole offer, `route.amount_in`, which is what the dry run gave the
+    /// payer. Right for a router that spends the exact input it is given
+    /// (`SwapRouter02.exactInputSingle`), and a guess for one that can take
+    /// less without saying so.
+    #[default]
+    Offered,
+    /// The `n`th (from 0) 32-byte word of the return data is the input the
+    /// router took, as `PoolSwapper.swapV3` returns `amountInUsed`. A word
+    /// that is missing, does not fit a `u128`, or is more than was offered is
+    /// an error, never a figure.
+    Word(usize),
+}
+
+impl InputRule {
+    fn amount_in(self, data: &[u8], offered: ChainAmount) -> Result<ChainAmount> {
+        match self {
+            InputRule::Offered => Ok(offered),
+            InputRule::Word(n) => {
+                let word = n
+                    .checked_mul(32)
+                    .and_then(|from| data.get(from..from.checked_add(32)?))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "no word {n} in {} bytes of return data: it names no input taken",
+                            data.len()
+                        )
+                    })?;
+                let taken: ChainAmount = U256::from_be_slice(word)
+                    .try_into()
+                    .context("the input taken overflowed u128")?;
+                if taken > offered {
+                    bail!("the router says it took {taken} of an offer of {offered}");
+                }
+                Ok(taken)
+            }
+        }
+    }
+}
+
 pub struct EvmSimulated {
     rpc: EvmRpc,
     pending: Mutex<HashMap<B256, PendingSimulation>>,
     slots: SlotCache,
     code: HashMap<Address, CodeOverride>,
     returns: HashMap<Address, ReturnRule>,
+    inputs: HashMap<Address, InputRule>,
     /// Whether a run with no block given reads the node's `pending` block
     /// rather than its latest one.
     pending_block: bool,
@@ -135,6 +188,7 @@ impl EvmSimulated {
             slots: SlotCache::default(),
             code: HashMap::new(),
             returns: HashMap::new(),
+            inputs: HashMap::new(),
             pending_block: false,
         }
     }
@@ -153,6 +207,13 @@ impl EvmSimulated {
     /// from its first word.
     pub fn with_return_rule(mut self, address: Address, rule: ReturnRule) -> Self {
         self.returns.insert(address, rule);
+        self
+    }
+
+    /// Reads the input a swap consumed from a call to `address` by `rule`
+    /// rather than taking the whole offer.
+    pub fn with_input_rule(mut self, address: Address, rule: InputRule) -> Self {
+        self.inputs.insert(address, rule);
         self
     }
 
@@ -310,6 +371,12 @@ impl DexExecutor for EvmSimulated {
                     .with_context(|| format!("decoding {router}'s return data by {rule:?}"))?
                     .try_into()
                     .context("amount_out overflowed u128")?;
+                let input_rule = self.inputs.get(&router).copied().unwrap_or_default();
+                let amount_in = input_rule
+                    .amount_in(&data, ctx.amount_in)
+                    .with_context(|| {
+                        format!("reading the input {router} took by {input_rule:?}")
+                    })?;
                 // An `eth_call` reports no gas: ask the node what the same
                 // call needs. A refusal here, of a call that just ran, is the
                 // node disagreeing with itself (the pending state moved
@@ -333,6 +400,7 @@ impl DexExecutor for EvmSimulated {
                     })?;
                 Ok(Realised {
                     amount_out: Some(amount_out),
+                    amount_in: Some(amount_in),
                     outcome: Outcome::Success,
                     cost: TxCost::Evm(EvmCost {
                         gas_used: Some(gas_used),
@@ -346,6 +414,7 @@ impl DexExecutor for EvmSimulated {
             Err(err) => match err.downcast::<RpcError>() {
                 Ok(revert) => Ok(Realised {
                     amount_out: None,
+                    amount_in: None,
                     outcome: Outcome::Reverted {
                         reason: revert.reason,
                     },
@@ -515,6 +584,11 @@ mod tests {
 
         let realised = adapter.execute(&prepared, Some(42)).await.unwrap();
         assert_eq!(realised.amount_out, Some(777));
+        assert_eq!(
+            realised.amount_in,
+            Some(1_000),
+            "an eth_call shows no transfers: the offer, which the payer was given"
+        );
         assert!(matches!(realised.outcome, Outcome::Success));
         assert_eq!(realised.provenance, Provenance::Simulated);
         assert_eq!(realised.tx_ref, None);
@@ -807,6 +881,91 @@ mod tests {
         assert_eq!(realised.amount_out, Some(4_321));
     }
 
+    /// `PoolSwapper.swapV3` returns what the pool took as well as what it
+    /// paid, which is less than the offer when the price limit is reached: a
+    /// rule for its address reads it, and another router is not affected.
+    #[tokio::test]
+    async fn an_input_rule_reads_what_the_router_says_it_took() {
+        let server = MockServer::start().await;
+        let router = [0x11; 20];
+        let calldata = vec![0x21, 0x22];
+        // (amount out, amount in): 600 of the 1 000 offered.
+        let mut swap_return = U256::from(550u64).to_be_bytes::<32>().to_vec();
+        swap_return.extend_from_slice(&U256::from(600u64).to_be_bytes::<32>());
+        mount_router(&server, router, &calldata, swap_return).await;
+
+        let by_rule = EvmSimulated::new(EvmRpc::new(server.uri()))
+            .with_input_rule(Address::from(router), InputRule::Word(1));
+        let prepared = by_rule
+            .prepare(&route(payload_for(router, &calldata)), &request())
+            .await
+            .unwrap();
+        let realised = by_rule.execute(&prepared, Some(1)).await.unwrap();
+        assert_eq!(realised.amount_out, Some(550));
+        assert_eq!(realised.amount_in, Some(600));
+
+        let without = EvmSimulated::new(EvmRpc::new(server.uri()))
+            .with_input_rule(Address::from([0x22; 20]), InputRule::Word(1));
+        let prepared = without
+            .prepare(&route(payload_for(router, &calldata)), &request())
+            .await
+            .unwrap();
+        let realised = without.execute(&prepared, Some(1)).await.unwrap();
+        assert_eq!(
+            realised.amount_in,
+            Some(1_000),
+            "a rule belongs to its own address: this router's input is its offer"
+        );
+    }
+
+    /// What the rule cannot read as an input the swap could have taken is an
+    /// error that names the rule, never a figure for the books.
+    #[tokio::test]
+    async fn an_input_the_rule_cannot_read_or_that_exceeds_the_offer_is_an_error() {
+        let router = [0x11; 20];
+        for (calldata, swap_return, expected) in [
+            // One word only: no word 1.
+            (
+                vec![0x31],
+                U256::from(550u64).to_be_bytes::<32>().to_vec(),
+                "no word 1",
+            ),
+            // More than the 1 000 the payer was given.
+            (
+                vec![0x32],
+                [U256::from(550u64), U256::from(1_001u64)]
+                    .iter()
+                    .flat_map(|w| w.to_be_bytes::<32>())
+                    .collect(),
+                "took 1001 of an offer of 1000",
+            ),
+            // Does not fit a u128.
+            (
+                vec![0x33],
+                [U256::from(550u64), U256::MAX]
+                    .iter()
+                    .flat_map(|w| w.to_be_bytes::<32>())
+                    .collect(),
+                "overflowed u128",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            mount_router(&server, router, &calldata, swap_return).await;
+            let adapter = EvmSimulated::new(EvmRpc::new(server.uri()))
+                .with_input_rule(Address::from(router), InputRule::Word(1));
+            let prepared = adapter
+                .prepare(&route(payload_for(router, &calldata)), &request())
+                .await
+                .unwrap();
+            let err = adapter.execute(&prepared, Some(1)).await.unwrap_err();
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("Word(1)") && text.contains(expected),
+                "{expected}: {text}"
+            );
+        }
+    }
+
     /// A one-word answer read as an array points past the data: an error
     /// that names the rule, never a figure.
     #[tokio::test]
@@ -933,6 +1092,7 @@ mod tests {
             other => panic!("expected Reverted, got {other:?}"),
         }
         assert_eq!(realised.cost, TxCost::Evm(EvmCost::default()));
+        assert_eq!(realised.amount_in, None, "a revert took no input");
         assert!(
             requests(&server, "eth_estimateGas").await.is_empty(),
             "a swap that reverted has no gas to ask for"

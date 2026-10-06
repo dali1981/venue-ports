@@ -15,8 +15,8 @@ use crate::dex::jupiter::{
     build, check_request, http_client, message_key, Destination, JupiterConfig,
 };
 use crate::dex::{
-    DexExecutor, Outcome, Prepared, Realised, RouteQuote, SolanaCost, SolanaTransaction,
-    SwapRequest, TxCost,
+    ChainAmount, DexExecutor, Outcome, Prepared, Realised, RouteQuote, SolanaCost,
+    SolanaTransaction, SwapRequest, TxCost,
 };
 use crate::solana::rpc::SolanaRpc;
 use crate::solana::token::token_account_amount;
@@ -35,6 +35,8 @@ struct Pending {
     /// What the transaction would pay: the signatures' base fee and the
     /// priority fee `/swap` put in it.
     fee_lamports: u64,
+    /// The input an `ExactIn` route spends when it succeeds: its offer.
+    amount_in: ChainAmount,
 }
 
 pub struct JupiterSimulated {
@@ -84,6 +86,7 @@ impl DexExecutor for JupiterSimulated {
                 destination: built.destination,
                 fee_lamports: signatures * LAMPORTS_PER_SIGNATURE
                     + built.prioritization_fee_lamports,
+                amount_in: route.amount_in,
             },
         );
         Ok(Prepared::Solana(SolanaTransaction {
@@ -120,6 +123,7 @@ impl DexExecutor for JupiterSimulated {
         if let Some(err) = simulation.err {
             return Ok(Realised {
                 amount_out: None,
+                amount_in: None,
                 outcome: Outcome::Reverted {
                     reason: err.to_string(),
                 },
@@ -138,6 +142,7 @@ impl DexExecutor for JupiterSimulated {
         let after = token_account_amount(&after)?;
         Ok(Realised {
             amount_out: Some(u128::from(after.saturating_sub(ctx.destination.before))),
+            amount_in: Some(ctx.amount_in),
             outcome: Outcome::Success,
             cost,
             at: simulation.slot,

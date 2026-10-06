@@ -77,6 +77,20 @@ pub async fn dex_executor_contract(
         realised.amount_out.is_some(),
         matches!(realised.outcome, Outcome::Success)
     );
+    // The input taken is known exactly when the output is, and a swap
+    // takes no more than it was offered.
+    assert_eq!(
+        realised.amount_in.is_some(),
+        matches!(realised.outcome, Outcome::Success),
+        "amount_in against the outcome: {realised:?}"
+    );
+    if let Some(amount_in) = realised.amount_in {
+        assert!(
+            amount_in <= fixture.route.amount_in,
+            "a swap took {amount_in} of an offer of {}: {realised:?}",
+            fixture.route.amount_in
+        );
+    }
     assert_tx_ref_shape(&realised.tx_ref, realised.provenance, sends, &realised);
 }
 
