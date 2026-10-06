@@ -39,7 +39,10 @@ impl BlockTag {
 /// A JSON-RPC `error` object from the node, with any Solidity revert
 /// reason already decoded. Distinguished from a transport failure (a bad
 /// URL, a dropped connection) so a caller can tell "the node answered no"
-/// from "the node did not answer" — `EvmSimulated` turns only this into
+/// from "the node did not answer". "The node answered no" is not yet "the
+/// call reverted": a node refuses a call it cannot run (a rate limit, state
+/// it no longer holds) with the same kind of object, so [`RpcError::is_revert`]
+/// says which it was. `EvmSimulated` turns only a revert into
 /// `Outcome::Reverted`, and `EvmSender` treats a broadcast refused this way
 /// as never sent.
 #[derive(Debug, Clone)]
@@ -49,6 +52,19 @@ pub struct RpcError {
     /// The decoded `Error(string)` reason when the error carries one, the
     /// node's own message otherwise.
     pub reason: String,
+    /// Whether the node attached revert data: `data`, or the nested
+    /// `data.data` some nodes use, as a `0x` string.
+    pub revert_data: bool,
+}
+
+impl RpcError {
+    /// Whether this is the call reverting: the node attached revert data, or
+    /// its message says the call reverted. Any other error is the node failing
+    /// to run the call (a rate limit, a timeout, state it no longer holds), and
+    /// says nothing about the call.
+    pub fn is_revert(&self) -> bool {
+        self.revert_data || self.message.to_ascii_lowercase().contains("revert")
+    }
 }
 
 impl std::fmt::Display for RpcError {
@@ -168,6 +184,11 @@ impl EvmRpc {
                     .unwrap_or_default()
                     .to_string(),
                 reason: decode_revert_reason(error),
+                revert_data: [error.get("data"), error.pointer("/data/data")]
+                    .into_iter()
+                    .flatten()
+                    .find_map(Value::as_str)
+                    .is_some_and(|data| data.starts_with("0x")),
             }
             .into());
         }
