@@ -270,7 +270,10 @@ pub enum TxCost {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EvmCost {
-    /// `None` where a dry run reports none.
+    /// A receipt's `gasUsed`. For a dry run on `EvmSimulated`, the node's
+    /// `eth_estimateGas` of the same call with the same overrides: what the
+    /// swap needs, which is at least what it uses. `None` where a dry run
+    /// reports none (a revert).
     pub gas_used: Option<u64>,
     pub effective_gas_price_wei: Option<u128>,
     /// A rollup's data fee, from the receipt.
@@ -398,8 +401,16 @@ pub trait DexExecutor: Send + Sync {
   `ReturnRule::FirstWord` (the default) or `ReturnRule::LastOfArray`, the last element of one returned
   `uint256[]`, as Uniswap v2's and Aerodrome's `swapExactTokensForTokens` return every hop's amount with
   the amount out last. Return data the rule cannot decode (an offset or a length past the data, an empty
-  array) is an error, never a figure; `EvmLive` needs no rule, since it reads the output's `Transfer`. The
-  simulation's `cost` is `TxCost::Evm` with every figure `None`: an `eth_call` reports no gas.
+  array) is an error, never a figure; `EvmLive` needs no rule, since it reads the output's `Transfer`.
+  With no block given, a run reads the latest block (once, so that its probes and its swap see one state),
+  or the node's `pending` block after `EvmSimulated::with_pending_block()`, for a caller that priced from the
+  pending state (Base's Flashblocks); a block given to `execute` pins the run to it either way, and
+  `Realised::at` is the number of the block read, the number the node gives its pending block for `pending`
+  (a node with no pending block is an error). An `eth_call` reports no gas, so for a swap that ran the adapter
+  asks the node's `eth_estimateGas` for the same call (same sender, block and overrides), and the
+  simulation's `cost` is `TxCost::Evm` with that figure as `gas_used` and every other figure `None`. A swap
+  that reverted reports no gas. An `eth_estimateGas` that refuses a swap `eth_call` just ran is an `Err`:
+  the node disagreed with itself, and neither answer is the swap's.
 - **`DexStub`** (today's `EvmStub`, renamed: it was never EVM-specific) — an in-process fake with no
   network calls at all. Must let a test program the exact `Realised` (or error) a given `execute()` call
   returns, including reverts with a specific reason, a forced `TimedOut` and an `Expired`. Must record

@@ -9,6 +9,19 @@
 //! it, including free/keyless public endpoints, so this adapter needs
 //! nothing beyond an RPC URL.
 //!
+//! **Which block.** `execute(prepared, Some(n))` runs at block `n`. With
+//! `None` it runs at the latest block, read once and then used for every
+//! call of that dry run so the probes and the swap see one state; or, after
+//! [`EvmSimulated::with_pending_block`], at the node's `pending` block (on
+//! Base, the preconfirmed state), for a caller that priced from it.
+//! `Realised::at` is that block's number: for `pending`, the number the node
+//! gives its pending block.
+//!
+//! **Gas.** A swap that ran is also put to the node's `eth_estimateGas`, with
+//! the same sender, block and overrides, and `EvmCost::gas_used` is its
+//! answer: what the swap needs, which is at least what it uses. A swap that
+//! reverted reports no gas.
+//!
 //! Where the simulated sender does not actually hold the input token or
 //! the router's allowance, this adapter overrides just enough storage to
 //! make the call possible: the sender's `balanceOf` slot, and the
@@ -109,6 +122,9 @@ pub struct EvmSimulated {
     slots: SlotCache,
     code: HashMap<Address, CodeOverride>,
     returns: HashMap<Address, ReturnRule>,
+    /// Whether a run with no block given reads the node's `pending` block
+    /// rather than its latest one.
+    pending_block: bool,
 }
 
 impl EvmSimulated {
@@ -119,7 +135,18 @@ impl EvmSimulated {
             slots: SlotCache::default(),
             code: HashMap::new(),
             returns: HashMap::new(),
+            pending_block: false,
         }
+    }
+
+    /// Runs at the node's `pending` block when `execute` is given no block,
+    /// instead of at the latest one: for a caller whose decision was priced
+    /// from the pending state (Base's Flashblocks), which a dry run on the
+    /// latest block would disagree with. A block given to `execute` still
+    /// pins the run to it.
+    pub fn with_pending_block(mut self) -> Self {
+        self.pending_block = true;
+        self
     }
 
     /// Reads the amount out of a call to `address` by `rule` rather than
@@ -259,11 +286,12 @@ impl DexExecutor for EvmSimulated {
             })?;
         let router = address_from_slice(&prepared.to).context("prepared.to")?;
 
-        let block = match at {
-            Some(block) => block,
-            None => self.rpc.block_number().await?,
+        let tag = match at {
+            Some(block) => BlockTag::Number(block),
+            None if self.pending_block => BlockTag::Pending,
+            None => BlockTag::Number(self.rpc.block_number().await?),
         };
-        let tag = BlockTag::Number(block);
+        let block = self.rpc.block_number_at(tag).await?;
         let overrides = self.overrides(&ctx, router, tag).await?;
 
         match self
@@ -284,11 +312,34 @@ impl DexExecutor for EvmSimulated {
                     .with_context(|| format!("decoding {router}'s return data by {rule:?}"))?
                     .try_into()
                     .context("amount_out overflowed u128")?;
+                // An `eth_call` reports no gas: ask the node what the same
+                // call needs. A refusal here, of a call that just ran, is the
+                // node disagreeing with itself (the pending state moved
+                // between the two): neither answer is the swap's.
+                let gas_used = self
+                    .rpc
+                    .eth_estimate_gas(
+                        router,
+                        &prepared.calldata,
+                        Some(ctx.sender),
+                        tag,
+                        Some(&overrides),
+                    )
+                    .await
+                    .map_err(|err| match err.downcast::<RpcError>() {
+                        Ok(refused) => anyhow!(
+                            "eth_estimateGas refused a swap that eth_call ran: {}",
+                            refused.reason
+                        ),
+                        Err(transport) => transport.context("eth_estimateGas for the swap"),
+                    })?;
                 Ok(Realised {
                     amount_out: Some(amount_out),
                     outcome: Outcome::Success,
-                    // An `eth_call` reports no gas.
-                    cost: TxCost::Evm(EvmCost::default()),
+                    cost: TxCost::Evm(EvmCost {
+                        gas_used: Some(gas_used),
+                        ..EvmCost::default()
+                    }),
                     at: block,
                     provenance: Provenance::Simulated,
                     tx_ref: None,
@@ -365,6 +416,13 @@ mod tests {
         calldata: &[u8],
         swap_return: Vec<u8>,
     ) {
+        mount_probes(server, router).await;
+        mount_swap(server, calldata, swap_return).await;
+    }
+
+    /// The balance and allowance probes for the fixed token and sender, and
+    /// `router` as the spender.
+    async fn mount_probes(server: &MockServer, router: [u8; 20]) {
         let sender = Address::from([0xCC; 20]);
         mount_slot_probe(server, BALANCE_OF_SELECTOR, mapping_slot(sender, 0)).await;
         mount_slot_probe(
@@ -373,12 +431,27 @@ mod tests {
             allowance_slot(sender, Address::from(router), 0),
         )
         .await;
-        mount_swap(server, calldata, swap_return).await;
     }
 
-    /// A swap call (calldata exactly `calldata`) that returns `swap_return`;
-    /// any other `eth_call` gets zero.
+    /// What the mock node's `eth_estimateGas` answers.
+    const ESTIMATED_GAS: u64 = 123_456;
+
+    /// A swap call (calldata exactly `calldata`) that returns `swap_return`,
+    /// and an `eth_estimateGas` that answers [`ESTIMATED_GAS`]; any other
+    /// `eth_call` gets zero.
     async fn mount_swap(server: &MockServer, calldata: &[u8], swap_return: Vec<u8>) {
+        mount_swap_call(server, calldata, swap_return).await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({ "method": "eth_estimateGas" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({ "jsonrpc": "2.0", "id": 1, "result": format!("0x{ESTIMATED_GAS:x}") }),
+            ))
+            .mount(server)
+            .await;
+    }
+
+    /// As [`mount_swap`], with no `eth_estimateGas` mounted.
+    async fn mount_swap_call(server: &MockServer, calldata: &[u8], swap_return: Vec<u8>) {
         let expected_calldata = calldata.to_vec();
         let swap_return_hex = format!("0x{}", hex::encode(swap_return));
         Mock::given(method("POST"))
@@ -455,16 +528,21 @@ mod tests {
         assert_eq!(adapter.slots.allowance_index(token, router_addr), Some(0));
     }
 
-    /// Every `eth_call` a mock node received, as its JSON body.
-    async fn eth_calls(server: &MockServer) -> Vec<Json> {
+    /// Every request of `method` a mock node received, as its JSON body.
+    async fn requests(server: &MockServer, method: &str) -> Vec<Json> {
         server
             .received_requests()
             .await
             .expect("the mock records its requests")
             .iter()
             .map(|r| r.body_json::<Json>().unwrap())
-            .filter(|body| body["method"] == "eth_call")
+            .filter(|body| body["method"] == method)
             .collect()
+    }
+
+    /// Every `eth_call` a mock node received, as its JSON body.
+    async fn eth_calls(server: &MockServer) -> Vec<Json> {
+        requests(server, "eth_call").await
     }
 
     /// The swap's own call: the one whose data is `calldata`.
@@ -806,6 +884,249 @@ mod tests {
             Outcome::Reverted { reason: got } => assert_eq!(got, reason),
             other => panic!("expected Reverted, got {other:?}"),
         }
+        assert_eq!(realised.cost, TxCost::Evm(EvmCost::default()));
+        assert!(
+            requests(&server, "eth_estimateGas").await.is_empty(),
+            "a swap that reverted has no gas to ask for"
+        );
+    }
+
+    /// The block a request was made at: the second parameter of `eth_call`
+    /// and `eth_estimateGas`.
+    fn block_of(request: &Json) -> &str {
+        request["params"][1].as_str().unwrap()
+    }
+
+    /// An `eth_getBlockByNumber` that answers `result`, whatever the tag.
+    async fn mount_block(server: &MockServer, result: Json) {
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({ "method": "eth_getBlockByNumber" }),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "jsonrpc": "2.0", "id": 1, "result": result })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_block_number(server: &MockServer, number: u64) {
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({ "method": "eth_blockNumber" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({ "jsonrpc": "2.0", "id": 1, "result": format!("0x{number:x}") }),
+            ))
+            .mount(server)
+            .await;
+    }
+
+    /// A dry run of one swap through a fixed router, on `adapter`, at `at`.
+    async fn dry_run(
+        server: &MockServer,
+        adapter: &EvmSimulated,
+        at: Option<u64>,
+    ) -> Result<Realised> {
+        let router = [0x11; 20];
+        let calldata = vec![0x01, 0x02, 0x03, 0x04];
+        mount_router(
+            server,
+            router,
+            &calldata,
+            U256::from(777u64).to_be_bytes::<32>().to_vec(),
+        )
+        .await;
+        let prepared = adapter
+            .prepare(&route(payload_for(router, &calldata)), &request())
+            .await
+            .unwrap();
+        adapter.execute(&prepared, at).await
+    }
+
+    /// A dry run that ran reports the node's estimate for the same call: the
+    /// same sender, the same block and the same overrides as the swap's own
+    /// `eth_call`, with no other figure invented.
+    #[tokio::test]
+    async fn a_dry_run_reports_the_nodes_gas_estimate_of_the_same_call() {
+        let server = MockServer::start().await;
+        let adapter = EvmSimulated::new(EvmRpc::new(server.uri()));
+        let realised = dry_run(&server, &adapter, Some(42)).await.unwrap();
+
+        assert!(matches!(realised.outcome, Outcome::Success));
+        assert_eq!(
+            realised.cost,
+            TxCost::Evm(EvmCost {
+                gas_used: Some(ESTIMATED_GAS),
+                effective_gas_price_wei: None,
+                l1_fee_wei: None,
+            })
+        );
+
+        let calls = eth_calls(&server).await;
+        let swap = swap_call(&calls, &[0x01, 0x02, 0x03, 0x04]);
+        let estimates = requests(&server, "eth_estimateGas").await;
+        assert_eq!(estimates.len(), 1, "one estimate for one swap");
+        assert_eq!(
+            estimates[0]["params"], swap["params"],
+            "the call, the block and the overrides are the swap's own"
+        );
+        assert_eq!(estimates[0]["params"][1], "0x2a");
+        assert_eq!(
+            estimates[0]["params"][0]["from"].as_str().unwrap(),
+            Address::from([0xCC; 20]).to_string(),
+            "the sender's swap, not an anonymous one"
+        );
+    }
+
+    /// An estimate the node refuses for a call that just ran is the node
+    /// disagreeing with itself, which is an error that says so and names the
+    /// reason, not a swap with its gas left out.
+    #[tokio::test]
+    async fn an_estimate_refused_for_a_swap_that_ran_is_an_error() {
+        let server = MockServer::start().await;
+        let router = [0x11; 20];
+        let calldata = vec![0x01, 0x02, 0x03, 0x04];
+        mount_probes(&server, router).await;
+        mount_swap_call(
+            &server,
+            &calldata,
+            U256::from(777u64).to_be_bytes::<32>().to_vec(),
+        )
+        .await;
+        let refusal = format!("0x{}", hex::encode(encode_error_string("STF")));
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({ "method": "eth_estimateGas" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1,
+                "error": { "code": 3, "message": "execution reverted", "data": refusal },
+            })))
+            .mount(&server)
+            .await;
+
+        let adapter = EvmSimulated::new(EvmRpc::new(server.uri()));
+        let prepared = adapter
+            .prepare(&route(payload_for(router, &calldata)), &request())
+            .await
+            .unwrap();
+        let err = adapter.execute(&prepared, Some(42)).await.unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("eth_estimateGas refused a swap that eth_call ran")
+                && text.contains("STF"),
+            "{text}"
+        );
+    }
+
+    /// A node that does not answer the estimate has said nothing about the
+    /// swap's gas: an error, never a success with the gas missing.
+    #[tokio::test]
+    async fn an_estimate_the_node_does_not_answer_is_an_error() {
+        let server = MockServer::start().await;
+        let router = [0x11; 20];
+        let calldata = vec![0x01, 0x02, 0x03, 0x04];
+        mount_probes(&server, router).await;
+        mount_swap_call(
+            &server,
+            &calldata,
+            U256::from(777u64).to_be_bytes::<32>().to_vec(),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({ "method": "eth_estimateGas" })))
+            .respond_with(ResponseTemplate::new(500).set_body_string("upstream down"))
+            .mount(&server)
+            .await;
+
+        let adapter = EvmSimulated::new(EvmRpc::new(server.uri()));
+        let prepared = adapter
+            .prepare(&route(payload_for(router, &calldata)), &request())
+            .await
+            .unwrap();
+        let err = adapter.execute(&prepared, Some(42)).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("eth_estimateGas for the swap"),
+            "{err:#}"
+        );
+    }
+
+    /// Without the pending mode a run with no block given reads the latest
+    /// block number once and pins every call to it, the estimate included.
+    #[tokio::test]
+    async fn without_the_pending_mode_every_call_is_pinned_to_the_latest_block() {
+        let server = MockServer::start().await;
+        mount_block_number(&server, 42).await;
+        let adapter = EvmSimulated::new(EvmRpc::new(server.uri()));
+        let realised = dry_run(&server, &adapter, None).await.unwrap();
+
+        assert_eq!(realised.at, 42);
+        assert_eq!(requests(&server, "eth_blockNumber").await.len(), 1);
+        assert!(requests(&server, "eth_getBlockByNumber").await.is_empty());
+        let mut reads = eth_calls(&server).await;
+        reads.extend(requests(&server, "eth_estimateGas").await);
+        assert!(reads.len() >= 3, "two probes, the swap and its estimate");
+        for read in &reads {
+            assert_eq!(block_of(read), "0x2a", "{read}");
+        }
+    }
+
+    /// The pending mode reads the pending block for everything: the slot
+    /// probes, the swap and its estimate, so that one state answers all of
+    /// them. `at` is the number the node gives its pending block.
+    #[tokio::test]
+    async fn the_pending_mode_reads_every_call_at_pending_and_reports_its_number() {
+        let server = MockServer::start().await;
+        mount_block(&server, json!({ "number": "0x65", "hash": "0x01" })).await;
+        let adapter = EvmSimulated::new(EvmRpc::new(server.uri())).with_pending_block();
+        let realised = dry_run(&server, &adapter, None).await.unwrap();
+
+        assert!(matches!(realised.outcome, Outcome::Success));
+        assert_eq!(realised.amount_out, Some(777));
+        assert_eq!(
+            realised.cost,
+            TxCost::Evm(EvmCost {
+                gas_used: Some(ESTIMATED_GAS),
+                ..EvmCost::default()
+            })
+        );
+        assert_eq!(realised.at, 0x65);
+        assert!(requests(&server, "eth_blockNumber").await.is_empty());
+        let mut reads = eth_calls(&server).await;
+        reads.extend(requests(&server, "eth_estimateGas").await);
+        assert!(reads.len() >= 3, "two probes, the swap and its estimate");
+        for read in &reads {
+            assert_eq!(block_of(read), "pending", "{read}");
+        }
+    }
+
+    /// A block given to `execute` pins the run to it, pending mode or not:
+    /// it is how a caller re-runs a dry run on the block it was made at.
+    #[tokio::test]
+    async fn a_block_given_pins_the_run_even_in_the_pending_mode() {
+        let server = MockServer::start().await;
+        let adapter = EvmSimulated::new(EvmRpc::new(server.uri())).with_pending_block();
+        let realised = dry_run(&server, &adapter, Some(42)).await.unwrap();
+
+        assert_eq!(realised.at, 42);
+        assert!(requests(&server, "eth_blockNumber").await.is_empty());
+        assert!(requests(&server, "eth_getBlockByNumber").await.is_empty());
+        let mut reads = eth_calls(&server).await;
+        reads.extend(requests(&server, "eth_estimateGas").await);
+        for read in &reads {
+            assert_eq!(block_of(read), "0x2a", "{read}");
+        }
+    }
+
+    /// A node that cannot name its pending block cannot say where the read
+    /// was made: an error before anything is called, not a guess.
+    #[tokio::test]
+    async fn a_node_with_no_pending_block_is_an_error_before_any_call() {
+        let server = MockServer::start().await;
+        mount_block(&server, Json::Null).await;
+        let adapter = EvmSimulated::new(EvmRpc::new(server.uri())).with_pending_block();
+        let err = dry_run(&server, &adapter, None).await.unwrap_err();
+
+        assert!(format!("{err:#}").contains("no pending block"), "{err:#}");
+        assert!(eth_calls(&server).await.is_empty());
     }
 
     /// Everything above proves this adapter's logic against a mocked
