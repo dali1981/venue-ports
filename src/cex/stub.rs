@@ -11,7 +11,9 @@
 //! recorded by `IMPLEMENTATION_PLAN.md` Phase 12's testnet run, and the
 //! stub copies that once it is known.
 
-use crate::cex::{CexExecutor, CexFill, OrderRequest, OrderSide, OrderStateUnknown};
+use crate::cex::{
+    with_provenance, CexExecutor, CexFill, OrderRequest, OrderSide, OrderStateUnknown,
+};
 use crate::Provenance;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
@@ -152,7 +154,21 @@ impl CexStub {
 
 #[async_trait]
 impl CexExecutor for CexStub {
+    /// Every `Err` carries `Provenance::Simulated`, a programmed one too
+    /// unless the test gave it another.
     async fn execute(&self, req: &OrderRequest) -> Result<CexFill> {
+        self.run(req)
+            .map_err(|err| with_provenance(err, Provenance::Simulated))
+    }
+
+    fn label(&self) -> &'static str {
+        "cex-stub"
+    }
+}
+
+impl CexStub {
+    /// [`CexExecutor::execute`] without its errors' provenance.
+    fn run(&self, req: &OrderRequest) -> Result<CexFill> {
         self.calls.lock().unwrap().push(RecordedCall {
             request: req.clone(),
         });
@@ -186,10 +202,6 @@ impl CexExecutor for CexStub {
             self.apply_fill(req, fill);
         }
         result
-    }
-
-    fn label(&self) -> &'static str {
-        "cex-stub"
     }
 }
 
@@ -270,6 +282,48 @@ mod tests {
         assert_eq!(unknown.symbol, "SOLUSDT");
         assert_eq!(unknown.client_order_id, "vp-1");
         assert_eq!(unknown.order_ref, None);
+    }
+
+    /// The stub sends nothing, so every error it returns says `Simulated`:
+    /// a programmed rejection, an order state unknown, a reduce-only refusal,
+    /// and an error a test programmed as it likes. A test that programs an
+    /// error with a provenance of its own keeps it.
+    #[tokio::test]
+    async fn every_error_carries_the_simulated_provenance() {
+        use crate::cex::provenance_of;
+
+        let stub = CexStub::new();
+        stub.program_rejected("insufficient balance");
+        stub.program_state_unknown("vp-1");
+        stub.program_execute(Err(anyhow::anyhow!("a test's own error")));
+        stub.program_execute(Err(with_provenance(
+            anyhow::anyhow!("a landed one"),
+            Provenance::Landed,
+        )));
+
+        let rejected = stub.execute(&request()).await.unwrap_err();
+        assert!(rejected.to_string().contains("insufficient balance"));
+        assert_eq!(provenance_of(&rejected), Some(Provenance::Simulated));
+
+        let unknown = stub.execute(&request()).await.unwrap_err();
+        assert!(unknown.downcast_ref::<OrderStateUnknown>().is_some());
+        assert_eq!(provenance_of(&unknown), Some(Provenance::Simulated));
+
+        let own = stub.execute(&request()).await.unwrap_err();
+        assert_eq!(own.to_string(), "a test's own error");
+        assert_eq!(provenance_of(&own), Some(Provenance::Simulated));
+
+        let landed = stub.execute(&request()).await.unwrap_err();
+        assert_eq!(landed.to_string(), "a landed one");
+        assert_eq!(provenance_of(&landed), Some(Provenance::Landed));
+
+        stub.set_position("SOLUSDT", decimal("-5"));
+        let refused = stub
+            .execute(&reduce_only(OrderSide::Sell, "1"))
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("reduce-only"));
+        assert_eq!(provenance_of(&refused), Some(Provenance::Simulated));
     }
 
     #[tokio::test]

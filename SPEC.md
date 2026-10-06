@@ -993,6 +993,17 @@ fill whose details cannot be read (for example commission charged in more than o
 `CexFill` cannot hold) all become `OrderStateUnknown`. None of them may surface as a plain error, and
 no fill is ever returned with a guessed commission.
 
+**Every `Err` from `execute` carries the provenance of the order it is the failure of**: the one a fill
+from that executor would carry, `Landed` for a live adapter (a refusal before anything was sent included)
+and `Simulated` for a stub or a paper model. It is a layer of the error's chain, `ErrorProvenance`,
+found with `downcast_ref` or read with `cex::provenance_of(&err)`, and attached with
+`cex::with_provenance(err, provenance)`: an error that already carries one keeps it. The layer's
+`Display` is the message of the layer it covers, so an error's `to_string()` is what it was without it,
+and whatever else is in the chain, `OrderStateUnknown` included, is still found by `downcast_ref`.
+`OrderStateUnknown` itself gains no field, so a caller that builds one by struct literal is unaffected;
+it attaches the provenance with `with_provenance` when it returns the error. (`{:#}` of an error tagged
+after the fact says its top-level message twice; an `OrderStateUnknown` this crate builds does not.)
+
 ### Required implementations (CEX)
 
 - **`CexLive`** — places a real order against a venue's trading API. Responsible for: rounding

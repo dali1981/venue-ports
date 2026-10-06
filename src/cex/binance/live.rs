@@ -44,7 +44,9 @@ use crate::cex::binance::order::{settled, single_commission, trade_lines, unread
 use crate::cex::binance::rest::{
     BinanceOrderResponse, BinanceRest, OrderCheck, MY_TRADES_PATH, ORDER_PATH,
 };
-use crate::cex::{new_client_order_id, CexExecutor, CexFill, OrderRequest, OrderSide};
+use crate::cex::{
+    new_client_order_id, with_provenance, CexExecutor, CexFill, OrderRequest, OrderSide,
+};
 use crate::Provenance;
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
@@ -152,6 +154,28 @@ impl BinanceLive {
         Ok((side, quantity))
     }
 
+    /// Places `req` and reads what became of it: [`CexExecutor::execute`]
+    /// without its errors' provenance.
+    async fn place(&self, req: &OrderRequest) -> Result<CexFill> {
+        let (side, quantity) = self.market_order(req)?;
+        let client_order_id = new_client_order_id();
+        let what = format!("{side} {quantity} {} ({client_order_id})", req.symbol);
+        let placed = self
+            .rest
+            .place_market_order(&req.symbol, side, quantity, &client_order_id)
+            .await;
+        let order = settled(
+            self.rest.client(),
+            ORDER_PATH,
+            &req.symbol,
+            &client_order_id,
+            &what,
+            placed,
+        )
+        .await?;
+        self.settle(req, &client_order_id, order).await
+    }
+
     /// Checks `req` as [`CexExecutor::execute`] would place it, at
     /// `POST /api/v3/order/test` with `computeCommissionRates=true`: the
     /// venue validates the order and states the commission its trades would
@@ -180,24 +204,12 @@ impl BinanceLive {
 
 #[async_trait]
 impl CexExecutor for BinanceLive {
+    /// Every `Err` carries `Provenance::Landed`: the provenance of the fill
+    /// this order would have been, even when it was refused before it was sent.
     async fn execute(&self, req: &OrderRequest) -> Result<CexFill> {
-        let (side, quantity) = self.market_order(req)?;
-        let client_order_id = new_client_order_id();
-        let what = format!("{side} {quantity} {} ({client_order_id})", req.symbol);
-        let placed = self
-            .rest
-            .place_market_order(&req.symbol, side, quantity, &client_order_id)
-            .await;
-        let order = settled(
-            self.rest.client(),
-            ORDER_PATH,
-            &req.symbol,
-            &client_order_id,
-            &what,
-            placed,
-        )
-        .await?;
-        self.settle(req, &client_order_id, order).await
+        self.place(req)
+            .await
+            .map_err(|err| with_provenance(err, Provenance::Landed))
     }
 
     fn label(&self) -> &'static str {
@@ -644,6 +656,77 @@ mod tests {
         )
         .await;
         // `expect(0)` is verified when `server` drops.
+    }
+
+    /// Every way `execute` fails says `Landed`, so a caller records where the
+    /// order went without asking the adapter: a refusal before anything is
+    /// sent, the venue's refusal, an order that ended with nothing filled,
+    /// and an order whose state is unknown. The messages are the ones the
+    /// tests above read.
+    #[tokio::test]
+    async fn every_error_carries_the_landed_provenance() {
+        use crate::cex::provenance_of;
+
+        let server = venue().await;
+        let err = live(&server, decimal("0.01"))
+            .execute(&OrderRequest {
+                reduce_only: true,
+                ..request()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("reduce_only"), "{err}");
+        assert_eq!(provenance_of(&err), Some(Provenance::Landed), "{err:#}");
+
+        let server = venue().await;
+        mount_placing(
+            &server,
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "code": -2010, "msg": "Account has insufficient balance for requested action."
+            })),
+        )
+        .await;
+        let err = live(&server, decimal("0.01"))
+            .execute(&request())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("-2010"), "{err}");
+        assert_eq!(provenance_of(&err), Some(Provenance::Landed), "{err:#}");
+
+        let server = venue().await;
+        mount_placing(
+            &server,
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "orderId": 7, "status": "REJECTED", "executedQty": "0", "fills": []
+            })),
+        )
+        .await;
+        let err = live(&server, decimal("0.01"))
+            .execute(&request())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("REJECTED"), "{err}");
+        assert_eq!(provenance_of(&err), Some(Provenance::Landed), "{err:#}");
+
+        let server = venue().await;
+        mount_placing(
+            &server,
+            ResponseTemplate::new(200)
+                .set_body_json(filled_order("FILLED", "10.03"))
+                .set_delay(Duration::from_millis(600)),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/order"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let err = live(&server, decimal("0.01"))
+            .execute(&request())
+            .await
+            .unwrap_err();
+        assert!(err.downcast_ref::<OrderStateUnknown>().is_some(), "{err:#}");
+        assert_eq!(provenance_of(&err), Some(Provenance::Landed), "{err:#}");
     }
 
     fn placed_with_its_trades() -> serde_json::Value {

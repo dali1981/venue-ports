@@ -53,7 +53,9 @@ use crate::cex::binance::order::{
 use crate::cex::binance_futures::account::BinanceFuturesAccount;
 use crate::cex::binance_futures::filters::{symbol_filters, ExchangeInfo, SymbolFilters};
 use crate::cex::binance_futures::rest::{BinanceFuturesConfig, BinanceFuturesRest};
-use crate::cex::{new_client_order_id, CexExecutor, CexFill, OrderRequest, OrderSide};
+use crate::cex::{
+    new_client_order_id, with_provenance, CexExecutor, CexFill, OrderRequest, OrderSide,
+};
 use crate::Provenance;
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -190,7 +192,23 @@ impl BinanceFuturesLive {
 
 #[async_trait]
 impl CexExecutor for BinanceFuturesLive {
+    /// Every `Err` carries `Provenance::Landed`: the provenance of the fill
+    /// this order would have been, even when it was refused before it was sent.
     async fn execute(&self, req: &OrderRequest) -> Result<CexFill> {
+        self.place(req)
+            .await
+            .map_err(|err| with_provenance(err, Provenance::Landed))
+    }
+
+    fn label(&self) -> &'static str {
+        "binance-futures-live"
+    }
+}
+
+impl BinanceFuturesLive {
+    /// Places `req` and reads what became of it: [`CexExecutor::execute`]
+    /// without its errors' provenance.
+    async fn place(&self, req: &OrderRequest) -> Result<CexFill> {
         let filters = self.filters.get(&req.symbol).ok_or_else(|| {
             anyhow!(
                 "{} was not among the symbols given to connect; refusing to send it",
@@ -233,10 +251,6 @@ impl CexExecutor for BinanceFuturesLive {
         )
         .await?;
         self.fill(req, &client_order_id, order).await
-    }
-
-    fn label(&self) -> &'static str {
-        "binance-futures-live"
     }
 }
 
@@ -774,6 +788,71 @@ pub(super) mod tests {
         );
         // A refusal needs no status query.
         assert!(requests_to(&server, "GET", ORDER_PATH).await.is_empty());
+    }
+
+    /// Every way `execute` fails says `Landed`, so a caller records where the
+    /// order went without asking the adapter: a refusal before anything is
+    /// sent, the venue's refusal, an order that ended with nothing filled,
+    /// and an order whose state is unknown.
+    #[tokio::test]
+    async fn every_error_carries_the_landed_provenance() {
+        use crate::cex::provenance_of;
+
+        let server = venue().await;
+        let err = connect(&server)
+            .await
+            .execute(&buy("0.0019"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("below the minimum 0.002"), "{err}");
+        assert_eq!(provenance_of(&err), Some(Provenance::Landed), "{err:#}");
+
+        let server = venue().await;
+        on(
+            &server,
+            "POST",
+            ORDER_PATH,
+            venue_error(-2022, "ReduceOnly Order is rejected."),
+        )
+        .await;
+        let err = connect(&server)
+            .await
+            .execute(&OrderRequest {
+                side: OrderSide::Sell,
+                reduce_only: true,
+                ..buy("0.006")
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("-2022"), "{err}");
+        assert_eq!(provenance_of(&err), Some(Provenance::Landed), "{err:#}");
+
+        let server = venue().await;
+        on(&server, "POST", ORDER_PATH, ok(order("EXPIRED", "0", "0"))).await;
+        let err = connect(&server)
+            .await
+            .execute(&buy("0.006"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("nothing filled"), "{err}");
+        assert_eq!(provenance_of(&err), Some(Provenance::Landed), "{err:#}");
+
+        let server = venue().await;
+        on(
+            &server,
+            "POST",
+            ORDER_PATH,
+            ok(order("FILLED", "0.006", "60000")).set_delay(Duration::from_millis(600)),
+        )
+        .await;
+        on(&server, "GET", ORDER_PATH, ResponseTemplate::new(500)).await;
+        let err = connect(&server)
+            .await
+            .execute(&buy("0.006"))
+            .await
+            .unwrap_err();
+        assert!(err.downcast_ref::<OrderStateUnknown>().is_some(), "{err:#}");
+        assert_eq!(provenance_of(&err), Some(Provenance::Landed), "{err:#}");
     }
 
     #[tokio::test]

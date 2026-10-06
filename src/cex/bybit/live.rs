@@ -38,7 +38,8 @@
 
 use crate::cex::bybit::rest::{BybitOrder, BybitRest, OrderKey, PlaceError};
 use crate::cex::{
-    new_client_order_id, CexExecutor, CexFill, OrderRequest, OrderSide, OrderStateUnknown,
+    new_client_order_id, with_provenance, CexExecutor, CexFill, OrderRequest, OrderSide,
+    OrderStateUnknown,
 };
 use crate::Provenance;
 use anyhow::{anyhow, bail, Result};
@@ -125,7 +126,7 @@ impl BybitLive {
                     client_order_id: order_link_id.to_string(),
                     order_ref,
                 }
-                .because(why));
+                .because(Provenance::Landed, why));
             }
             tokio::time::sleep(timings.poll_interval).await;
         }
@@ -151,7 +152,7 @@ impl BybitLive {
                 client_order_id: order_link_id.to_string(),
                 order_ref,
             }
-            .because(why)
+            .because(Provenance::Landed, why)
         };
         let filled_price: Decimal = order.avg_price.parse().map_err(|_| {
             unknown(format!(
@@ -191,7 +192,23 @@ fn is_terminal(status: &str) -> bool {
 
 #[async_trait]
 impl CexExecutor for BybitLive {
+    /// Every `Err` carries `Provenance::Landed`: the provenance of the fill
+    /// this order would have been, even when it was refused before it was sent.
     async fn execute(&self, req: &OrderRequest) -> Result<CexFill> {
+        self.place(req)
+            .await
+            .map_err(|err| with_provenance(err, Provenance::Landed))
+    }
+
+    fn label(&self) -> &'static str {
+        "bybit-live"
+    }
+}
+
+impl BybitLive {
+    /// Places `req` and reads what became of it: [`CexExecutor::execute`]
+    /// without its errors' provenance.
+    async fn place(&self, req: &OrderRequest) -> Result<CexFill> {
         if req.reduce_only {
             bail!(
                 "reduce_only is not supported on Bybit spot, which holds no positions — \
@@ -252,10 +269,6 @@ impl CexExecutor for BybitLive {
                 Err(anyhow!("{what} was not placed, nothing filled: {err:#}"))
             }
         }
-    }
-
-    fn label(&self) -> &'static str {
-        "bybit-live"
     }
 }
 
@@ -569,6 +582,67 @@ mod tests {
             err.downcast_ref::<OrderStateUnknown>().unwrap().order_ref,
             Some(9001)
         );
+    }
+
+    /// Every way `execute` fails says `Landed`, so a caller records where the
+    /// order went without asking the adapter: a refusal before anything is
+    /// sent, the venue's refusal, an order that ended with no fill, and an
+    /// order whose state is unknown.
+    #[tokio::test]
+    async fn every_error_carries_the_landed_provenance() {
+        use crate::cex::provenance_of;
+
+        let server = MockServer::start().await;
+        let err = live(&server)
+            .execute(&OrderRequest {
+                reduce_only: true,
+                ..request()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("reduce_only"), "{err}");
+        assert_eq!(provenance_of(&err), Some(Provenance::Landed), "{err:#}");
+
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            "POST",
+            "/v5/order/create",
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "retCode": 170131, "retMsg": "Insufficient balance.",
+                "result": {}, "retExtInfo": {}, "time": 1
+            })),
+        )
+        .await;
+        let err = live(&server).execute(&request()).await.unwrap_err();
+        assert!(err.to_string().contains("170131"), "{err}");
+        assert_eq!(provenance_of(&err), Some(Provenance::Landed), "{err:#}");
+
+        let server = MockServer::start().await;
+        mount(&server, "POST", "/v5/order/create", created("9002")).await;
+        mount(
+            &server,
+            "GET",
+            "/v5/order/realtime",
+            listed("Rejected", "0", "0", "0"),
+        )
+        .await;
+        let err = live(&server).execute(&request()).await.unwrap_err();
+        assert!(err.to_string().contains("Rejected"), "{err}");
+        assert_eq!(provenance_of(&err), Some(Provenance::Landed), "{err:#}");
+
+        let server = MockServer::start().await;
+        mount(&server, "POST", "/v5/order/create", created("9001")).await;
+        mount(
+            &server,
+            "GET",
+            "/v5/order/realtime",
+            ResponseTemplate::new(500),
+        )
+        .await;
+        let err = live(&server).execute(&request()).await.unwrap_err();
+        assert!(err.downcast_ref::<OrderStateUnknown>().is_some(), "{err:#}");
+        assert_eq!(provenance_of(&err), Some(Provenance::Landed), "{err:#}");
     }
 
     #[tokio::test]

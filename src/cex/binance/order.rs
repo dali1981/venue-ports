@@ -11,6 +11,7 @@
 
 use crate::cex::binance::client::{ApiError, BinanceClient, NO_SUCH_ORDER};
 use crate::cex::{CexTrade, OrderStateUnknown};
+use crate::Provenance;
 use anyhow::{anyhow, bail};
 use reqwest::Method;
 use rust_decimal::Decimal;
@@ -303,7 +304,7 @@ pub(crate) async fn settled<T: VenueOrder>(
                 client_order_id: client_order_id.to_string(),
                 order_ref,
             }
-            .because(why))
+            .because(Provenance::Landed, why))
         }
     }
 }
@@ -322,9 +323,12 @@ pub(crate) fn unreadable_fill(
         client_order_id: client_order_id.to_string(),
         order_ref: Some(order_ref),
     }
-    .because(why.context(format!(
-        "order {order_ref} filled {executed_qty} but the fill could not be read"
-    )))
+    .because(
+        Provenance::Landed,
+        why.context(format!(
+            "order {order_ref} filled {executed_qty} but the fill could not be read"
+        )),
+    )
 }
 
 #[cfg(test)]
