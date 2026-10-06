@@ -190,15 +190,9 @@ impl EvmRpc {
         block: BlockTag,
         overrides: Option<&Value>,
     ) -> Result<Vec<u8>> {
-        let mut call = json!({ "to": to.to_string(), "data": hex_data(data) });
-        if let Some(from) = from {
-            call["from"] = json!(from.to_string());
-        }
-        let params = match overrides {
-            Some(overrides) => json!([call, block.param(), overrides]),
-            None => json!([call, block.param()]),
-        };
-        let result = self.call("eth_call", params).await?;
+        let result = self
+            .call("eth_call", call_params(to, data, from, block, overrides))
+            .await?;
         decode_hex(
             result
                 .as_str()
@@ -206,8 +200,50 @@ impl EvmRpc {
         )
     }
 
+    /// `eth_estimateGas` of the call [`EvmRpc::eth_call`] would make with the
+    /// same arguments: the node's figure for the gas the call needs, at
+    /// `block`, with `overrides` applied. A call the node would revert is an
+    /// [`RpcError`], as for `eth_call`.
+    pub async fn eth_estimate_gas(
+        &self,
+        to: Address,
+        data: &[u8],
+        from: Option<Address>,
+        block: BlockTag,
+        overrides: Option<&Value>,
+    ) -> Result<u64> {
+        self.call_u64(
+            "eth_estimateGas",
+            call_params(to, data, from, block, overrides),
+        )
+        .await
+    }
+
     pub async fn block_number(&self) -> Result<u64> {
         self.call_u64("eth_blockNumber", json!([])).await
+    }
+
+    /// The number of the block `block` names: a number is itself, `latest` is
+    /// `eth_blockNumber`, and `pending` is the number the node gives its
+    /// pending block (on Base, the preconfirmed one). A node with no pending
+    /// block is an error: the caller asked where a read was made, and a
+    /// guess would be an answer to something else.
+    pub async fn block_number_at(&self, block: BlockTag) -> Result<u64> {
+        match block {
+            BlockTag::Number(number) => Ok(number),
+            BlockTag::Latest => self.block_number().await,
+            BlockTag::Pending => {
+                let header = self
+                    .call("eth_getBlockByNumber", json!([block.param(), false]))
+                    .await?;
+                parse_hex_u64(
+                    header
+                        .get("number")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow!("the node has no pending block: {header}"))?,
+                )
+            }
+        }
     }
 
     pub async fn chain_id(&self) -> Result<u64> {
@@ -415,6 +451,25 @@ impl EvmRpc {
                 .as_str()
                 .ok_or_else(|| anyhow!("{method} result was not a hex string: {result}"))?,
         )
+    }
+}
+
+/// The parameters of `eth_call` and `eth_estimateGas`, which take the same
+/// three: the call, the block, and (when given) the state overrides.
+fn call_params(
+    to: Address,
+    data: &[u8],
+    from: Option<Address>,
+    block: BlockTag,
+    overrides: Option<&Value>,
+) -> Value {
+    let mut call = json!({ "to": to.to_string(), "data": hex_data(data) });
+    if let Some(from) = from {
+        call["from"] = json!(from.to_string());
+    }
+    match overrides {
+        Some(overrides) => json!([call, block.param(), overrides]),
+        None => json!([call, block.param()]),
     }
 }
 

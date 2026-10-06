@@ -37,6 +37,9 @@ enum Programmed {
     /// the `Prepared` it runs.
     Shaped {
         amount_out: Option<ChainAmount>,
+        /// The input the swap took, when the test set it; otherwise a
+        /// success took the whole offer of the route it was prepared from.
+        amount_in: Option<ChainAmount>,
         outcome: Outcome,
         at: u64,
     },
@@ -65,25 +68,42 @@ impl DexStub {
             .push_back(Programmed::Exact(result));
     }
 
-    fn program_shaped(&self, amount_out: Option<ChainAmount>, outcome: Outcome, at: u64) {
+    fn program_shaped(
+        &self,
+        amount_out: Option<ChainAmount>,
+        amount_in: Option<ChainAmount>,
+        outcome: Outcome,
+        at: u64,
+    ) {
         self.programmed
             .lock()
             .unwrap()
             .push_back(Programmed::Shaped {
                 amount_out,
+                amount_in,
                 outcome,
                 at,
             });
     }
 
-    /// Program a successful swap.
+    /// Program a successful swap that took the whole offer of the route it
+    /// was prepared from. `execute` refuses a `Prepared` this stub did not
+    /// prepare, since it cannot say what such a swap took; use
+    /// [`DexStub::program_success_taking`] for one.
     pub fn program_success(&self, amount_out: ChainAmount, at: u64) {
-        self.program_shaped(Some(amount_out), Outcome::Success, at);
+        self.program_shaped(Some(amount_out), None, Outcome::Success, at);
+    }
+
+    /// Program a successful swap that took `amount_in`, which can be less
+    /// than the route offered: a V3 swap that reached its price limit.
+    pub fn program_success_taking(&self, amount_out: ChainAmount, amount_in: ChainAmount, at: u64) {
+        self.program_shaped(Some(amount_out), Some(amount_in), Outcome::Success, at);
     }
 
     /// Program a revert with a specific reason.
     pub fn program_reverted(&self, reason: impl Into<String>, at: u64) {
         self.program_shaped(
+            None,
             None,
             Outcome::Reverted {
                 reason: reason.into(),
@@ -95,13 +115,13 @@ impl DexStub {
     /// Program a forced timeout — the outcome a real adapter would report
     /// when a transaction never reaches a terminal state in time.
     pub fn program_timed_out(&self, at: u64) {
-        self.program_shaped(None, Outcome::TimedOut, at);
+        self.program_shaped(None, None, Outcome::TimedOut, at);
     }
 
     /// Program an expiry — a Solana transaction whose blockhash expired
     /// with no status for its signature, so it can never land.
     pub fn program_expired(&self, at: u64) {
-        self.program_shaped(None, Outcome::Expired, at);
+        self.program_shaped(None, None, Outcome::Expired, at);
     }
 
     /// Every call the stub has received so far, in the order received.
@@ -133,36 +153,57 @@ impl DexExecutor for DexStub {
     }
 
     async fn execute(&self, prepared: &Prepared, at: Option<u64>) -> Result<Realised> {
-        let shaped = |amount_out, outcome, at| Realised {
+        let shaped = |amount_out, amount_in, outcome, at| Realised {
             amount_out,
+            amount_in,
             outcome,
             cost: TxCost::none_for(prepared),
             at,
             provenance: Provenance::Simulated,
             tx_ref: None,
         };
+        // The call `prepared` was prepared by, if this stub prepared it.
+        let prepared_by_this_stub = || {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|call| &call.prepared == prepared)
+                .cloned()
+        };
         match self.programmed.lock().unwrap().pop_front() {
             Some(Programmed::Exact(result)) => return result,
             Some(Programmed::Shaped {
                 amount_out,
+                amount_in,
                 outcome,
                 at,
-            }) => return Ok(shaped(amount_out, outcome, at)),
+            }) => {
+                let amount_in = match (&outcome, amount_in) {
+                    (Outcome::Success, None) => Some(
+                        prepared_by_this_stub()
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "DexStub cannot say what a swap it did not prepare took: \
+                                     program it with program_success_taking"
+                                )
+                            })?
+                            .route
+                            .amount_in,
+                    ),
+                    (_, amount_in) => amount_in,
+                };
+                return Ok(shaped(amount_out, amount_in, outcome, at));
+            }
             None => {}
         }
-        let min_amount_out = self
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .rev()
-            .find(|call| &call.prepared == prepared)
-            .map(|call| call.request.min_amount_out)
-            .ok_or_else(|| {
-                anyhow!("DexStub has no programmed outcome for a Prepared value it did not prepare")
-            })?;
+        let call = prepared_by_this_stub().ok_or_else(|| {
+            anyhow!("DexStub has no programmed outcome for a Prepared value it did not prepare")
+        })?;
         Ok(shaped(
-            Some(min_amount_out),
+            Some(call.request.min_amount_out),
+            Some(call.route.amount_in),
             Outcome::Success,
             at.unwrap_or(0),
         ))
@@ -218,9 +259,59 @@ mod tests {
 
         assert!(matches!(realised.outcome, Outcome::Success));
         assert_eq!(realised.amount_out, Some(90));
+        assert_eq!(
+            realised.amount_in,
+            Some(100),
+            "the whole offer of the route it was prepared from"
+        );
         assert_eq!(realised.cost, TxCost::Evm(EvmCost::default()));
         assert_eq!(realised.provenance, Provenance::Simulated);
         assert_eq!(realised.tx_ref, None);
+    }
+
+    /// A programmed success takes the route's whole offer unless the test
+    /// says it took less (a swap that reached its price limit), and every
+    /// outcome that is not a success took none.
+    #[tokio::test]
+    async fn a_programmed_swap_takes_the_offer_unless_it_is_programmed_to_take_less() {
+        let stub = DexStub::new();
+        stub.program_success(95, 1);
+        stub.program_success_taking(60, 65, 2);
+        stub.program_reverted("no", 3);
+        stub.program_timed_out(4);
+        stub.program_expired(5);
+        let prepared = stub.prepare(&solana_route(), &request()).await.unwrap();
+
+        let whole = stub.execute(&prepared, None).await.unwrap();
+        assert_eq!((whole.amount_out, whole.amount_in), (Some(95), Some(100)));
+        let partial = stub.execute(&prepared, None).await.unwrap();
+        assert_eq!(
+            (partial.amount_out, partial.amount_in),
+            (Some(60), Some(65))
+        );
+        for _ in 0..3 {
+            let realised = stub.execute(&prepared, None).await.unwrap();
+            assert_eq!(realised.amount_in, None, "{:?}", realised.outcome);
+        }
+    }
+
+    /// A success programmed without an input cannot say what a swap it did
+    /// not prepare took, and does not guess; one that names it can.
+    #[tokio::test]
+    async fn a_programmed_success_for_a_prepared_value_it_did_not_prepare_needs_its_input() {
+        let stub = DexStub::new();
+        let foreign = Prepared::Evm(EvmCall {
+            to: vec![7],
+            calldata: Vec::new(),
+            value: 1,
+        });
+        stub.program_success(95, 1);
+        stub.program_success_taking(95, 40, 1);
+
+        let err = stub.execute(&foreign, None).await.unwrap_err();
+        assert!(err.to_string().contains("program_success_taking"), "{err}");
+        let realised = stub.execute(&foreign, None).await.unwrap();
+        assert_eq!(realised.amount_in, Some(40));
     }
 
     #[tokio::test]
@@ -266,6 +357,7 @@ mod tests {
         let realised = stub.execute(&prepared, None).await.unwrap();
 
         assert_eq!(realised.amount_out, None);
+        assert_eq!(realised.amount_in, None);
         assert_eq!(realised.at, 42);
         match realised.outcome {
             Outcome::Reverted { reason } => assert_eq!(reason, "insufficient liquidity"),

@@ -40,6 +40,13 @@
 //! allowance is read. The amount out is read the same way, from the output's
 //! `Transfer` to `SwapRequest.recipient`.
 //!
+//! **The amount in** is what the pool took, which a swap that reaches its
+//! price limit makes less than the route's `amount_in`: the input token's
+//! `Transfer`s out of the payer (the sender, or the contract called), less
+//! any `Transfer` back to it (a router refunding what it did not use). A
+//! landed swap with none is an error naming its transaction, as one with no
+//! output `Transfer` is.
+//!
 //! **Over a fork sender** (`SPEC.md` §5b), this adapter is a swap simulator
 //! whose state persists between calls: its provenance is `Simulated`, and its
 //! `tx_ref` is the fork transaction's hash, as a live send's is. The payer
@@ -64,6 +71,7 @@ use std::sync::{Arc, Mutex};
 struct PendingLive {
     token_in: Address,
     token_out: Address,
+    sender: Address,
     recipient: Address,
     payer: Payer,
     amount_in: ChainAmount,
@@ -147,6 +155,7 @@ impl DexExecutor for EvmLive {
             PendingLive {
                 token_in,
                 token_out,
+                sender,
                 recipient,
                 payer: req.payer,
                 amount_in: route.amount_in,
@@ -214,8 +223,20 @@ impl DexExecutor for EvmLive {
                              token to the recipient was found in its logs"
                         )
                     })?;
+                let payer = match ctx.payer {
+                    Payer::Sender => ctx.sender,
+                    Payer::CalledContract => router,
+                };
+                let amount_in =
+                    decode_amount_spent(&logs, ctx.token_in, payer).ok_or_else(|| {
+                        anyhow!(
+                            "swap landed (tx {tx_hash}) but no ERC-20 Transfer of the input token \
+                         out of its payer {payer} was found in its logs"
+                        )
+                    })?;
                 Ok(Realised {
                     amount_out: Some(amount_out),
+                    amount_in: Some(amount_in),
                     outcome: Outcome::Success,
                     cost: TxCost::Evm(cost),
                     at: block,
@@ -230,6 +251,7 @@ impl DexExecutor for EvmLive {
                 cost,
             } => Ok(Realised {
                 amount_out: None,
+                amount_in: None,
                 outcome: Outcome::Reverted { reason },
                 cost: TxCost::Evm(cost),
                 at: block,
@@ -240,6 +262,7 @@ impl DexExecutor for EvmLive {
                 let at = self.sender.rpc().block_number().await.unwrap_or(0);
                 Ok(Realised {
                     amount_out: None,
+                    amount_in: None,
                     outcome: Outcome::TimedOut,
                     cost: TxCost::Evm(EvmCost::default()),
                     at,
@@ -274,6 +297,27 @@ fn decode_transfer_amount(
         .and_then(|t| t.value.try_into().ok())
 }
 
+/// What `payer` gave up of `token` in a receipt's logs: its `Transfer`s out,
+/// less the `Transfer`s back to it. `None` when nothing net left it, and for
+/// an amount above `u128`, never truncated.
+fn decode_amount_spent(logs: &[RpcLog], token: Address, payer: Address) -> Option<ChainAmount> {
+    let (mut out, mut back) = (U256::ZERO, U256::ZERO);
+    for transfer in erc20::transfers(logs)
+        .into_iter()
+        .filter(|t| t.token == token && t.from != t.to)
+    {
+        if transfer.from == payer {
+            out = out.saturating_add(transfer.value);
+        }
+        if transfer.to == payer {
+            back = back.saturating_add(transfer.value);
+        }
+    }
+    out.checked_sub(back)
+        .filter(|spent| !spent.is_zero())
+        .and_then(|spent| spent.try_into().ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +330,19 @@ mod tests {
     use std::time::Duration;
     use wiremock::matchers::{body_partial_json, body_string_contains, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// An ERC-20 `Transfer` log.
+    fn transfer(token: Address, from: Address, to: Address, amount: u64) -> Value {
+        json!({
+            "address": token.to_string(),
+            "topics": [
+                transfer_topic().to_string(),
+                hex_data(&pad_address(from)),
+                hex_data(&pad_address(to)),
+            ],
+            "data": format_u256(U256::from(amount)),
+        })
+    }
 
     fn route(
         router: Address,
@@ -438,26 +495,21 @@ mod tests {
             .mount(&server)
             .await;
 
-        let transfer_log = json!({
-            "address": token_out.to_string(),
-            "topics": [
-                transfer_topic().to_string(),
-                hex_data(&pad_address(router)),
-                hex_data(&pad_address(recipient)),
-            ],
-            "data": format_u256(U256::from(4_200u64)),
-        });
+        let live = EvmLive::new(connect(&server).await);
+        let sender = live.address();
         mount_receipt(
             &server,
             json!({
-                "status": "0x1", "blockNumber": "0x2a", "logs": [transfer_log],
+                "status": "0x1", "blockNumber": "0x2a",
+                "logs": [
+                    transfer(token_in, sender, router, 1_000),
+                    transfer(token_out, router, recipient, 4_200),
+                ],
                 "gasUsed": "0x249f0", "effectiveGasPrice": "0x77359400", "l1Fee": "0x7",
             }),
         )
         .await;
 
-        let live = EvmLive::new(connect(&server).await);
-        let sender = live.address();
         let route = route(router, token_in, token_out, &calldata);
         let req = request(sender, recipient);
 
@@ -465,6 +517,7 @@ mod tests {
         let realised = live.execute(&prepared, None).await.unwrap();
 
         assert_eq!(realised.amount_out, Some(4_200));
+        assert_eq!(realised.amount_in, Some(1_000));
         assert!(matches!(realised.outcome, Outcome::Success));
         assert_eq!(
             realised.cost,
@@ -499,18 +552,15 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let transfer_log = json!({
-            "address": token_out.to_string(),
-            "topics": [
-                transfer_topic().to_string(),
-                hex_data(&pad_address(pool)),
-                hex_data(&pad_address(contract)),
-            ],
-            "data": format_u256(U256::from(4_200u64)),
-        });
         mount_receipt(
             &server,
-            json!({ "status": "0x1", "blockNumber": "0x2a", "logs": [transfer_log] }),
+            json!({
+                "status": "0x1", "blockNumber": "0x2a",
+                "logs": [
+                    transfer(token_in, contract, pool, 1_000),
+                    transfer(token_out, pool, contract, 4_200),
+                ],
+            }),
         )
         .await;
 
@@ -525,6 +575,11 @@ mod tests {
             .unwrap();
         let realised = live.execute(&prepared, None).await.unwrap();
         assert_eq!(realised.amount_out, Some(4_200));
+        assert_eq!(
+            realised.amount_in,
+            Some(1_000),
+            "what the contract paid the pool"
+        );
         assert!(matches!(realised.outcome, Outcome::Success));
 
         let bodies: Vec<Value> = server
@@ -576,18 +631,16 @@ mod tests {
                 .mount(&server)
                 .await;
         }
-        let transfer_log = json!({
-            "address": token_out.to_string(),
-            "topics": [
-                transfer_topic().to_string(),
-                hex_data(&pad_address(Address::from([0x22; 20]))),
-                hex_data(&pad_address(owner)),
-            ],
-            "data": format_u256(U256::from(4_200u64)),
-        });
+        let pool = Address::from([0x22; 20]);
         mount_receipt(
             &server,
-            json!({ "status": "0x1", "blockNumber": "0x2a", "logs": [transfer_log] }),
+            json!({
+                "status": "0x1", "blockNumber": "0x2a",
+                "logs": [
+                    transfer(token_in, contract, pool, 1_000),
+                    transfer(token_out, pool, owner, 4_200),
+                ],
+            }),
         )
         .await;
 
@@ -609,6 +662,7 @@ mod tests {
             .unwrap();
         let realised = live.execute(&prepared, None).await.unwrap();
         assert_eq!(realised.amount_out, Some(4_200));
+        assert_eq!(realised.amount_in, Some(1_000));
         assert_eq!(realised.provenance, Provenance::Simulated);
         assert_eq!(realised.tx_ref, Some(tx_hash.as_slice().to_vec()));
 
@@ -628,22 +682,19 @@ mod tests {
         let recipient = Address::from([0xDD; 20]);
         mount_send_plumbing(&server).await;
         mount_sufficient_allowance(&server).await;
-        let transfer_log = json!({
-            "address": token_out.to_string(),
-            "topics": [
-                transfer_topic().to_string(),
-                hex_data(&pad_address(router)),
-                hex_data(&pad_address(recipient)),
-            ],
-            "data": format_u256(U256::from(950u64)),
-        });
+        let live = EvmLive::new(connect(&server).await);
         mount_receipt(
             &server,
-            json!({ "status": "0x1", "blockNumber": "0x2a", "logs": [transfer_log] }),
+            json!({
+                "status": "0x1", "blockNumber": "0x2a",
+                "logs": [
+                    transfer(Address::from([0xAA; 20]), live.address(), router, 1_000),
+                    transfer(token_out, router, recipient, 950),
+                ],
+            }),
         )
         .await;
 
-        let live = EvmLive::new(connect(&server).await);
         let fixture = crate::testkit::contract::DexContractFixture {
             route: route(router, Address::from([0xAA; 20]), token_out, &[0xCA, 0xFE]),
             request: request(live.address(), recipient),
@@ -693,12 +744,163 @@ mod tests {
         let realised = live.execute(&prepared, None).await.unwrap();
 
         assert_eq!(realised.amount_out, None);
+        assert_eq!(realised.amount_in, None, "a revert took no input");
         assert_eq!(realised.provenance, Provenance::Landed);
         assert!(realised.tx_ref.is_some());
         match realised.outcome {
             Outcome::Reverted { reason: got } => assert_eq!(got, reason),
             other => panic!("expected Reverted, got {other:?}"),
         }
+    }
+
+    /// One swap of 1 000 through a router, by `payer`, whose receipt carries
+    /// the logs `logs` builds from the sender's address.
+    async fn swap_landing_with(
+        payer: Payer,
+        logs: impl FnOnce(Address) -> Vec<Value>,
+    ) -> Result<Realised> {
+        let server = MockServer::start().await;
+        mount_send_plumbing(&server).await;
+        mount_sufficient_allowance(&server).await;
+        let live = EvmLive::new(connect(&server).await);
+        mount_receipt(
+            &server,
+            json!({ "status": "0x1", "blockNumber": "0x2a", "logs": logs(live.address()) }),
+        )
+        .await;
+        let route = route(
+            Address::from([0x11; 20]),
+            Address::from([0xAA; 20]),
+            Address::from([0xBB; 20]),
+            &[0xCA, 0xFE],
+        );
+        let req = SwapRequest {
+            payer,
+            ..request(live.address(), Address::from([0xDD; 20]))
+        };
+        let prepared = live.prepare(&route, &req).await?;
+        live.execute(&prepared, None).await
+    }
+
+    /// A V3 swap that reaches its price limit takes less than it was given:
+    /// what is booked is what left the payer, not what the route offered.
+    #[tokio::test]
+    async fn a_swap_that_took_less_than_its_offer_reports_what_the_pool_took() {
+        let (router, pool, recipient) = (
+            Address::from([0x11; 20]),
+            Address::from([0x22; 20]),
+            Address::from([0xDD; 20]),
+        );
+        let (token_in, token_out) = (Address::from([0xAA; 20]), Address::from([0xBB; 20]));
+        let realised = swap_landing_with(Payer::Sender, |sender| {
+            vec![
+                transfer(token_in, sender, pool, 600),
+                transfer(token_out, pool, recipient, 550),
+            ]
+        })
+        .await
+        .unwrap();
+        assert_eq!(realised.amount_in, Some(600), "the offer was 1 000");
+        assert_eq!(realised.amount_out, Some(550));
+
+        // A router that pulled the whole offer and refunded the rest: the
+        // refund is netted off what it pulled.
+        let realised = swap_landing_with(Payer::Sender, |sender| {
+            vec![
+                transfer(token_in, sender, router, 1_000),
+                transfer(token_in, router, sender, 400),
+                transfer(token_in, router, pool, 600),
+                transfer(token_out, pool, recipient, 550),
+            ]
+        })
+        .await
+        .unwrap();
+        assert_eq!(realised.amount_in, Some(600));
+    }
+
+    /// Only the payer's own input counts: another address's transfers of the
+    /// same token, and the payer's transfers of another token, do not.
+    #[tokio::test]
+    async fn only_the_payers_own_transfers_of_the_input_token_count() {
+        let (pool, recipient, other) = (
+            Address::from([0x22; 20]),
+            Address::from([0xDD; 20]),
+            Address::from([0x33; 20]),
+        );
+        let (token_in, token_out) = (Address::from([0xAA; 20]), Address::from([0xBB; 20]));
+        let realised = swap_landing_with(Payer::Sender, |sender| {
+            vec![
+                transfer(token_in, other, pool, 5_000),
+                transfer(token_out, sender, other, 77),
+                transfer(token_in, sender, pool, 1_000),
+                transfer(token_out, pool, recipient, 950),
+            ]
+        })
+        .await
+        .unwrap();
+        assert_eq!(realised.amount_in, Some(1_000));
+    }
+
+    /// With a contract payer the input leaves the contract called, and the
+    /// sender's own transfers are not the swap's.
+    #[tokio::test]
+    async fn a_contract_payers_input_is_what_the_contract_called_paid() {
+        let (router, pool, recipient) = (
+            Address::from([0x11; 20]),
+            Address::from([0x22; 20]),
+            Address::from([0xDD; 20]),
+        );
+        let (token_in, token_out) = (Address::from([0xAA; 20]), Address::from([0xBB; 20]));
+        let logs = move |sender: Address| {
+            vec![
+                transfer(token_in, router, pool, 600),
+                transfer(token_in, sender, pool, 9),
+                transfer(token_out, pool, recipient, 550),
+            ]
+        };
+        let realised = swap_landing_with(Payer::CalledContract, logs)
+            .await
+            .unwrap();
+        assert_eq!(realised.amount_in, Some(600));
+
+        // The same receipt for a swap the sender paid is the sender's 9.
+        let realised = swap_landing_with(Payer::Sender, logs).await.unwrap();
+        assert_eq!(realised.amount_in, Some(9));
+    }
+
+    /// A swap that landed with no `Transfer` of the input out of its payer is
+    /// an error that says so, as one with no output `Transfer` is: a figure
+    /// guessed from the offer would be booked as what the pool took.
+    #[tokio::test]
+    async fn a_landed_swap_with_no_input_transfer_is_an_error() {
+        let (pool, recipient) = (Address::from([0x22; 20]), Address::from([0xDD; 20]));
+        let (token_in, token_out) = (Address::from([0xAA; 20]), Address::from([0xBB; 20]));
+        let err = swap_landing_with(Payer::Sender, |_| {
+            vec![
+                transfer(token_in, pool, recipient, 1_000),
+                transfer(token_out, pool, recipient, 950),
+            ]
+        })
+        .await
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("swap landed")
+                && text.contains("no ERC-20 Transfer of the input token out of its payer"),
+            "{text}"
+        );
+
+        // Nor does an input that came straight back count as spent.
+        let err = swap_landing_with(Payer::Sender, |sender| {
+            vec![
+                transfer(token_in, sender, pool, 1_000),
+                transfer(token_in, pool, sender, 1_000),
+                transfer(token_out, pool, recipient, 950),
+            ]
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("input token"), "{err}");
     }
 
     #[tokio::test]
@@ -725,6 +927,7 @@ mod tests {
         let realised = live.execute(&prepared, None).await.unwrap();
 
         assert_eq!(realised.amount_out, None);
+        assert_eq!(realised.amount_in, None, "a timeout says nothing was taken");
         assert_eq!(realised.provenance, Provenance::Landed);
         assert!(realised.tx_ref.is_some());
         assert!(matches!(realised.outcome, Outcome::TimedOut));

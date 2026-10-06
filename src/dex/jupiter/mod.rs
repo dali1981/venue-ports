@@ -14,12 +14,18 @@
 //! - **The amount out** is the destination token account's balance after,
 //!   less before: the recipient's associated token account for the output
 //!   mint, under the mint's own token program.
+//! - **The amount in** is the quote's `inAmount`, which is `route.amount_in`:
+//!   an `ExactIn` route (the only mode accepted) spends all of it or fails, and
+//!   slippage is a minimum on the output alone, so a swap that succeeded took
+//!   the whole offer. A swap that did not succeed took none.
 //!
 //! [`JupiterSimulated`] runs the built transaction as a dry run;
 //! [`JupiterLive`] signs and sends it through a `SolanaSender` (Simulated on
 //! a Surfpool fork; Live is not built until the owner asks).
 
 mod live;
+#[cfg(test)]
+mod mock_tests;
 mod simulated;
 #[cfg(test)]
 mod surfpool_tests;

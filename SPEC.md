@@ -270,7 +270,10 @@ pub enum TxCost {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EvmCost {
-    /// `None` where a dry run reports none.
+    /// A receipt's `gasUsed`. For a dry run on `EvmSimulated`, the node's
+    /// `eth_estimateGas` of the same call with the same overrides: what the
+    /// swap needs, which is at least what it uses. `None` where a dry run
+    /// reports none (a revert).
     pub gas_used: Option<u64>,
     pub effective_gas_price_wei: Option<u128>,
     /// A rollup's data fee, from the receipt.
@@ -320,6 +323,15 @@ pub struct Realised {
     /// timeout must never be represented as a zero amount — a zero is a
     /// real, terrible price; "no price" is a different fact.
     pub amount_out: Option<ChainAmount>,
+    /// The input the swap consumed, which can be less than the route's
+    /// `amount_in`: a V3 swap that reaches its price limit takes less than it
+    /// was given, and what the pool took is what is booked. `Some` exactly
+    /// when `outcome` is `Success`, as `amount_out` is: a swap that reverted,
+    /// timed out or expired consumed none that this reports, and no outcome
+    /// is represented as a zero input. A live adapter reads it from the
+    /// transaction (`EvmLive` from its `Transfer` logs); an adapter that
+    /// cannot observe it says what it reports instead (below).
+    pub amount_in: Option<ChainAmount>,
     pub outcome: Outcome,
     /// What it cost, whenever something ran, a revert included. A dry
     /// run's figures are what the run reported (an `eth_call` reports no
@@ -395,14 +407,39 @@ pub trait DexExecutor: Send + Sync {
   `MetaAggregationRouterV2.swap` and the other common aggregator routers put the output amount first.
   Fewer than 32 bytes is an error, never a panic. A router whose output is not its first word is read by a
   return rule set for its address, `EvmSimulated::with_return_rule(address, ReturnRule)`:
-  `ReturnRule::FirstWord` (the default) or `ReturnRule::LastOfArray`, the last element of one returned
+  `ReturnRule::FirstWord` (the default), `ReturnRule::LastOfArray`, the last element of one returned
   `uint256[]`, as Uniswap v2's and Aerodrome's `swapExactTokensForTokens` return every hop's amount with
-  the amount out last. Return data the rule cannot decode (an offset or a length past the data, an empty
-  array) is an error, never a figure; `EvmLive` needs no rule, since it reads the output's `Transfer`. The
-  simulation's `cost` is `TxCost::Evm` with every figure `None`: an `eth_call` reports no gas.
+  the amount out last, or `ReturnRule::Word(n)`, the `n`th (from 0) 32-byte word, for a function that
+  returns the amount out after something else. Return data the rule cannot decode (an offset or a length
+  past the data, a missing or oversized word, an empty array) is an error, never a figure; `EvmLive` needs
+  no rule, since it reads the output's `Transfer`. One address can hold functions that return different
+  layouts, so a rule can also be set for an address *and* a 4-byte selector, the first 4 bytes of the
+  call's calldata: `with_return_rule_for(address, selector, rule)` and
+  `with_input_rule_for(address, selector, rule)`. A call is read by the rule for its (address, selector),
+  else by the rule set for the address alone (`with_return_rule`, `with_input_rule`, which keep their
+  meaning), else by the default; calldata shorter than a selector has no selector's rule.
+  With no block given, a run reads the latest block (once, so that its probes and its swap see one state),
+  or the node's `pending` block after `EvmSimulated::with_pending_block()`, for a caller that priced from the
+  pending state (Base's Flashblocks); a block given to `execute` pins the run to it either way, and
+  `Realised::at` is the number of the block read, the number the node gives its pending block for `pending`
+  (a node with no pending block is an error). An `eth_call` reports no gas, so for a swap that ran the adapter
+  asks the node's `eth_estimateGas` for the same call (same sender, block and overrides), and the
+  simulation's `cost` is `TxCost::Evm` with that figure as `gas_used` and every other figure `None`. A swap
+  that reverted reports no gas. An `eth_estimateGas` that refuses a swap `eth_call` just ran is an `Err`:
+  the node disagreed with itself, and neither answer is the swap's. An `eth_call` shows no transfers, so
+  `amount_in` is what the router says it took or else its offer: the dry run gives the payer exactly
+  `route.amount_in`, and the amount in is that unless an input rule is set for the address called,
+  `EvmSimulated::with_input_rule(address, InputRule::Word(n))` (the `n`th 32-byte word of the return data, as
+  `PoolSwapper.swapV3` returns `amountInUsed`; a word that is missing, does not fit a `u128`, or exceeds the
+  offer is an error). `InputRule::Offered` is the default, right for a router that spends the exact input it is
+  given and a guess for one that can take less without saying so. `EvmLive`'s amount in is the input token's
+  `Transfer`s out of the payer (the sender, or the contract called) less any back to it; a landed swap with none
+  is an error naming its transaction, as one with no output `Transfer` is.
 - **`DexStub`** (today's `EvmStub`, renamed: it was never EVM-specific) — an in-process fake with no
   network calls at all. Must let a test program the exact `Realised` (or error) a given `execute()` call
-  returns, including reverts with a specific reason, a forced `TimedOut` and an `Expired`. Must record
+  returns, including reverts with a specific reason, a forced `TimedOut` and an `Expired`. A programmed
+  success takes the whole offer of the route it was prepared from (`program_success`), or the input the
+  test names (`program_success_taking`, a swap that reached its price limit). Must record
   every call it received (route, request, prepared value) so a test can assert on what was actually
   sent to it, not just on what it returned.
 
@@ -416,6 +453,9 @@ pub trait DexExecutor: Send + Sync {
 - **The amount out** is the destination token account's balance after, less before. It is read from
   `simulateTransaction`'s returned accounts (dry run), or from the landed transaction's post token
   balances.
+- **The amount in** is the quote's `inAmount`, which is `route.amount_in`: an `ExactIn` route (the only mode
+  accepted) spends all of it or fails, and slippage is a minimum on the output alone, so a swap that succeeded
+  took the whole offer.
 - **The cost** is `TxCost::Solana`, carrying the run's `unitsConsumed`.
 - **The payer** is the account that signs. Both adapters refuse `Payer::CalledContract` by name.
 
@@ -510,7 +550,14 @@ Rules:
 The EVM chain family's plumbing is shared by every EVM adapter rather than copied into each:
 `src/evm/rpc.rs` (`EvmRpc`: JSON-RPC, `eth_call` with `from` and state overrides, receipts,
 revert-reason replay, hex/ABI helpers) and `src/evm/erc20.rs` (selectors, balance and allowance reads,
-storage-slot probing).
+storage-slot probing). The probing is one prober for every adapter: a token's `balanceOf` and `allowance`
+mappings are found once per token, in one `eth_call` each, by writing a sentinel of its own into the slot
+each candidate base would put the entry at and reading back which one the token returns. The candidates are
+the first 24 storage slots and OpenZeppelin v5's ERC-7201 namespace for its upgradeable ERC-20
+(`erc7201:openzeppelin.storage.ERC20`, where MORPHO on Base keeps its state: the balances at the namespace,
+the allowances one slot on, both checked against the storage `ERC20Upgradeable` v5.6.1 and v5.7.0 write). A
+token that keeps them anywhere else is an error naming what was probed, and a node that did not answer is an
+error, never "no candidate".
 
 ### The Solana family — one sender per wallet and cluster
 
@@ -982,6 +1029,17 @@ fill whose details cannot be read (for example commission charged in more than o
 `CexFill` cannot hold) all become `OrderStateUnknown`. None of them may surface as a plain error, and
 no fill is ever returned with a guessed commission.
 
+**Every `Err` from `execute` carries the provenance of the order it is the failure of**: the one a fill
+from that executor would carry, `Landed` for a live adapter (a refusal before anything was sent included)
+and `Simulated` for a stub or a paper model. It is a layer of the error's chain, `ErrorProvenance`,
+found with `downcast_ref` or read with `cex::provenance_of(&err)`, and attached with
+`cex::with_provenance(err, provenance)`: an error that already carries one keeps it. The layer's
+`Display` is the message of the layer it covers, so an error's `to_string()` is what it was without it,
+and whatever else is in the chain, `OrderStateUnknown` included, is still found by `downcast_ref`.
+`OrderStateUnknown` itself gains no field, so a caller that builds one by struct literal is unaffected;
+it attaches the provenance with `with_provenance` when it returns the error. (`{:#}` of an error tagged
+after the fact says its top-level message twice; an `OrderStateUnknown` this crate builds does not.)
+
 ### Required implementations (CEX)
 
 - **`CexLive`** — places a real order against a venue's trading API. Responsible for: rounding
@@ -1156,6 +1214,8 @@ pub async fn dex_executor_contract(executor: &dyn DexExecutor, sends: Sends, fix
     // Shape assertions every implementation must satisfy, regardless of
     // mode:
     assert_eq!(realised.amount_out.is_some(), matches!(realised.outcome, Outcome::Success));
+    assert_eq!(realised.amount_in.is_some(), matches!(realised.outcome, Outcome::Success));
+    assert!(realised.amount_in.map_or(true, |taken| taken <= fixture.route.amount_in));
     assert_eq!(realised.tx_ref.is_some(), sends == Sends::Transactions);
     if realised.provenance == Provenance::Landed {
         assert_eq!(sends, Sends::Transactions);

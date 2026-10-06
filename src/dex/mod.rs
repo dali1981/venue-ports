@@ -230,7 +230,10 @@ pub enum TxCost {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EvmCost {
-    /// `None` where a dry run reports none.
+    /// A receipt's `gasUsed`. For a dry run on `EvmSimulated`, the node's
+    /// `eth_estimateGas` of the same call with the same overrides: what the
+    /// swap needs, which is at least what it uses. `None` where a dry run
+    /// reports none (a revert).
     pub gas_used: Option<u64>,
     pub effective_gas_price_wei: Option<u128>,
     /// A rollup's data fee, from the receipt.
@@ -304,10 +307,22 @@ pub struct Realised {
     /// timeout must never be represented as a zero amount — a zero is a
     /// real, terrible price; "no price" is a different fact.
     pub amount_out: Option<ChainAmount>,
+    /// The input the swap consumed, which can be less than the route's
+    /// `amount_in`: a V3 swap that reaches its price limit takes less than it
+    /// was given, and what the pool took is what is booked. `Some` exactly
+    /// when `outcome` is `Success`, as `amount_out` is: a swap that reverted,
+    /// timed out or expired consumed none that this reports, and no outcome
+    /// is represented as a zero input. A live adapter reads it from the
+    /// transaction (`EvmLive` from its `Transfer` logs); an adapter that
+    /// cannot observe it says in its docs what it reports instead
+    /// (`EvmSimulated`, `InputRule`).
+    pub amount_in: Option<ChainAmount>,
     pub outcome: Outcome,
     /// What it cost, whenever something ran, a revert included. A dry run's
-    /// figures are what the run reported: an `eth_call` reports no gas, and
-    /// `simulateTransaction` reports `unitsConsumed`.
+    /// figures are what the run reported: an `eth_call` reports no gas, so
+    /// `EvmSimulated` asks the node's `eth_estimateGas` for a swap that ran
+    /// and reports none for one that reverted, and `simulateTransaction`
+    /// reports `unitsConsumed`.
     pub cost: TxCost,
     /// The block (or slot) the outcome was observed at.
     pub at: u64,

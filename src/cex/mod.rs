@@ -91,13 +91,75 @@ impl std::fmt::Display for OrderStateUnknown {
 impl std::error::Error for OrderStateUnknown {}
 
 impl OrderStateUnknown {
-    /// This value as the error `execute` returns, with `why` as context.
-    /// `downcast_ref::<OrderStateUnknown>()` still finds it under the
-    /// context.
-    pub(crate) fn because(self, why: impl std::fmt::Display) -> anyhow::Error {
-        let why = format!("{why:#}");
-        anyhow::Error::new(self).context(why)
+    /// This value as the error `execute` returns, with `why` as its message
+    /// and `provenance` attached. `downcast_ref::<OrderStateUnknown>()` still
+    /// finds it under them, and `why` is said once: the provenance is carried
+    /// by the layer that holds `why`.
+    pub(crate) fn because(
+        self,
+        provenance: Provenance,
+        why: impl std::fmt::Display,
+    ) -> anyhow::Error {
+        let message = format!("{why:#}");
+        anyhow::Error::new(self).context(ErrorProvenance {
+            provenance,
+            message,
+        })
     }
+}
+
+/// Which provenance an `Err` from [`CexExecutor::execute`] came from: the one
+/// a fill from that executor would carry. `Landed` for an executor that sends
+/// to a venue (a refusal before anything was sent included, since it is the
+/// refusal of an order that would have been), `Simulated` for a stub or a
+/// paper model. An [`OrderStateUnknown`] carries it too, so a caller records
+/// where the unresolved order is without being told by whoever built the
+/// executor.
+///
+/// It is a layer of the error's chain, found with `downcast_ref` like
+/// `OrderStateUnknown`, or read with [`provenance_of`], and added with
+/// [`with_provenance`]. It leaves the error as it was: its `Display` is the
+/// message of the layer it was added over, so `to_string()` of the error is
+/// the same with or without it, and whatever else is in the chain
+/// (`OrderStateUnknown` included) is still found by `downcast_ref`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorProvenance {
+    pub provenance: Provenance,
+    message: String,
+}
+
+impl std::fmt::Display for ErrorProvenance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ErrorProvenance {}
+
+/// `err` with `provenance` attached, for an executor to return from
+/// `execute`: every adapter in this crate does, and a consumer's paper model
+/// does the same with `Provenance::Simulated`. An error that already carries
+/// one keeps it, since whoever attached it first knew the order best.
+///
+/// `to_string()` of the result is `err`'s. `{:#}` of one tagged after the fact
+/// says the top-level message twice (once as the tag, once as the layer it
+/// was added over); an [`OrderStateUnknown`] built by this crate does not.
+pub fn with_provenance(err: anyhow::Error, provenance: Provenance) -> anyhow::Error {
+    if provenance_of(&err).is_some() {
+        return err;
+    }
+    let message = err.to_string();
+    err.context(ErrorProvenance {
+        provenance,
+        message,
+    })
+}
+
+/// The provenance an `Err` from [`CexExecutor::execute`] carries, or `None`
+/// if the executor that returned it did not attach one.
+pub fn provenance_of(err: &anyhow::Error) -> Option<Provenance> {
+    err.downcast_ref::<ErrorProvenance>()
+        .map(|tag| tag.provenance)
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +214,11 @@ pub trait CexExecutor: Send + Sync {
     /// After a venue accepts an order, a lost response, a failed status
     /// query, or a fill whose details cannot be read all become
     /// `OrderStateUnknown`, never a plain error.
+    ///
+    /// Every `Err` carries the provenance of the order it is the failure of
+    /// ([`provenance_of`]): an implementation attaches it with
+    /// [`with_provenance`], and a caller reads it there rather than being
+    /// handed the executor's.
     async fn execute(&self, req: &OrderRequest) -> Result<CexFill>;
 
     fn label(&self) -> &'static str;
@@ -274,18 +341,82 @@ mod tests {
         );
     }
 
-    #[test]
-    fn state_unknown_with_context_is_still_found_by_downcast() {
-        let err = OrderStateUnknown {
+    fn unknown() -> OrderStateUnknown {
+        OrderStateUnknown {
             symbol: "SOLUSDT".to_string(),
             client_order_id: "vp-1".to_string(),
             order_ref: Some(7),
         }
-        .because("the status query failed");
+    }
+
+    #[test]
+    fn state_unknown_with_context_is_still_found_by_downcast() {
+        let err = unknown().because(Provenance::Landed, "the status query failed");
         assert_eq!(err.to_string(), "the status query failed");
         assert_eq!(
             err.downcast_ref::<OrderStateUnknown>().unwrap().order_ref,
             Some(7)
         );
+    }
+
+    /// The provenance rides on the layer that holds the message, so the
+    /// error reads as it did before it carried one.
+    #[test]
+    fn state_unknown_carries_its_provenance_without_saying_its_message_twice() {
+        let err = unknown().because(Provenance::Landed, "the status query failed");
+        assert_eq!(provenance_of(&err), Some(Provenance::Landed));
+        assert_eq!(
+            format!("{err:#}"),
+            "the status query failed: the state of order vp-1 on SOLUSDT is unknown: \
+             it may have filled in part, in full or not at all (venue order id 7)"
+        );
+    }
+
+    /// An order state unknown built by a struct literal, as a consumer's
+    /// tests build one, is still an `OrderStateUnknown` once it is tagged,
+    /// and says what it said.
+    #[test]
+    fn a_tagged_error_keeps_its_message_and_the_typed_error_under_it() {
+        let bare: anyhow::Error = unknown().into();
+        let said = bare.to_string();
+        assert_eq!(provenance_of(&bare), None);
+
+        let tagged = with_provenance(bare, Provenance::Simulated);
+        assert_eq!(tagged.to_string(), said);
+        assert_eq!(provenance_of(&tagged), Some(Provenance::Simulated));
+        assert_eq!(tagged.downcast_ref::<OrderStateUnknown>(), Some(&unknown()));
+
+        let plain = with_provenance(anyhow::anyhow!("order rejected: no"), Provenance::Landed);
+        assert_eq!(plain.to_string(), "order rejected: no");
+        assert_eq!(provenance_of(&plain), Some(Provenance::Landed));
+        // The cost of tagging after the fact, which `with_provenance` says.
+        assert_eq!(
+            format!("{plain:#}"),
+            "order rejected: no: order rejected: no"
+        );
+        assert!(plain.downcast_ref::<OrderStateUnknown>().is_none());
+    }
+
+    #[test]
+    fn the_provenance_survives_context_added_above_it() {
+        let err = with_provenance(anyhow::anyhow!("refused"), Provenance::Landed)
+            .context("placing the hedge");
+        assert_eq!(err.to_string(), "placing the hedge");
+        assert_eq!(provenance_of(&err), Some(Provenance::Landed));
+
+        let err = unknown()
+            .because(Provenance::Simulated, "lost")
+            .context("placing the hedge");
+        assert_eq!(provenance_of(&err), Some(Provenance::Simulated));
+        assert!(err.downcast_ref::<OrderStateUnknown>().is_some());
+    }
+
+    /// Whoever tagged an error first knew the order best.
+    #[test]
+    fn an_error_that_carries_a_provenance_keeps_it() {
+        let landed = unknown().because(Provenance::Landed, "lost");
+        let retagged = with_provenance(landed, Provenance::Simulated);
+        assert_eq!(provenance_of(&retagged), Some(Provenance::Landed));
+        assert_eq!(retagged.to_string(), "lost");
     }
 }

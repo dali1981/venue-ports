@@ -77,6 +77,20 @@ pub async fn dex_executor_contract(
         realised.amount_out.is_some(),
         matches!(realised.outcome, Outcome::Success)
     );
+    // The input taken is known exactly when the output is, and a swap
+    // takes no more than it was offered.
+    assert_eq!(
+        realised.amount_in.is_some(),
+        matches!(realised.outcome, Outcome::Success),
+        "amount_in against the outcome: {realised:?}"
+    );
+    if let Some(amount_in) = realised.amount_in {
+        assert!(
+            amount_in <= fixture.route.amount_in,
+            "a swap took {amount_in} of an offer of {}: {realised:?}",
+            fixture.route.amount_in
+        );
+    }
     assert_tx_ref_shape(&realised.tx_ref, realised.provenance, sends, &realised);
 }
 
@@ -357,7 +371,8 @@ pub fn assert_fill_shape(fill: &CexFill, label: &str) {
 /// error — nothing filled, so never an [`OrderStateUnknown`] — rather than
 /// send an order it cannot guard (`SPEC.md` §6). That nothing reached the
 /// venue is the caller's to assert, e.g. with a mock server that expects no
-/// request.
+/// request. Like every `Err` from `execute`, the refusal carries the
+/// provenance of the order it refused ([`crate::cex::provenance_of`]).
 pub async fn cex_spot_rejects_reduce_only(executor: &dyn CexExecutor, fixture: CexContractFixture) {
     let request = OrderRequest {
         reduce_only: true,
@@ -371,6 +386,10 @@ pub async fn cex_spot_rejects_reduce_only(executor: &dyn CexExecutor, fixture: C
     assert!(
         err.downcast_ref::<OrderStateUnknown>().is_none(),
         "a refusal before sending is not an unknown order state: {err}"
+    );
+    assert!(
+        crate::cex::provenance_of(&err).is_some(),
+        "an Err from execute carries its provenance (cex::with_provenance): {err:#}"
     );
 }
 
