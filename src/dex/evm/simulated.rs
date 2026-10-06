@@ -493,7 +493,7 @@ impl DexExecutor for EvmSimulated {
                 })
             }
             Err(err) => match err.downcast::<RpcError>() {
-                Ok(revert) => Ok(Realised {
+                Ok(revert) if revert.is_revert() => Ok(Realised {
                     amount_out: None,
                     amount_in: None,
                     outcome: Outcome::Reverted {
@@ -504,6 +504,12 @@ impl DexExecutor for EvmSimulated {
                     provenance: Provenance::Simulated,
                     tx_ref: None,
                 }),
+                // The node refused the call without running it: a rate limit,
+                // a timeout, state it no longer holds. It says nothing about
+                // the swap, and a revert is a fact about the swap: so it is
+                // an error, never an outcome a caller would count.
+                Ok(refused) => Err(anyhow::Error::new(refused)
+                    .context("the node could not run the swap's eth_call")),
                 Err(transport_err) => Err(transport_err),
             },
         }
@@ -1503,6 +1509,105 @@ mod tests {
             requests(&server, "eth_estimateGas").await.is_empty(),
             "a swap that reverted has no gas to ask for"
         );
+    }
+
+    /// A node whose swap `eth_call` (the one with `calldata`) answers `error`,
+    /// and any other `eth_call` zero: what the slot probes get.
+    async fn mount_swap_error(server: &MockServer, calldata: &[u8], error: Json) {
+        let expected_calldata = calldata.to_vec();
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({ "method": "eth_call" })))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: Json = req.body_json().unwrap();
+                let data = decode_hex(body["params"][0]["data"].as_str().unwrap()).unwrap();
+                if data == expected_calldata {
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({ "jsonrpc": "2.0", "id": 1, "error": error.clone() }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "jsonrpc": "2.0", "id": 1, "result": format_u256(U256::ZERO),
+                    }))
+                }
+            })
+            .mount(server)
+            .await;
+    }
+
+    /// Runs one swap whose `eth_call` answers `error`, and returns what the
+    /// dry run said, with the node asked for no gas.
+    async fn swap_answering(error: Json) -> (Result<Realised>, usize) {
+        let server = MockServer::start().await;
+        let router = [0x11; 20];
+        let calldata = vec![0xff; 4];
+        let sender = Address::from([0xCC; 20]);
+        mount_slot_probe(&server, BALANCE_OF_SELECTOR, mapping_slot(sender, 0)).await;
+        mount_slot_probe(
+            &server,
+            ALLOWANCE_SELECTOR,
+            allowance_slot(sender, Address::from(router), 0),
+        )
+        .await;
+        mount_swap_error(&server, &calldata, error).await;
+        let adapter = EvmSimulated::new(EvmRpc::new(server.uri()));
+        let said = run(&adapter, router, &calldata).await;
+        (said, requests(&server, "eth_estimateGas").await.len())
+    }
+
+    /// Only the call reverting is an outcome: a node that cannot run the call
+    /// says nothing about the swap, so a rate limit, state the node no longer
+    /// holds and a timeout reported as a JSON-RPC error are errors, never a
+    /// `Reverted` a caller would count as the swap's own answer.
+    #[tokio::test]
+    async fn a_node_that_cannot_run_the_call_is_an_error_not_a_revert() {
+        for error in [
+            json!({ "code": -32005, "message": "rate limit exceeded" }),
+            json!({ "code": -32000, "message": "missing trie node 5c8a (path ) state 0x5c8a is not available" }),
+            json!({ "code": -32000, "message": "header not found" }),
+            json!({ "code": -32603, "message": "request timed out", "data": "upstream took too long" }),
+        ] {
+            let message = error["message"].as_str().unwrap().to_string();
+            let (said, gas_asked) = swap_answering(error).await;
+            let err = said.expect_err(&format!("{message} is not an outcome"));
+            assert!(format!("{err:#}").contains(&message), "{err:#}");
+            assert_eq!(
+                gas_asked, 0,
+                "{message}: nothing ran, so no gas is asked for"
+            );
+        }
+    }
+
+    /// What a revert looks like across nodes: revert data, or a message that
+    /// says so, with or without a code.
+    #[tokio::test]
+    async fn a_call_that_reverted_is_an_outcome_however_the_node_words_it() {
+        let reason = "STF";
+        let data = format!("0x{}", hex::encode(encode_error_string(reason)));
+        for (error, expected) in [
+            (
+                json!({ "code": 3, "message": "execution reverted", "data": data }),
+                reason,
+            ),
+            // No data, but the message says it.
+            (
+                json!({ "code": -32000, "message": "execution reverted" }),
+                "execution reverted",
+            ),
+            (
+                json!({ "code": -32015, "message": "VM Exception: Reverted" }),
+                "VM Exception: Reverted",
+            ),
+            // Data under `data.data`, as some nodes nest it, with a message that does not say it.
+            (
+                json!({ "code": -32015, "message": "VM execution error.", "data": { "data": data } }),
+                reason,
+            ),
+        ] {
+            let (said, _) = swap_answering(error.clone()).await;
+            match said.unwrap_or_else(|e| panic!("{error}: {e:#}")).outcome {
+                Outcome::Reverted { reason: got } => assert_eq!(got, expected, "{error}"),
+                other => panic!("{error}: expected Reverted, got {other:?}"),
+            }
+        }
     }
 
     /// The block a request was made at: the second parameter of `eth_call`
