@@ -26,6 +26,14 @@
 //! [`InputRule::Word`] for it with [`EvmSimulated::with_input_rule`]. A swap
 //! that reverted took none.
 //!
+//! **Rules per function.** One address can hold functions that return
+//! different layouts (`PoolSwapper.swapV3` returns `(amountInUsed, amountOut)`,
+//! its `swapV2` just `amountOut`), so a rule can also be set for an address
+//! *and* a 4-byte selector, the first 4 bytes of the call's calldata
+//! ([`EvmSimulated::with_return_rule_for`], [`EvmSimulated::with_input_rule_for`]).
+//! A call is read by the rule for its (address, selector), else by the
+//! address's own rule (the one set without a selector), else by the default.
+//!
 //! **Gas.** A swap that ran is also put to the node's `eth_estimateGas`, with
 //! the same sender, block and overrides, and `EvmCost::gas_used` is its
 //! answer: what the swap needs, which is at least what it uses. A swap that
@@ -64,7 +72,8 @@
 //! returns every hop's amount as one `uint256[]` (Uniswap v2's and
 //! Aerodrome's `swapExactTokensForTokens`) has its first word read as the
 //! array's offset, so its caller sets [`ReturnRule::LastOfArray`] for it
-//! with [`EvmSimulated::with_return_rule`]. Return data the rule cannot
+//! with [`EvmSimulated::with_return_rule`]. A function that puts it
+//! elsewhere is read by [`ReturnRule::Word`]. Return data the rule cannot
 //! decode is an error, never a panic.
 
 use crate::dex::{
@@ -114,6 +123,11 @@ pub enum ReturnRule {
     /// The last element of a returned `uint256[]`: a router that returns
     /// every hop's amount, the amount out last.
     LastOfArray,
+    /// The `n`th (from 0) 32-byte word of the return data, for a function
+    /// that returns the amount out after something else, as
+    /// `PoolSwapper.swapV3` returns `(amountInUsed, amountOut)`. A word that
+    /// is missing, or does not fit a `u128`, is an error, never a figure.
+    Word(usize),
 }
 
 impl ReturnRule {
@@ -121,8 +135,23 @@ impl ReturnRule {
         match self {
             ReturnRule::FirstWord => first_word(data),
             ReturnRule::LastOfArray => last_of_uint_array(data),
+            ReturnRule::Word(n) => nth_word(data, n, "an amount out"),
         }
     }
+}
+
+/// The `n`th (from 0) 32-byte word of `data`; `names` is what the caller
+/// takes it for, for the error when `data` has no such word.
+fn nth_word(data: &[u8], n: usize, names: &str) -> Result<U256> {
+    n.checked_mul(32)
+        .and_then(|from| data.get(from..from.checked_add(32)?))
+        .map(U256::from_be_slice)
+        .ok_or_else(|| {
+            anyhow!(
+                "no word {n} in {} bytes of return data: it names no {names}",
+                data.len()
+            )
+        })
 }
 
 /// Where the input a swap consumed is, for a router that returns it.
@@ -147,16 +176,7 @@ impl InputRule {
         match self {
             InputRule::Offered => Ok(offered),
             InputRule::Word(n) => {
-                let word = n
-                    .checked_mul(32)
-                    .and_then(|from| data.get(from..from.checked_add(32)?))
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "no word {n} in {} bytes of return data: it names no input taken",
-                            data.len()
-                        )
-                    })?;
-                let taken: ChainAmount = U256::from_be_slice(word)
+                let taken: ChainAmount = nth_word(data, n, "input taken")?
                     .try_into()
                     .context("the input taken overflowed u128")?;
                 if taken > offered {
@@ -168,13 +188,46 @@ impl InputRule {
     }
 }
 
+/// The rules of one kind, set for an address (whatever it is called with) or
+/// for an address and the 4-byte selector of the function called.
+#[derive(Debug)]
+struct Rules<R> {
+    by_call: HashMap<(Address, Option<[u8; 4]>), R>,
+}
+
+impl<R> Default for Rules<R> {
+    fn default() -> Self {
+        Self {
+            by_call: HashMap::new(),
+        }
+    }
+}
+
+impl<R: Copy + Default> Rules<R> {
+    fn set(&mut self, address: Address, selector: Option<[u8; 4]>, rule: R) {
+        self.by_call.insert((address, selector), rule);
+    }
+
+    /// The rule for a call of `address` with `calldata`: the one set for its
+    /// selector, else the one set for the address, else the default. Calldata
+    /// shorter than a selector has none, so only the last two apply.
+    fn for_call(&self, address: Address, calldata: &[u8]) -> R {
+        let selector = calldata.get(..4).and_then(|s| <[u8; 4]>::try_from(s).ok());
+        selector
+            .and_then(|selector| self.by_call.get(&(address, Some(selector))))
+            .or_else(|| self.by_call.get(&(address, None)))
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
 pub struct EvmSimulated {
     rpc: EvmRpc,
     pending: Mutex<HashMap<B256, PendingSimulation>>,
     slots: SlotCache,
     code: HashMap<Address, CodeOverride>,
-    returns: HashMap<Address, ReturnRule>,
-    inputs: HashMap<Address, InputRule>,
+    returns: Rules<ReturnRule>,
+    inputs: Rules<InputRule>,
     /// Whether a run with no block given reads the node's `pending` block
     /// rather than its latest one.
     pending_block: bool,
@@ -187,8 +240,8 @@ impl EvmSimulated {
             pending: Mutex::new(HashMap::new()),
             slots: SlotCache::default(),
             code: HashMap::new(),
-            returns: HashMap::new(),
-            inputs: HashMap::new(),
+            returns: Rules::default(),
+            inputs: Rules::default(),
             pending_block: false,
         }
     }
@@ -204,16 +257,45 @@ impl EvmSimulated {
     }
 
     /// Reads the amount out of a call to `address` by `rule` rather than
-    /// from its first word.
+    /// from its first word: for every function of `address` that has no rule
+    /// of its own ([`with_return_rule_for`](Self::with_return_rule_for)).
     pub fn with_return_rule(mut self, address: Address, rule: ReturnRule) -> Self {
-        self.returns.insert(address, rule);
+        self.returns.set(address, None, rule);
+        self
+    }
+
+    /// As [`with_return_rule`](Self::with_return_rule), for calls to `address`
+    /// whose calldata starts with `selector` only, and in preference to the
+    /// rule set for the address as a whole.
+    pub fn with_return_rule_for(
+        mut self,
+        address: Address,
+        selector: [u8; 4],
+        rule: ReturnRule,
+    ) -> Self {
+        self.returns.set(address, Some(selector), rule);
         self
     }
 
     /// Reads the input a swap consumed from a call to `address` by `rule`
-    /// rather than taking the whole offer.
+    /// rather than taking the whole offer: for every function of `address`
+    /// that has no rule of its own
+    /// ([`with_input_rule_for`](Self::with_input_rule_for)).
     pub fn with_input_rule(mut self, address: Address, rule: InputRule) -> Self {
-        self.inputs.insert(address, rule);
+        self.inputs.set(address, None, rule);
+        self
+    }
+
+    /// As [`with_input_rule`](Self::with_input_rule), for calls to `address`
+    /// whose calldata starts with `selector` only, and in preference to the
+    /// rule set for the address as a whole.
+    pub fn with_input_rule_for(
+        mut self,
+        address: Address,
+        selector: [u8; 4],
+        rule: InputRule,
+    ) -> Self {
+        self.inputs.set(address, Some(selector), rule);
         self
     }
 
@@ -365,13 +447,12 @@ impl DexExecutor for EvmSimulated {
             .await
         {
             Ok(data) => {
-                let rule = self.returns.get(&router).copied().unwrap_or_default();
+                let rule = self.returns.for_call(router, &prepared.calldata);
                 let amount_out: u128 = rule
                     .amount_out(&data)
-                    .with_context(|| format!("decoding {router}'s return data by {rule:?}"))?
-                    .try_into()
-                    .context("amount_out overflowed u128")?;
-                let input_rule = self.inputs.get(&router).copied().unwrap_or_default();
+                    .and_then(|out| u128::try_from(out).context("amount_out overflowed u128"))
+                    .with_context(|| format!("decoding {router}'s return data by {rule:?}"))?;
+                let input_rule = self.inputs.for_call(router, &prepared.calldata);
                 let amount_in = input_rule
                     .amount_in(&data, ctx.amount_in)
                     .with_context(|| {
@@ -536,6 +617,74 @@ mod tests {
             })
             .mount(server)
             .await;
+    }
+
+    /// The probes for `router`, and a node whose swap calls answer by their
+    /// calldata: each `(calldata, return data)` of `calls` returns its own
+    /// data, any other `eth_call` gets zero. For one address that holds
+    /// several functions.
+    async fn mount_router_calls(
+        server: &MockServer,
+        router: [u8; 20],
+        calls: Vec<(Vec<u8>, Vec<u8>)>,
+    ) {
+        mount_probes(server, router).await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({ "method": "eth_call" })))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: Json = req.body_json().unwrap();
+                let data = decode_hex(body["params"][0]["data"].as_str().unwrap()).unwrap();
+                let result = calls
+                    .iter()
+                    .find(|(calldata, _)| *calldata == data)
+                    .map_or_else(
+                        || format_u256(U256::ZERO),
+                        |(_, returned)| format!("0x{}", hex::encode(returned)),
+                    );
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+            })
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({ "method": "eth_estimateGas" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({ "jsonrpc": "2.0", "id": 1, "result": format!("0x{ESTIMATED_GAS:x}") }),
+            ))
+            .mount(server)
+            .await;
+    }
+
+    /// `keccak256(signature)[..4]`: the selector of a function.
+    fn selector_of(signature: &str) -> [u8; 4] {
+        alloy_primitives::keccak256(signature.as_bytes())[..4]
+            .try_into()
+            .unwrap()
+    }
+
+    /// A call of the function `selector`, with one word of arguments.
+    fn call_of(selector: [u8; 4], arg: u8) -> Vec<u8> {
+        let mut calldata = selector.to_vec();
+        calldata.extend_from_slice(&[arg; 32]);
+        calldata
+    }
+
+    /// Return data of one 32-byte word per figure.
+    fn words(figures: &[u64]) -> Vec<u8> {
+        figures
+            .iter()
+            .flat_map(|figure| U256::from(*figure).to_be_bytes::<32>())
+            .collect()
+    }
+
+    /// Prepares `calldata` to `router` for the fixed route and sender, and
+    /// runs it at block 1.
+    async fn run(adapter: &EvmSimulated, router: [u8; 20], calldata: &[u8]) -> Result<Realised> {
+        let prepared = adapter
+            .prepare(&route(payload_for(router, calldata)), &request())
+            .await
+            .unwrap();
+        adapter.execute(&prepared, Some(1)).await
     }
 
     /// A simulation runs the call at the sender's policy: a bid above it is
@@ -964,6 +1113,263 @@ mod tests {
                 "{expected}: {text}"
             );
         }
+    }
+
+    const SWAP_V3: &str = "swapV3(address,bool,uint256,uint160,uint256,uint256)";
+    const SWAP_V2: &str = "swapV2(address,bool,uint256,uint256,uint256)";
+
+    /// `PoolSwapper` has two functions at one address with two return
+    /// layouts: `swapV3` returns `(amountInUsed, amountOut)`, and the pool may
+    /// have stopped at the price limit with part of the offer unspent;
+    /// `swapV2` returns `amountOut`, having sent the pair exactly the offer.
+    /// One adapter reads each by its own rules.
+    #[tokio::test]
+    async fn two_functions_at_one_address_are_each_read_by_their_own_rules() {
+        let server = MockServer::start().await;
+        let pool_swapper = [0x11; 20];
+        let (v3, v2) = (selector_of(SWAP_V3), selector_of(SWAP_V2));
+        let (v3_call, v2_call) = (call_of(v3, 0x01), call_of(v2, 0x02));
+        // 1 000 offered: swapV3 used 600 of it (!= its 550 out) and swapV2
+        // paid out 870.
+        mount_router_calls(
+            &server,
+            pool_swapper,
+            vec![
+                (v3_call.clone(), words(&[600, 550])),
+                (v2_call.clone(), words(&[870])),
+            ],
+        )
+        .await;
+
+        let address = Address::from(pool_swapper);
+        let adapter = EvmSimulated::new(EvmRpc::new(server.uri()))
+            .with_return_rule_for(address, v3, ReturnRule::Word(1))
+            .with_input_rule_for(address, v3, InputRule::Word(0))
+            .with_return_rule_for(address, v2, ReturnRule::FirstWord)
+            .with_input_rule_for(address, v2, InputRule::Offered);
+
+        let swap_v3 = run(&adapter, pool_swapper, &v3_call).await.unwrap();
+        assert_eq!(swap_v3.amount_out, Some(550), "swapV3's second word");
+        assert_eq!(
+            swap_v3.amount_in,
+            Some(600),
+            "swapV3's first word, not the offer"
+        );
+        assert!(matches!(swap_v3.outcome, Outcome::Success));
+
+        let swap_v2 = run(&adapter, pool_swapper, &v2_call).await.unwrap();
+        assert_eq!(swap_v2.amount_out, Some(870));
+        assert_eq!(
+            swap_v2.amount_in,
+            Some(1_000),
+            "swapV2 takes exactly the offer"
+        );
+        assert!(matches!(swap_v2.outcome, Outcome::Success));
+    }
+
+    /// The rule for a function wins over the address's rule, for that
+    /// function only, whichever was set first; the address's other functions
+    /// keep the address's rule.
+    #[tokio::test]
+    async fn a_selector_rule_beats_the_address_rule_for_its_selector_only() {
+        let server = MockServer::start().await;
+        let router = [0x11; 20];
+        let (ruled, other) = ([0xa1, 0xa2, 0xa3, 0xa4], [0xb1, 0xb2, 0xb3, 0xb4]);
+        let (ruled_call, other_call) = (call_of(ruled, 1), call_of(other, 2));
+        // Both functions return (111, 222) for an offer of 1 000.
+        mount_router_calls(
+            &server,
+            router,
+            vec![
+                (ruled_call.clone(), words(&[111, 222])),
+                (other_call.clone(), words(&[111, 222])),
+            ],
+        )
+        .await;
+
+        let address = Address::from(router);
+        let adapter = EvmSimulated::new(EvmRpc::new(server.uri()))
+            // The function's rules are set before the address's.
+            .with_return_rule_for(address, ruled, ReturnRule::Word(0))
+            .with_input_rule_for(address, ruled, InputRule::Offered)
+            .with_return_rule(address, ReturnRule::Word(1))
+            .with_input_rule(address, InputRule::Word(1));
+
+        let realised = run(&adapter, router, &ruled_call).await.unwrap();
+        assert_eq!(realised.amount_out, Some(111), "its own return rule");
+        assert_eq!(realised.amount_in, Some(1_000), "its own input rule");
+
+        let realised = run(&adapter, router, &other_call).await.unwrap();
+        assert_eq!(realised.amount_out, Some(222), "the address's return rule");
+        assert_eq!(realised.amount_in, Some(222), "the address's input rule");
+    }
+
+    /// A rule for a function leaves the address's other functions, and every
+    /// other address, on the defaults: a first word out, the whole offer in.
+    #[tokio::test]
+    async fn a_selector_rule_alone_leaves_the_rest_on_the_defaults() {
+        let server = MockServer::start().await;
+        let router = [0x11; 20];
+        let (ruled, other) = ([0xa1, 0xa2, 0xa3, 0xa4], [0xb1, 0xb2, 0xb3, 0xb4]);
+        let (ruled_call, other_call) = (call_of(ruled, 1), call_of(other, 2));
+        mount_router_calls(
+            &server,
+            router,
+            vec![
+                (ruled_call.clone(), words(&[111, 222])),
+                (other_call.clone(), words(&[111, 222])),
+            ],
+        )
+        .await;
+
+        // The rules are for `ruled` at the router, and for `other` at
+        // another address.
+        let adapter = EvmSimulated::new(EvmRpc::new(server.uri()))
+            .with_return_rule_for(Address::from(router), ruled, ReturnRule::Word(1))
+            .with_input_rule_for(Address::from(router), ruled, InputRule::Word(1))
+            .with_return_rule_for(Address::from([0x22; 20]), other, ReturnRule::Word(1))
+            .with_input_rule_for(Address::from([0x22; 20]), other, InputRule::Word(1));
+
+        let realised = run(&adapter, router, &ruled_call).await.unwrap();
+        assert_eq!(
+            (realised.amount_out, realised.amount_in),
+            (Some(222), Some(222))
+        );
+
+        let realised = run(&adapter, router, &other_call).await.unwrap();
+        assert_eq!(
+            (realised.amount_out, realised.amount_in),
+            (Some(111), Some(1_000)),
+            "a selector's rule at another address is not this address's"
+        );
+    }
+
+    /// A rule set for an address alone is what it always was: it reads every
+    /// function of the address, a call whose calldata is too short to hold a
+    /// selector included.
+    #[tokio::test]
+    async fn an_address_rule_alone_reads_every_call_to_it() {
+        let server = MockServer::start().await;
+        let router = [0x11; 20];
+        let amounts = crate::evm::rpc::tests::uint_array(&[1_000, 1_234]);
+        let calls = [
+            call_of([0xa1, 0xa2, 0xa3, 0xa4], 1),
+            call_of([0xb1, 0xb2, 0xb3, 0xb4], 2),
+            vec![0xc1, 0xc2, 0xc3],
+            vec![],
+        ];
+        mount_router_calls(
+            &server,
+            router,
+            calls
+                .iter()
+                .map(|call| (call.clone(), amounts.clone()))
+                .collect(),
+        )
+        .await;
+
+        let adapter = EvmSimulated::new(EvmRpc::new(server.uri()))
+            .with_return_rule(Address::from(router), ReturnRule::LastOfArray)
+            .with_input_rule(Address::from(router), InputRule::Word(0));
+        for call in &calls {
+            let realised = run(&adapter, router, call).await.unwrap();
+            // The array's offset (32) is the first word: the input rule
+            // reads it, and the return rule goes on to the last element.
+            assert_eq!(realised.amount_out, Some(1_234), "calldata {call:?}");
+            assert_eq!(realised.amount_in, Some(32), "calldata {call:?}");
+        }
+    }
+
+    /// What `Word(n)` cannot read as an amount out is an error that names the
+    /// rule, never a figure.
+    #[tokio::test]
+    async fn a_return_word_that_is_missing_or_does_not_fit_is_an_error() {
+        let router = [0x11; 20];
+        for (rule, swap_return, expected) in [
+            // One word only: no word 1.
+            (ReturnRule::Word(1), words(&[550]), "no word 1"),
+            // 32 bytes of a second word, but 31 of them.
+            (
+                ReturnRule::Word(1),
+                [words(&[550]), vec![0x01; 31]].concat(),
+                "no word 1 in 63 bytes",
+            ),
+            (ReturnRule::Word(0), vec![], "no word 0 in 0 bytes"),
+            // An index whose byte offset overflows.
+            (ReturnRule::Word(usize::MAX), words(&[550, 600]), "no word"),
+            // Does not fit a u128.
+            (
+                ReturnRule::Word(1),
+                [U256::from(550u64), U256::MAX]
+                    .iter()
+                    .flat_map(|w| w.to_be_bytes::<32>())
+                    .collect(),
+                "overflowed u128",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            let calldata = call_of([0xd1, 0xd2, 0xd3, 0xd4], 1);
+            mount_router_calls(&server, router, vec![(calldata.clone(), swap_return)]).await;
+            let adapter = EvmSimulated::new(EvmRpc::new(server.uri()))
+                .with_return_rule(Address::from(router), rule);
+            let err = run(&adapter, router, &calldata).await.unwrap_err();
+            let text = format!("{err:#}");
+            assert!(
+                text.contains(&format!("{rule:?}")) && text.contains(expected),
+                "{rule:?} {expected}: {text}"
+            );
+        }
+    }
+
+    /// `Word(n)` reads the `n`th word of data longer than that, whatever is
+    /// after it.
+    #[tokio::test]
+    async fn a_return_word_is_read_from_data_of_any_length() {
+        let server = MockServer::start().await;
+        let router = [0x11; 20];
+        let calldata = call_of([0xd1, 0xd2, 0xd3, 0xd4], 1);
+        mount_router_calls(
+            &server,
+            router,
+            vec![(calldata.clone(), words(&[10, 20, 30, 40]))],
+        )
+        .await;
+        for (n, expected) in [(0, 10), (1, 20), (2, 30), (3, 40)] {
+            let adapter = EvmSimulated::new(EvmRpc::new(server.uri()))
+                .with_return_rule(Address::from(router), ReturnRule::Word(n));
+            let realised = run(&adapter, router, &calldata).await.unwrap();
+            assert_eq!(realised.amount_out, Some(expected), "Word({n})");
+        }
+    }
+
+    /// The rule for a call: its selector's, else its address's, else the
+    /// default; calldata shorter than a selector has no selector's.
+    #[test]
+    fn a_calls_rule_is_its_selectors_then_its_addresses_then_the_default() {
+        let (address, other) = (Address::from([0x11; 20]), Address::from([0x22; 20]));
+        let (selector, calldata) = ([1, 2, 3, 4], [1, 2, 3, 4, 5]);
+        let mut rules = Rules::<ReturnRule>::default();
+        assert_eq!(rules.for_call(address, &calldata), ReturnRule::FirstWord);
+
+        rules.set(address, Some(selector), ReturnRule::Word(1));
+        assert_eq!(rules.for_call(address, &calldata), ReturnRule::Word(1));
+        assert_eq!(rules.for_call(address, &[1, 2, 3, 4]), ReturnRule::Word(1));
+        assert_eq!(rules.for_call(address, &[1, 2, 3]), ReturnRule::FirstWord);
+        assert_eq!(
+            rules.for_call(address, &[9, 2, 3, 4]),
+            ReturnRule::FirstWord
+        );
+        assert_eq!(rules.for_call(other, &calldata), ReturnRule::FirstWord);
+
+        rules.set(address, None, ReturnRule::LastOfArray);
+        assert_eq!(rules.for_call(address, &calldata), ReturnRule::Word(1));
+        assert_eq!(rules.for_call(address, &[1, 2, 3]), ReturnRule::LastOfArray);
+        assert_eq!(rules.for_call(address, &[]), ReturnRule::LastOfArray);
+        assert_eq!(
+            rules.for_call(address, &[9, 2, 3, 4]),
+            ReturnRule::LastOfArray
+        );
+        assert_eq!(rules.for_call(other, &calldata), ReturnRule::FirstWord);
     }
 
     /// A one-word answer read as an array points past the data: an error
