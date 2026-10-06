@@ -14,6 +14,7 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 
 pub(crate) const ORDER_PATH: &str = "/api/v3/order";
+pub(crate) const ORDER_TEST_PATH: &str = "/api/v3/order/test";
 pub(crate) const MY_TRADES_PATH: &str = "/api/v3/myTrades";
 
 pub struct BinanceConfig {
@@ -51,6 +52,64 @@ pub(crate) struct BinanceOrderResponse {
     pub(crate) executed_qty: Decimal,
     #[serde(default)]
     pub(crate) fills: Vec<TradeLine>,
+    /// When the venue processed the order: on the placing call's answer.
+    #[serde(rename = "transactTime", default)]
+    pub(crate) transact_time: Option<u64>,
+    /// When the order last changed: on a status query's answer, which
+    /// carries no `transactTime`.
+    #[serde(rename = "updateTime", default)]
+    pub(crate) update_time: Option<u64>,
+}
+
+/// What `POST /api/v3/order/test` with `computeCommissionRates=true` says an
+/// order would pay, for the order's own side. The order is validated and
+/// never sent to the matching engine: nothing trades. See
+/// <https://developers.binance.com/docs/binance-spot-api-docs/rest-api/trading-endpoints#test-new-order-trade>.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderCheck {
+    /// The quantity the order was checked with, rounded to the symbol's step
+    /// as `BinanceLive::execute` would send it.
+    pub quantity: Decimal,
+    /// The client order id the checked request carried.
+    pub client_order_id: String,
+    pub rates: CommissionRates,
+}
+
+/// Commission rates on an order's trades, each a fraction of the traded
+/// amount (`0.001` is 10 bps), as Binance states them for that order.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CommissionRates {
+    #[serde(rename = "standardCommissionForOrder")]
+    pub standard: MakerTaker,
+    /// Absent from older answers.
+    #[serde(rename = "specialCommissionForOrder", default)]
+    pub special: Option<MakerTaker>,
+    #[serde(rename = "taxCommissionForOrder")]
+    pub tax: MakerTaker,
+    /// The reduction of the standard rate when commission is paid in the
+    /// discount asset (BNB).
+    pub discount: Option<CommissionDiscount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MakerTaker {
+    pub maker: Decimal,
+    pub taker: Decimal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CommissionDiscount {
+    #[serde(rename = "enabledForAccount")]
+    pub enabled_for_account: bool,
+    #[serde(rename = "enabledForSymbol")]
+    pub enabled_for_symbol: bool,
+    /// `None` where the venue names none: the spot testnet answered
+    /// `"discountAsset": null`, with a discount of zero, on 3 October 2026.
+    #[serde(rename = "discountAsset")]
+    pub asset: Option<String>,
+    /// The fraction the standard rate is reduced by (`0.25` is a quarter).
+    #[serde(rename = "discount")]
+    pub rate: Decimal,
 }
 
 impl VenueOrder for BinanceOrderResponse {
@@ -100,14 +159,42 @@ impl BinanceRest {
         quantity: Decimal,
         client_order_id: &str,
     ) -> Result<BinanceOrderResponse, ApiError> {
-        let params = [
-            ("symbol", symbol.to_string()),
-            ("side", side.to_string()),
-            ("type", "MARKET".to_string()),
-            ("quantity", quantity.normalize().to_string()),
-            ("newClientOrderId", client_order_id.to_string()),
-            ("newOrderRespType", "FULL".to_string()),
-        ];
+        let params = market_order(symbol, side, quantity, client_order_id);
         self.client.signed(Method::POST, ORDER_PATH, &params).await
     }
+
+    /// Checks the market order [`Self::place_market_order`] would place,
+    /// with the same parameters, at `POST /api/v3/order/test`, and returns
+    /// the commission rates Binance says its trades would pay. Nothing is
+    /// sent to the matching engine, so a lost answer is a plain failure.
+    pub(crate) async fn test_market_order(
+        &self,
+        symbol: &str,
+        side: &str,
+        quantity: Decimal,
+        client_order_id: &str,
+    ) -> Result<CommissionRates, ApiError> {
+        let mut params = market_order(symbol, side, quantity, client_order_id).to_vec();
+        params.push(("computeCommissionRates", "true".to_string()));
+        self.client
+            .signed(Method::POST, ORDER_TEST_PATH, &params)
+            .await
+    }
+}
+
+/// A market order's parameters, as both the order and its test send them.
+fn market_order(
+    symbol: &str,
+    side: &str,
+    quantity: Decimal,
+    client_order_id: &str,
+) -> [(&'static str, String); 6] {
+    [
+        ("symbol", symbol.to_string()),
+        ("side", side.to_string()),
+        ("type", "MARKET".to_string()),
+        ("quantity", quantity.normalize().to_string()),
+        ("newClientOrderId", client_order_id.to_string()),
+        ("newOrderRespType", "FULL".to_string()),
+    ]
 }

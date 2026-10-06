@@ -83,6 +83,9 @@ pub(crate) struct BybitOrder {
     pub(crate) cum_exec_qty: Decimal,
     #[serde(rename = "cumExecFee")]
     pub(crate) cum_exec_fee: Decimal,
+    /// When the order last changed, ms since the epoch as a decimal string.
+    #[serde(rename = "updatedTime", default)]
+    pub(crate) updated_time: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

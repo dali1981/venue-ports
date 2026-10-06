@@ -39,6 +39,7 @@
 //! outcome with its reason. Fork senders are not in the registry: a fork is
 //! its own node, and anvil assigns an impersonated account's nonces itself.
 
+use crate::dex::EvmCost;
 use crate::evm::erc20::{self, SlotCache};
 use crate::evm::rpc::{format_u256, BlockTag, EvmRpc, Receipt, RpcError, RpcLog};
 use crate::Provenance;
@@ -163,11 +164,15 @@ pub enum TxOutcome {
         block: u64,
         tx_hash: B256,
         logs: Vec<RpcLog>,
+        /// What it cost, from the receipt.
+        cost: EvmCost,
     },
     Reverted {
         block: u64,
         tx_hash: B256,
         reason: String,
+        /// A reverted transaction still pays for its gas.
+        cost: EvmCost,
     },
     TimedOut {
         tx_hash: B256,
@@ -318,8 +323,8 @@ impl EvmSender {
     }
 
     /// `Simulated` for a fork sender, `Landed` for a signing one. Adapters
-    /// take their provenance from this, and set `tx_ref` only when it is
-    /// `Landed`.
+    /// take their provenance from this. Either way a transaction was sent,
+    /// so they set `tx_ref` to its hash.
     pub fn provenance(&self) -> Provenance {
         match self.backend {
             Backend::Signing(_) => Provenance::Landed,
@@ -417,34 +422,40 @@ impl EvmSender {
         }
     }
 
-    /// Checks that the owner holds at least `amount` of `token`. A signing
-    /// sender returns an error when it does not, so a transaction that would
-    /// revert with STF is never sent. A fork sender instead writes the
-    /// balance slot with `anvil_setStorageAt` (the slot comes from
-    /// [`erc20`]'s probing), exactly as `EvmSimulated` overrides state.
-    pub async fn ensure_balance(&self, token: Address, amount: U256) -> Result<()> {
-        let current = erc20::balance_of(&self.rpc, token, self.address, BlockTag::Latest)
+    /// Checks that `holder` holds at least `amount` of `token`: the owner,
+    /// or a contract that pays a swap from its own inventory (a swap's
+    /// payer, `SwapRequest.payer`). A signing sender returns an error when
+    /// it does not, so a transaction that would revert with STF is never
+    /// sent. A fork sender instead writes the holder's balance slot with
+    /// `anvil_setStorageAt` (the slot comes from [`erc20`]'s probing),
+    /// exactly as `EvmSimulated` overrides state.
+    pub async fn ensure_balance(
+        &self,
+        token: Address,
+        holder: Address,
+        amount: U256,
+    ) -> Result<()> {
+        let current = erc20::balance_of(&self.rpc, token, holder, BlockTag::Latest)
             .await
-            .with_context(|| format!("reading {}'s balance of {token}", self.address))?;
+            .with_context(|| format!("reading {holder}'s balance of {token}"))?;
         if current >= amount {
             return Ok(());
         }
         match self.backend {
             Backend::Signing(_) => bail!(
-                "{} holds {current} of {token}, less than the {amount} this needs — refusing to \
-                 send a transaction that would revert",
-                self.address
+                "{holder} holds {current} of {token}, less than the {amount} this needs — refusing \
+                 to send a transaction that would revert"
             ),
             Backend::Fork => {
                 let index = erc20::find_balance_slot(
                     &self.rpc,
                     &self.slots,
                     token,
-                    self.address,
+                    holder,
                     BlockTag::Latest,
                 )
                 .await?;
-                let slot = erc20::mapping_slot(self.address, index);
+                let slot = erc20::mapping_slot(holder, index);
                 self.rpc
                     .call(
                         "anvil_setStorageAt",
@@ -452,13 +463,11 @@ impl EvmSender {
                     )
                     .await
                     .context("writing the balance slot on the fork")?;
-                let written =
-                    erc20::balance_of(&self.rpc, token, self.address, BlockTag::Latest).await?;
+                let written = erc20::balance_of(&self.rpc, token, holder, BlockTag::Latest).await?;
                 if written != amount {
                     bail!(
-                        "wrote {amount} into {token}'s balance slot for {} but balanceOf reads \
-                         {written} — the token does not keep balances in a plain mapping",
-                        self.address
+                        "wrote {amount} into {token}'s balance slot for {holder} but balanceOf \
+                         reads {written} — the token does not keep balances in a plain mapping"
                     );
                 }
                 Ok(())
@@ -638,6 +647,7 @@ impl EvmSender {
                 block: receipt.block,
                 tx_hash,
                 logs: receipt.logs,
+                cost: receipt.cost,
             };
         }
         let reason = self
@@ -648,6 +658,7 @@ impl EvmSender {
             block: receipt.block,
             tx_hash,
             reason,
+            cost: receipt.cost,
         }
     }
 }
@@ -1233,6 +1244,92 @@ pub(crate) mod tests {
         assert!(err.to_string().contains("only sends to an anvil node"));
     }
 
+    /// On a fork, the balance is written to the holder named, here a
+    /// contract that pays its own swaps, and never to the owner sending.
+    #[tokio::test]
+    async fn on_a_fork_ensure_balance_writes_the_holders_slot() {
+        let server = MockServer::start().await;
+        let owner = Address::from([0xCC; 20]);
+        let contract = Address::from([0x11; 20]);
+        let token = Address::from([0xAA; 20]);
+        let amount = U256::from(5_000_000u64);
+        let holder_slot = erc20::mapping_slot(contract, 0);
+        for (rpc_method, result) in [
+            ("web3_clientVersion", json!("anvil/v1.3.0")),
+            ("eth_chainId", json!("0x2105")),
+            (
+                "eth_getBalance",
+                json!(format_u256(U256::from(FORK_GAS_BALANCE))),
+            ),
+        ] {
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({ "method": rpc_method })))
+                .respond_with(ok(result))
+                .mount(&server)
+                .await;
+        }
+        // A token whose `balanceOf` mapping is at slot 0: a probe touching the
+        // holder's slot reads the marker, and a plain read reads what
+        // `anvil_setStorageAt` last wrote there.
+        let written = Arc::new(Mutex::new(U256::ZERO));
+        let written_by_node = written.clone();
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({ "method": "eth_call" })))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: Value = req.body_json().unwrap();
+                let value = match body["params"].get(2) {
+                    Some(overrides) => {
+                        if overrides[token.to_string()]["stateDiff"]
+                            .get(holder_slot.to_string())
+                            .is_some()
+                        {
+                            erc20::probe_marker()
+                        } else {
+                            U256::ZERO
+                        }
+                    }
+                    None => *written_by_node.lock().unwrap(),
+                };
+                ok(json!(format_u256(value)))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({ "method": "anvil_setStorageAt" })))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: Value = req.body_json().unwrap();
+                *written.lock().unwrap() =
+                    crate::evm::rpc::parse_hex_u256(body["params"][2].as_str().unwrap()).unwrap();
+                ok(json!(true))
+            })
+            .mount(&server)
+            .await;
+
+        let sender = EvmSender::fork(EvmRpc::new(server.uri()), owner, 8453)
+            .await
+            .unwrap();
+        sender
+            .ensure_balance(token, contract, amount)
+            .await
+            .unwrap();
+
+        let set: Vec<Value> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.body_json::<Value>().unwrap())
+            .filter(|b| b["method"] == "anvil_setStorageAt")
+            .collect();
+        assert_eq!(set.len(), 1);
+        assert_eq!(set[0]["params"][0], json!(token.to_string()));
+        assert_eq!(
+            set[0]["params"][1],
+            json!(holder_slot.to_string()),
+            "the contract's slot"
+        );
+    }
+
     /// A fork sender against a real anvil node: it is `Simulated`, it
     /// writes a token balance the owner does not hold, and it records a
     /// revert the node's estimate predicted as an outcome, reason included.
@@ -1255,7 +1352,7 @@ pub(crate) mod tests {
             + erc20::balance_of(&rpc, token, owner, BlockTag::Latest)
                 .await
                 .unwrap();
-        sender.ensure_balance(token, amount).await.unwrap();
+        sender.ensure_balance(token, owner, amount).await.unwrap();
         assert_eq!(
             erc20::balance_of(&rpc, token, owner, BlockTag::Latest)
                 .await

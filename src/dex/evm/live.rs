@@ -35,15 +35,25 @@
 //! router's current allowance and, only if it's short, sends an `approve`
 //! capped to exactly `route.amount_in` — never `U256::MAX`.
 //!
+//! **A contract payer** (`Payer::CalledContract`): the contract called holds
+//! the input and pays the venue itself, so nothing is approved and no
+//! allowance is read. The amount out is read the same way, from the output's
+//! `Transfer` to `SwapRequest.recipient`.
+//!
 //! **Over a fork sender** (`SPEC.md` §5b), this adapter is a swap simulator
-//! whose state persists between calls: its provenance is `Simulated` and it
-//! sets no `tx_ref`. The owner must hold the input token on the fork;
-//! [`EvmSender::ensure_balance`] writes it there.
+//! whose state persists between calls: its provenance is `Simulated`, and its
+//! `tx_ref` is the fork transaction's hash, as a live send's is. The payer
+//! must hold the input token on the fork; [`EvmSender::ensure_balance`]
+//! writes it there.
 
-use crate::dex::{ChainAmount, DexExecutor, Outcome, Prepared, Realised, RouteQuote, SwapRequest};
+use crate::dex::{
+    ChainAmount, DexExecutor, EvmCall, EvmCost, Outcome, Payer, Prepared, Realised, RouteQuote,
+    SwapRequest, TxCost,
+};
 use crate::evm::erc20;
 use crate::evm::rpc::address_from_slice;
 use crate::evm::{prepared_key, EvmSender, RpcLog, TxOutcome};
+use crate::Network;
 use crate::Provenance;
 use alloy_primitives::{Address, B256, U256};
 use anyhow::{anyhow, bail, Context, Result};
@@ -55,6 +65,7 @@ struct PendingLive {
     token_in: Address,
     token_out: Address,
     recipient: Address,
+    payer: Payer,
     amount_in: ChainAmount,
     deadline_unix_secs: u64,
 }
@@ -81,11 +92,6 @@ impl EvmLive {
     pub fn sender(&self) -> &Arc<EvmSender> {
         &self.sender
     }
-
-    /// `tx_ref` is set if and only if the provenance is `Landed`.
-    fn tx_ref(&self, tx_hash: B256) -> Option<Vec<u8>> {
-        (self.sender.provenance() == Provenance::Landed).then(|| tx_hash.as_slice().to_vec())
-    }
 }
 
 #[async_trait]
@@ -97,10 +103,11 @@ impl DexExecutor for EvmLive {
                 route.payload.len()
             );
         }
-        if route.chain_id != self.sender.chain_id() {
+        req.priority.policy_only("EvmLive")?;
+        if route.network != Network::evm(self.sender.chain_id()) {
             bail!(
-                "route is for chain {}, but this EvmLive's sender is on chain {}",
-                route.chain_id,
+                "route is for network {}, but this EvmLive's sender is on chain {}",
+                route.network,
                 self.sender.chain_id()
             );
         }
@@ -130,28 +137,30 @@ impl DexExecutor for EvmLive {
             );
         }
 
-        let prepared = Prepared {
+        let call = EvmCall {
             to: router_bytes.to_vec(),
             calldata: calldata.to_vec(),
             value: 0,
         };
         self.pending.lock().unwrap().insert(
-            prepared_key(&prepared),
+            prepared_key(&call),
             PendingLive {
                 token_in,
                 token_out,
                 recipient,
+                payer: req.payer,
                 amount_in: route.amount_in,
                 deadline_unix_secs: req.deadline_unix_secs,
             },
         );
-        Ok(prepared)
+        Ok(Prepared::Evm(call))
     }
 
     /// `at` is ignored: a live adapter only ever acts *now* — there is no
     /// "re-run this at a historical block" for a real broadcast the way
     /// there is for `EvmSimulated`'s throwaway `eth_call`.
     async fn execute(&self, prepared: &Prepared, _at: Option<u64>) -> Result<Realised> {
+        let prepared = prepared.evm_call()?;
         let ctx = self
             .pending
             .lock()
@@ -177,9 +186,15 @@ impl DexExecutor for EvmLive {
             );
         }
 
-        self.sender
-            .ensure_allowance(ctx.token_in, router, U256::from(ctx.amount_in))
-            .await?;
+        match ctx.payer {
+            Payer::Sender => {
+                self.sender
+                    .ensure_allowance(ctx.token_in, router, U256::from(ctx.amount_in))
+                    .await?
+            }
+            // The contract pays the venue from its own balance: nothing to approve.
+            Payer::CalledContract => {}
+        }
 
         match self
             .sender
@@ -190,6 +205,7 @@ impl DexExecutor for EvmLive {
                 block,
                 tx_hash,
                 logs,
+                cost,
             } => {
                 let amount_out = decode_transfer_amount(&logs, ctx.token_out, ctx.recipient)
                     .ok_or_else(|| {
@@ -201,30 +217,34 @@ impl DexExecutor for EvmLive {
                 Ok(Realised {
                     amount_out: Some(amount_out),
                     outcome: Outcome::Success,
+                    cost: TxCost::Evm(cost),
                     at: block,
                     provenance: self.sender.provenance(),
-                    tx_ref: self.tx_ref(tx_hash),
+                    tx_ref: Some(tx_hash.as_slice().to_vec()),
                 })
             }
             TxOutcome::Reverted {
                 block,
                 tx_hash,
                 reason,
+                cost,
             } => Ok(Realised {
                 amount_out: None,
                 outcome: Outcome::Reverted { reason },
+                cost: TxCost::Evm(cost),
                 at: block,
                 provenance: self.sender.provenance(),
-                tx_ref: self.tx_ref(tx_hash),
+                tx_ref: Some(tx_hash.as_slice().to_vec()),
             }),
             TxOutcome::TimedOut { tx_hash } => {
                 let at = self.sender.rpc().block_number().await.unwrap_or(0);
                 Ok(Realised {
                     amount_out: None,
                     outcome: Outcome::TimedOut,
+                    cost: TxCost::Evm(EvmCost::default()),
                     at,
                     provenance: self.sender.provenance(),
-                    tx_ref: self.tx_ref(tx_hash),
+                    tx_ref: Some(tx_hash.as_slice().to_vec()),
                 })
             }
         }
@@ -257,6 +277,7 @@ fn decode_transfer_amount(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dex::PriorityBid;
     use crate::evm::erc20::{transfer_topic, ALLOWANCE_SELECTOR};
     use crate::evm::rpc::{encode_error_string, format_u256, hex_data, pad_address};
     use crate::evm::tx::tests::{connect, mount_receipt, mount_send_plumbing, SEPOLIA};
@@ -275,7 +296,7 @@ mod tests {
         let mut payload = router.as_slice().to_vec();
         payload.extend_from_slice(calldata);
         RouteQuote {
-            chain_id: SEPOLIA,
+            network: Network::evm(SEPOLIA),
             token_in: token_in.as_slice().to_vec(),
             token_out: token_out.as_slice().to_vec(),
             amount_in: 1_000,
@@ -288,8 +309,10 @@ mod tests {
         SwapRequest {
             sender: sender.as_slice().to_vec(),
             recipient: recipient.as_slice().to_vec(),
+            payer: Payer::Sender,
             min_amount_out: 900,
             deadline_unix_secs: 9_999_999_999,
+            priority: PriorityBid::Policy,
         }
     }
 
@@ -353,7 +376,7 @@ mod tests {
         let router = Address::from([0x11; 20]);
         let token = Address::from([0xAA; 20]);
         let route = RouteQuote {
-            chain_id: 1,
+            network: Network::evm(1),
             ..route(router, token, token, &[0xCA, 0xFE])
         };
         let req = request(live.address(), Address::from([0xDD; 20]));
@@ -426,7 +449,10 @@ mod tests {
         });
         mount_receipt(
             &server,
-            json!({ "status": "0x1", "blockNumber": "0x2a", "logs": [transfer_log] }),
+            json!({
+                "status": "0x1", "blockNumber": "0x2a", "logs": [transfer_log],
+                "gasUsed": "0x249f0", "effectiveGasPrice": "0x77359400", "l1Fee": "0x7",
+            }),
         )
         .await;
 
@@ -440,9 +466,158 @@ mod tests {
 
         assert_eq!(realised.amount_out, Some(4_200));
         assert!(matches!(realised.outcome, Outcome::Success));
+        assert_eq!(
+            realised.cost,
+            TxCost::Evm(EvmCost {
+                gas_used: Some(150_000),
+                effective_gas_price_wei: Some(2_000_000_000),
+                l1_fee_wei: Some(7),
+            })
+        );
         assert_eq!(realised.provenance, Provenance::Landed);
         assert!(realised.tx_ref.is_some());
         assert_eq!(realised.at, 42);
+    }
+
+    /// A contract that keeps its own inventory pays the pool itself: no
+    /// allowance is read and no `approve` is sent, so the swap is the only
+    /// transaction. Its output is the `Transfer` to the contract.
+    #[tokio::test]
+    async fn a_contract_payer_sends_the_swap_and_nothing_else() {
+        let server = MockServer::start().await;
+        let contract = Address::from([0x11; 20]);
+        let token_in = Address::from([0xAA; 20]);
+        let token_out = Address::from([0xBB; 20]);
+        let pool = Address::from([0x22; 20]);
+
+        mount_send_plumbing(&server).await;
+        // An allowance read here would find none, and send an approve.
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "eth_call"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1, "result": format_u256(U256::ZERO),
+            })))
+            .mount(&server)
+            .await;
+        let transfer_log = json!({
+            "address": token_out.to_string(),
+            "topics": [
+                transfer_topic().to_string(),
+                hex_data(&pad_address(pool)),
+                hex_data(&pad_address(contract)),
+            ],
+            "data": format_u256(U256::from(4_200u64)),
+        });
+        mount_receipt(
+            &server,
+            json!({ "status": "0x1", "blockNumber": "0x2a", "logs": [transfer_log] }),
+        )
+        .await;
+
+        let live = EvmLive::new(connect(&server).await);
+        let req = SwapRequest {
+            payer: Payer::CalledContract,
+            ..request(live.address(), contract)
+        };
+        let prepared = live
+            .prepare(&route(contract, token_in, token_out, &[0xCA, 0xFE]), &req)
+            .await
+            .unwrap();
+        let realised = live.execute(&prepared, None).await.unwrap();
+        assert_eq!(realised.amount_out, Some(4_200));
+        assert!(matches!(realised.outcome, Outcome::Success));
+
+        let bodies: Vec<Value> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.body_json().unwrap())
+            .collect();
+        let count = |rpc_method: &str| bodies.iter().filter(|b| b["method"] == rpc_method).count();
+        assert_eq!(
+            count("eth_sendRawTransaction"),
+            1,
+            "the swap alone, no approve"
+        );
+        assert_eq!(count("eth_call"), 0, "no allowance read");
+    }
+
+    /// Over a fork sender the swap is `Simulated`, and carries the fork
+    /// transaction's hash all the same: a transaction was sent (`SPEC.md`
+    /// §5's shape rule, amended 3 October 2026).
+    #[tokio::test]
+    async fn over_a_fork_sender_the_swap_is_simulated_and_carries_its_hash() {
+        let server = MockServer::start().await;
+        let owner = Address::from([0xCC; 20]);
+        let contract = Address::from([0x11; 20]);
+        let token_in = Address::from([0xAA; 20]);
+        let token_out = Address::from([0xBB; 20]);
+        let tx_hash = B256::repeat_byte(0xAB);
+        for (rpc_method, result) in [
+            ("web3_clientVersion", json!("anvil/v1.3.0")),
+            ("eth_chainId", json!(format!("0x{SEPOLIA:x}"))),
+            (
+                "eth_getBalance",
+                json!(format_u256(U256::from(10u128.pow(20)))),
+            ),
+            ("anvil_impersonateAccount", Value::Null),
+            ("eth_getTransactionCount", json!("0x5")),
+            ("eth_estimateGas", json!("0x5208")),
+            ("eth_sendTransaction", json!(tx_hash.to_string())),
+            ("eth_blockNumber", json!("0x2a")),
+        ] {
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({ "method": rpc_method })))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({ "jsonrpc": "2.0", "id": 1, "result": result })),
+                )
+                .mount(&server)
+                .await;
+        }
+        let transfer_log = json!({
+            "address": token_out.to_string(),
+            "topics": [
+                transfer_topic().to_string(),
+                hex_data(&pad_address(Address::from([0x22; 20]))),
+                hex_data(&pad_address(owner)),
+            ],
+            "data": format_u256(U256::from(4_200u64)),
+        });
+        mount_receipt(
+            &server,
+            json!({ "status": "0x1", "blockNumber": "0x2a", "logs": [transfer_log] }),
+        )
+        .await;
+
+        let sender = EvmSender::fork(EvmRpc::new(server.uri()), owner, SEPOLIA)
+            .await
+            .unwrap();
+        let live = EvmLive::new(sender);
+        assert_eq!(live.label(), "evm-live-fork");
+        let fixture = crate::testkit::contract::DexContractFixture {
+            route: route(contract, token_in, token_out, &[0xCA, 0xFE]),
+            request: SwapRequest {
+                payer: Payer::CalledContract,
+                ..request(owner, owner)
+            },
+        };
+        let prepared = live
+            .prepare(&fixture.route, &fixture.request)
+            .await
+            .unwrap();
+        let realised = live.execute(&prepared, None).await.unwrap();
+        assert_eq!(realised.amount_out, Some(4_200));
+        assert_eq!(realised.provenance, Provenance::Simulated);
+        assert_eq!(realised.tx_ref, Some(tx_hash.as_slice().to_vec()));
+
+        crate::testkit::contract::dex_executor_contract(
+            &live,
+            crate::testkit::contract::Sends::Transactions,
+            fixture,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -473,7 +648,12 @@ mod tests {
             route: route(router, Address::from([0xAA; 20]), token_out, &[0xCA, 0xFE]),
             request: request(live.address(), recipient),
         };
-        crate::testkit::contract::dex_executor_contract(&live, fixture).await;
+        crate::testkit::contract::dex_executor_contract(
+            &live,
+            crate::testkit::contract::Sends::Transactions,
+            fixture,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -672,7 +852,7 @@ mod tests {
         payload.extend_from_slice(&swap_calldata);
 
         let route = RouteQuote {
-            chain_id: SEPOLIA,
+            network: Network::evm(SEPOLIA),
             token_in: weth.as_slice().to_vec(),
             token_out: usdc.as_slice().to_vec(),
             amount_in: AMOUNT_IN,
@@ -686,8 +866,10 @@ mod tests {
         let sim_request = SwapRequest {
             sender: me.as_slice().to_vec(),
             recipient: me.as_slice().to_vec(),
+            payer: Payer::Sender,
             min_amount_out: 0,
             deadline_unix_secs: 0,
+            priority: PriorityBid::Policy,
         };
         let sim_prepared = simulated.prepare(&route, &sim_request).await.unwrap();
         let sim_realised = simulated.execute(&sim_prepared, None).await.unwrap();
@@ -702,8 +884,10 @@ mod tests {
         let live_request = SwapRequest {
             sender: me.as_slice().to_vec(),
             recipient: me.as_slice().to_vec(),
+            payer: Payer::Sender,
             min_amount_out: 0,
             deadline_unix_secs: deadline,
+            priority: PriorityBid::Policy,
         };
         let live_prepared = live.prepare(&route, &live_request).await.unwrap();
         let live_realised = live.execute(&live_prepared, None).await.unwrap();

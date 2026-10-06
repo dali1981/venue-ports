@@ -17,4 +17,6 @@ mod rest;
 pub(crate) mod sign;
 
 pub use live::BinanceLive;
-pub use rest::{BinanceConfig, BinanceRest};
+pub use rest::{
+    BinanceConfig, BinanceRest, CommissionDiscount, CommissionRates, MakerTaker, OrderCheck,
+};

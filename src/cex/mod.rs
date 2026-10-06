@@ -19,7 +19,10 @@ mod stub;
 
 pub use account::{CexAccount, FundingPayment, MarginMode, MarginState, PerpPosition};
 pub use account_stub::{AccountCall, AccountRead, CexAccountStub};
-pub use binance::{BinanceConfig, BinanceLive, BinanceRest};
+pub use binance::{
+    BinanceConfig, BinanceLive, BinanceRest, CommissionDiscount, CommissionRates, MakerTaker,
+    OrderCheck,
+};
 pub use binance_futures::{
     BinanceFuturesAccount, BinanceFuturesConfig, BinanceFuturesLive, BinanceFuturesRest,
 };
@@ -106,6 +109,34 @@ pub struct CexFill {
     pub provenance: Provenance,
     /// Set if and only if `provenance == Provenance::Landed`.
     pub order_ref: Option<u64>,
+    /// The id this crate gave the order (`newClientOrderId`, `orderLinkId`),
+    /// which the venue can be asked about it by. Set if and only if
+    /// `provenance == Provenance::Landed`: a stub or a paper model sends
+    /// nothing, so it names nothing.
+    pub client_order_id: Option<String>,
+    /// The venue's own time for the order, in ms since the epoch: Binance
+    /// spot's `transactTime` (its `updateTime` when the order was found by a
+    /// status query), Binance futures' `updateTime`, Bybit's `updatedTime`.
+    /// `None` when nothing was sent, or when the venue's answer carried none.
+    pub venue_time_ms: Option<u64>,
+    /// The order's trades, as the venue listed them. Empty when nothing was
+    /// sent, and on a venue whose adapter does not read them (Bybit). When
+    /// listed, their quantities add up to `filled_qty`.
+    pub trades: Vec<CexTrade>,
+}
+
+/// One trade an order made, as the venue listed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CexTrade {
+    /// The venue's id for the trade. On Binance it is the id the public
+    /// trade stream gives the same trade (`t`), so the fill can be found in
+    /// a recording of that stream. `None` only if the venue's line carried
+    /// none.
+    pub trade_id: Option<u64>,
+    pub price: Decimal,
+    pub qty: Decimal,
+    pub commission: Decimal,
+    pub commission_asset: String,
 }
 
 #[async_trait]

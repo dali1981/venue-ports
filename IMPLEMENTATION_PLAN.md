@@ -277,12 +277,11 @@ Two venues from the start, not one followed by a second later — confirmed by M
 - Done when: §9's four-point bar is met for each venue, same as Phase 5's DEX equivalent, with "Live"
   meaning a real order against that venue's production API.
 
-## Phase 8 — Second chain family (optional, lower priority)
+## Phase 8 — Second chain family
 
-- A Solana-style `Live`/`Simulated` pair implementing the same `DexExecutor` trait (§5, final
-  paragraph) — `EvmStub` is reused as-is; the trait does not change.
-- Defer until at least one consumer actually needs a second chain family — the spec explicitly treats
-  this as an extension point, not a launch requirement.
+Superseded by Phase 15 ([V5](specs/V5-venues-and-solana.md)): a consumer needs Solana, and V5 is how
+it arrives. The trait is unchanged, as this phase said; `Prepared`, `Outcome` and the cost gained
+Solana forms, and the stub is `DexStub`.
 
 ## Phase 9 — Consumer-facing polish
 
@@ -452,6 +451,144 @@ the relevant environment variables, a no-op when they are unset, like the Sepoli
   so `MarginState.as_of_ms` is the venue clock as this client estimates it; funding is paged in
   windows of at most 7 days and refused for a `since_ms` older than 89 days, since Binance keeps three
   months of income and an older start could only be answered short.
+
+## Phase 15 — one contract for every venue, and the Solana family (V5)
+
+[V5](specs/V5-venues-and-solana.md), accepted 1 October 2026 with its §12 decided as recommended. Its
+signatures are in `SPEC.md` §3, §4, §5, §5b, §7 and §8. Requested by a consumer for its Solana work
+(arb-searcher's network plan, W6.3 and W6.4). Branch `feature/solana`, from `main` at `1c5f2c6`.
+
+The rule throughout: one contract per port — commands, events, capabilities. The caller branches only
+on capabilities, a venue's own types never cross the port, and a paper model is a venue that passes the
+same suite. Modes stay Live, Simulated and Stub; a fork is how Simulated runs a sequence. **No EVM
+number may move**: the suite and the anvil tests here, and the consumer's goldens and fork test, pin it.
+Solana Live signing is not built (the signing backend refuses) until the owner asks.
+
+Order of work, each step compiled and tested before the next (V5 §11):
+
+1. **Dependency spike.** One pinned Solana SDK line builds a v0 transaction, signs it, and
+   round-trips a transaction Jupiter built. Settles V5 §12.3: whether `orca_whirlpools_client`'s key
+   type is the transaction crate's, so Orca's client builds the instructions, or whether the adapter
+   encodes the six it needs from the IDL. *Stop and report.*
+2. **The shared types** (`SPEC.md` §4, §5): `Network`, `Prepared` as an enum over `EvmCall` and
+   `SolanaTransaction`, `Outcome::Expired`, `TxCost`, `Realised.cost`, `DexStub`. The EVM adapters only
+   rewrap. Done when the whole suite and the anvil tests pass unchanged.
+3. **The liquidity contract** (`SPEC.md` §5b): `LiquidityCommand`, `LiquidityEvent`,
+   `LiquidityReport`, `LiquidityCapabilities`. `EvmLiquidity` (now `liquidity/uniswap_v3/`, built with
+   its manager and ABI) and `LiquidityStub` move onto it, and `liquidity_executor_contract` runs V5
+   §8's sequence against both. The consumer's LP runner and paper model move at the same time, proven
+   by its `lp_golden` and `lp_fork`. *Stop and report.*
+4. **`solana/`** (`SPEC.md` §5): `SolanaRpc`, `SolanaSender` with the Surfpool fork backend and its
+   check, the signing backend refusing.
+5. **Jupiter**: `JupiterSimulated`, then `JupiterLive` on Surfpool, each through
+   `dex_executor_contract`.
+6. **Whirlpool**: `WhirlpoolLiquidity` on Surfpool, through `liquidity_executor_contract`. Needs
+   Surfpool installed, and its funding cheatcodes verified (V5 §12.5). *Stop and report.*
+7. The consumer bumps its rev, then runs its paper Whirlpool and its Solana fork gate.
+
+- Done when: steps 1–6 pass as stated, every EVM test here passes with no number changed, and the
+  consumer's gates are green on the new rev.
+- **Status: in progress.** Step 1 done, 1 October 2026, in a scratch crate outside this repository:
+  - **The line** is the one `solana-sdk` 5.0 pins: `solana-transaction` 5.1.0, `solana-message`
+    5.1.0, `solana-instruction` 4.0.0, `solana-hash` 4.7.0, `solana-keypair` 4.0.0, `solana-signer`
+    4.0.0, `solana-pubkey` 4.4.0 (`solana-address` 2.8.0), `solana-signature` 3.6.0. V5 read
+    `solana-transaction` 3.0.2; the crates had moved on.
+  - **Measured:** a v0 memo transaction built, signed, verified and round-tripped through bincode; a
+    transaction Jupiter built (`api.jup.ag/swap/v1`, 0.01 SOL to USDC, v0, one lookup table, 599
+    bytes) decoded and re-encoded byte-identical, then signed by its payer and verified with its
+    message unchanged.
+  - **§12.3: Orca's client builds the instructions.** `orca_whirlpools_client` 8.0 asks for
+    `solana-pubkey` ^3 and `solana-instruction` ^3, which resolve to `solana-pubkey` 3.0.0 (on
+    `solana-address` 1.1.0, whose source is `pub use solana_address_v2::*`) and `solana-instruction`
+    3.5.1 (`pub use solana_instruction_v4::*`). So its `Pubkey` and `Instruction` are the line's own:
+    its `IncreaseLiquidityByTokenAmountsV2` and `UpdateFeesAndRewards` builders compiled into a signed
+    v0 transaction with no conversion. A lockfile that held `solana-address` at 1.0.0 would split the
+    types, which fails to compile rather than silently.
+  - **Its cost:** taken with `default-features = false` (no `orca_whirlpools_core`), it takes the
+    line's graph from 112 crates to 236, bringing `solana-program` 3.0 and its sysvars; beside this
+    crate the total is 393, with one `k256` (0.13.4, the version this crate pins).
+  - **Step 2 done.** `Network`, `Prepared::{Evm, Solana}`, `EvmCall`, `SolanaTransaction`,
+    `Outcome::Expired`, `TxCost` with `native()`, `Realised.cost`, and `DexStub` (was `EvmStub`; a
+    Solana route is prepared as an unsigned transaction for the sender). `EvmLive` reads `gasUsed`,
+    `effectiveGasPrice` and `l1Fee` from the receipt into its cost; `EvmSimulated` reports none, and
+    refuses a Solana route. 173 unit tests pass (167 before, 6 new); the five anvil tests pass with
+    the same output as before the change, 100 lives reconciled to the wei.
+  - **Step 3 done.** `liquidity/mod.rs` is the contract: `LiquidityCommand`, `LiquidityEvent`,
+    `LiquidityReport`, `LiquidityCapabilities` (with `UNISWAP_V3` and `WHIRLPOOL`), and
+    `check_command`, the chain-free checks every venue makes, a paper model included. `EvmLiquidity`
+    (now `liquidity/uniswap_v3/`, built with its manager and `ManagerAbi`) reads the pool's tokens and
+    key from the pool and refuses a pool from another factory; it reads `positions(id)` and refuses a
+    `Remove` above the liquidity and a `Close` on a position that holds liquidity or owes tokens,
+    before sending. `LiquidityStub` keeps the position state its own events imply, so it refuses the
+    same. `liquidity_executor_contract` runs V5 §8's sequence (its rounding bound: one unit per token
+    per deposit). `Prepared::offline` gives a venue that runs nothing real its family's placeholder.
+    179 unit tests pass; on anvil the suite, the 100 lives (27 with a swap) and the injected failures
+    pass — the "Not cleared" burn is now an `Err` before sending, with no block mined. The consumer's
+    LP runner and paper model moved at the same time: its workspace tests (715 passed, 0 failed),
+    the replay goldens and `lp_golden` pass, and `lp_fork` on an Ethereum fork pinned at block
+    26,096,526 gives the same figures before and after (L 177916823714679017, minted
+    (13913933153331884, 1441119065980946), fee 1801218710 token1 units).
+  - **Step 4 done.** `src/solana/`: `SolanaRpc` (JSON-RPC over `reqwest`, no `solana-rpc-client`),
+    `SolanaSender` and `token.rs`. The signing backend refuses. The fork backend refuses a node that
+    does not answer `surfnet_getSurfnetInfo`, generates its key at run time, funds it through
+    `surfnet_setAccount`, and takes its network from the node's genesis hash (Surfpool reports
+    mainnet's). `ensure_balance` writes the owner's associated token account through
+    `surfnet_setTokenAccount`. Surfpool 1.6.0 (the darwin-arm64 release, in `~/.local/bin`) was
+    installed for this; its cheatcodes behave as documented except that both answer `null`
+    (V5 §12.5). On Surfpool forking mainnet: a memo transaction lands with its fee, and the payer's
+    lamports fall by exactly that fee; a blockhash past its height is refused before sending.
+    Against a mock node: an unseen send past its last valid height is `Expired` and blocks nothing,
+    and a `TimedOut` one blocks the next send until resolved. 188 unit tests pass.
+  - **Step 5 done.** `dex/jupiter/`: `JupiterSimulated` (`/swap`, then `simulateTransaction`) and
+    `JupiterLive` (over a `SolanaSender`, Jupiter's blockhash re-stamped with the sender's node's).
+    The minimum is written as the largest bps whose on-chain minimum is still at or above
+    `min_amount_out`. Both pass `dex_executor_contract` on Surfpool forking mainnet, 1 October 2026:
+    5 USDC to wSOL through Orca's SOL/USDC Whirlpool (the test pins `dexes=Whirlpool`), 42,594,159
+    wSOL units quoted and 42,579,328 simulated at 53,478 CU; on the fork, 42,569,092 landed, the
+    fork's own token account agreeing with the transaction's meta. Two causes had to be found first:
+    - **The upstream refused the fork's reads.** Every free node tried answered the burst of account
+      reads a swap needs with HTTP 429 (Solana Vibe Station refuses any `getMultipleAccounts` of more
+      than 3 keys); Surfpool gives up after five retries 500 ms apart and answers "Internal error",
+      and a transaction sent with preflight skipped is dropped, which the sender read as `Expired`.
+      `scripts/rpc-pacer.py` fixes it from outside the crate (`SPEC.md` §5, the Solana family).
+      `SolanaRpcError` now keeps the error's `data`, where Surfpool says why. LeoRPC's free node was
+      tried too: it sends `rentEpoch` as a float, which Surfpool cannot parse.
+    - **The fork's clock is behind the accounts it fetches.** Surfpool's clock runs about a second
+      behind the chain's, and a Whirlpool fetched fresh at send time carries a later reward-update
+      time, so the swap reverted ("Timestamp should be greater than the last updated timestamp").
+      The fork sender now loads a transaction's accounts with a dry run and sends once the fork's
+      clock has passed them. Surfpool's `surfnet_timeTravel` was tried first and dropped: in 1.6.0 it
+      writes the slot's index within the epoch into the `Clock` sysvar's slot, after which a lookup
+      table's entries read as inactive ("Transaction address table lookup uses an invalid index").
+    193 unit tests pass; the four Surfpool tests pass together on a fresh fork.
+  - **Step 6 done.** `liquidity/whirlpool/`: `WhirlpoolLiquidity` over a `SolanaSender`, built with
+    the program id, on `orca_whirlpools_client` 8.0.0 (no default features) for the instructions,
+    accounts, PDAs and event types. On Surfpool forking mainnet, 1 October 2026, on Orca's USDC/USDT
+    Whirlpool (tick spacing 1), from a fork sender the fork funds:
+    - `liquidity_executor_contract` passes: the five events in order, both refusals before sending,
+      the accounting (8,352,275 USDC units and 10,000,000 USDT units paid for liquidity
+      22,945,629,930; 8,352,274 and 9,999,999 released, one unit each under the deposit).
+    - Rent, checked on every landed transaction against the owner's lamports: on a range whose tick
+      arrays exist, `Open` deposits 8,324,160 lamports into the position's three accounts and `Close`
+      returns all of it. On a range whose array did not exist, `Open` creates it (a dynamic array,
+      3,480,000 spent, 1,559,040 of them the two ticks') and deposits 6,765,120; `Remove` releases the
+      ticks and the array gives their 1,559,040 back into the position; `Close` returns 8,324,160.
+      The owner is out of pocket 1,920,960, exactly what the empty array still holds. So V5 §3.4's
+      "rent spent never returns" does not hold for a dynamic tick array: `SolanaCost`'s docs now say
+      what is measured, and the per-life identity (`deposited + spent − returned`) is the exact one.
+      *Superseded the same day (Mo): the rent is signed, see below.*
+    - Fees: 10,000 lamports for `Open` (two signatures), 5,000 for each other command; 65,000 to
+      80,000 compute units for `Open`, 10,000 to 20,000 for the others.
+    202 unit tests pass; clippy is clean.
+  - **Signed rent (1 October 2026, Mo's decision).** `SolanaCost` carries `rent_deposit_lamports` and
+    `rent_spent_lamports`, each the signed net change in its kind of account (the position's three
+    accounts; the range's tick arrays), and `rent_returned_lamports` is gone; `NativeCost` is
+    `{fee, deposit, spent}`, the two rent figures `i128`. The split is now exact per life, not just
+    the net. On Surfpool, on a new array (deposit / spent): `Open` +6,765,120 / +3,480,000, `Remove`
+    +1,559,040 / −1,559,040, `Collect` 0 / 0, `Close` −8,324,160 / 0; on existing arrays `Open`
+    +8,324,160 / 0 and `Close` −8,324,160 / 0. The two rent tests now assert the deposits sum to zero
+    over a life and the spent rent equals what the new array holds. All three Whirlpool Surfpool tests
+    pass; 202 unit tests pass; clippy is clean.
 
 ## Tracking
 

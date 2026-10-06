@@ -1,28 +1,30 @@
 //! A position's whole life through the liquidity port (`SPEC.md` §5b):
-//! mint, increase, decrease, collect, burn.
+//! open, add, remove, collect, close.
 //!
 //! This crate does not choose the range, size the position, or remember
-//! what it minted (§2, §5b's non-goals): the caller decided the range and
-//! amounts below, and keeps the `PositionRef` each step hands back. Against
-//! `LiquidityStub` every outcome is programmed first; swap in `EvmLiquidity`
-//! over a fork sender (`EvmSender::fork`) for a Simulated run, or over a
-//! signing sender for a Live one — the calls do not change.
+//! what it opened (§2, §5b's non-goals): the caller decided the range and
+//! amounts below, and keeps the `PositionId` the `Opened` event hands back.
+//! The caller names no venue and branches on one capability only, to build
+//! the deposit's guard; the token flow and the fees come from the events,
+//! the same way on every venue. Against `LiquidityStub` every outcome is
+//! programmed first; swap in `EvmLiquidity` over a fork sender
+//! (`EvmSender::fork`) for a Simulated run, or over a signing sender for a
+//! Live one — the calls do not change.
 
 use venue_ports::dex::Outcome;
 use venue_ports::liquidity::{
-    LandedUnread, LiquidityAction, LiquidityExecutor, LiquidityRealised, LiquidityRequest,
-    LiquidityStub, PoolKey, PositionRef, RangeSpec,
+    Deposit, DepositGuard, DepositGuardKind, LandedUnread, LiquidityCapabilities, LiquidityCommand,
+    LiquidityEvent, LiquidityExecutor, LiquidityRequest, LiquidityStub, PositionId, Range,
+    TokenPair,
 };
+use venue_ports::Network;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let manager = vec![0xC3; 20];
-    let range = RangeSpec {
-        chain_id: 8453,
-        manager: manager.clone(),
-        token0: vec![0xA0; 20],
-        token1: vec![0xB1; 20],
-        pool_key: PoolKey::Fee(500),
+    let base = Network::evm(8453);
+    let range = Range {
+        network: base,
+        pool: vec![0xC3; 20],
         tick_lower: -1_000,
         tick_upper: 1_000,
     };
@@ -33,106 +35,170 @@ async fn main() -> anyhow::Result<()> {
 
     // What a real manager would report, programmed up front: the stub
     // never invents liquidity or amounts.
-    let stub = LiquidityStub::new();
-    let position = PositionRef {
-        chain_id: 8453,
-        manager,
-        id: token_id(1_234),
+    let stub = LiquidityStub::new(LiquidityCapabilities::UNISWAP_V3);
+    let position = PositionId {
+        network: base,
+        bytes: token_id(1_234),
     };
-    stub.program_success(position.clone(), 50_000, 1_000_000, 2_000_000, 100);
-    stub.program_success(position.clone(), 10_000, 200_000, 400_000, 101);
-    stub.program_success(position.clone(), 60_000, 1_199_999, 2_399_999, 102);
-    stub.program_success(position.clone(), 0, 1_200_310, 2_400_020, 103);
-    stub.program_success(position, 0, 0, 0, 104);
+    stub.program_event(
+        LiquidityEvent::Opened {
+            position: position.clone(),
+            liquidity: 50_000,
+            paid: TokenPair::new(1_000_000, 2_000_000),
+        },
+        100,
+    );
+    stub.program_event(
+        LiquidityEvent::Added {
+            liquidity: 10_000,
+            paid: TokenPair::new(200_000, 400_000),
+        },
+        101,
+    );
+    stub.program_event(
+        LiquidityEvent::Removed {
+            liquidity: 60_000,
+            released: TokenPair::new(1_199_999, 2_399_999),
+            transferred: TokenPair::default(),
+        },
+        102,
+    );
+    stub.program_event(
+        LiquidityEvent::Collected {
+            transferred: TokenPair::new(1_200_310, 2_400_020),
+        },
+        103,
+    );
+    stub.program_event(LiquidityEvent::Closed, 104);
 
-    let minted = step(
+    // The one branch a caller makes: the guard the venue enforces.
+    let deposit = |max: TokenPair| Deposit {
+        max,
+        guard: match stub.capabilities().deposit_guard {
+            DepositGuardKind::MinAmounts => DepositGuard::MinAmounts(TokenPair::new(
+                max.token0 / 100 * 99,
+                max.token1 / 100 * 99,
+            )),
+            DepositGuardKind::SqrtPriceBand => DepositGuard::SqrtPriceBand {
+                min_sqrt_price_x64: 1 << 63,
+                max_sqrt_price_x64: 1 << 65,
+            },
+        },
+    };
+
+    let mut events = Vec::new();
+    let Some(opened) = step(
         &stub,
-        LiquidityAction::Mint {
+        LiquidityCommand::Open {
             range,
-            amount0_desired: 1_000_000,
-            amount1_desired: 2_000_000,
-            amount0_min: 990_000,
-            amount1_min: 1_980_000,
+            deposit: deposit(TokenPair::new(1_000_000, 2_000_000)),
         },
         &request,
     )
-    .await?;
-    let Some(position) = minted.position.clone() else {
+    .await?
+    else {
         // A revert or timeout: there is no position to go on with.
         return Ok(());
     };
-    let mut liquidity = minted.liquidity_delta.unwrap_or(0);
+    let LiquidityEvent::Opened {
+        position,
+        mut liquidity,
+        ..
+    } = opened.clone()
+    else {
+        unreachable!("an Open answers Opened");
+    };
+    events.push(opened);
 
-    let increased = step(
+    let Some(added) = step(
         &stub,
-        LiquidityAction::Increase {
+        LiquidityCommand::Add {
             position: position.clone(),
-            amount0_desired: 200_000,
-            amount1_desired: 400_000,
-            amount0_min: 0,
-            amount1_min: 0,
+            deposit: deposit(TokenPair::new(200_000, 400_000)),
         },
         &request,
     )
-    .await?;
-    liquidity += increased.liquidity_delta.unwrap_or(0);
+    .await?
+    else {
+        return Ok(());
+    };
+    if let LiquidityEvent::Added {
+        liquidity: more, ..
+    } = added
+    {
+        liquidity += more;
+    }
+    events.push(added);
 
-    // Decrease moves the liquidity into the position's owed tokens and
-    // transfers nothing; collect is what pays out, principal plus fees.
-    step(
-        &stub,
-        LiquidityAction::Decrease {
+    for cmd in [
+        LiquidityCommand::Remove {
             position: position.clone(),
             liquidity,
-            amount0_min: 0,
-            amount1_min: 0,
+            min_out: TokenPair::default(),
         },
-        &request,
-    )
-    .await?;
-    step(
-        &stub,
-        LiquidityAction::Collect {
+        LiquidityCommand::Collect {
             position: position.clone(),
-            amount0_max: u128::MAX,
-            amount1_max: u128::MAX,
         },
-        &request,
-    )
-    .await?;
-    step(&stub, LiquidityAction::Burn { position }, &request).await?;
+        LiquidityCommand::Close { position },
+    ] {
+        let Some(event) = step(&stub, cmd, &request).await? else {
+            return Ok(());
+        };
+        events.push(event);
+    }
+
+    // The same accounting on every venue: what reached the owner, less
+    // what it released, is what the position earned.
+    let mut paid = TokenPair::default();
+    let mut released = TokenPair::default();
+    let mut transferred = TokenPair::default();
+    for event in &events {
+        match event {
+            LiquidityEvent::Opened { paid: p, .. } | LiquidityEvent::Added { paid: p, .. } => {
+                paid = paid.saturating_add(*p)
+            }
+            LiquidityEvent::Removed { released: r, .. } => released = released.saturating_add(*r),
+            _ => {}
+        }
+        transferred = transferred.saturating_add(event.transferred());
+    }
+    println!(
+        "paid {paid:?}, got back {transferred:?}, fees earned ({}, {})",
+        transferred.token0 - released.token0,
+        transferred.token1 - released.token1
+    );
     Ok(())
 }
 
-/// Runs one action and reacts to what came back — never assuming
-/// `Success`, never reading a revert or a timeout as zeros.
+/// Runs one command and reacts to what came back — never assuming
+/// `Success`, never reading a revert or a timeout as zeros. `None` when it
+/// did not succeed.
 async fn step(
     executor: &dyn LiquidityExecutor,
-    action: LiquidityAction,
+    cmd: LiquidityCommand,
     request: &LiquidityRequest,
-) -> anyhow::Result<LiquidityRealised> {
-    let kind = action.kind();
-    let prepared = executor.prepare(&action, request).await?;
-    let realised = match executor.execute(&prepared).await {
-        Ok(realised) => realised,
+) -> anyhow::Result<Option<LiquidityEvent>> {
+    let kind = cmd.kind();
+    let prepared = executor.prepare(&cmd, request).await?;
+    let report = match executor.execute(&prepared).await {
+        Ok(report) => report,
         Err(err) if err.downcast_ref::<LandedUnread>().is_some() => {
             // Something happened on chain that could not be read: inspect
             // the transaction before touching this position again.
             println!("[{}] {kind}: landed but unread — {err}", executor.label());
             return Err(err);
         }
-        // Any other error means nothing was sent for the action.
+        // Any other error means nothing was sent for the command.
         Err(err) => return Err(err),
     };
-    match &realised.outcome {
+    match &report.outcome {
         Outcome::Success => println!(
-            "[{}] {kind}: liquidity {:?}, amounts {:?} / {:?} (block {}, {:?})",
+            "[{}] {kind}: {:?} (block {}, {:?}, cost {:?})",
             executor.label(),
-            realised.liquidity_delta,
-            realised.amount0,
-            realised.amount1,
-            realised.at,
-            realised.provenance
+            report.event,
+            report.at,
+            report.provenance,
+            report.cost.native()
         ),
         Outcome::Reverted { reason } => {
             println!("[{}] {kind}: reverted — {reason}", executor.label())
@@ -141,19 +207,20 @@ async fn step(
             "[{}] {kind}: timed out — its fate is unknown; resolve it before anything else",
             executor.label()
         ),
+        Outcome::Expired => println!("[{}] {kind}: expired — it can never land", executor.label()),
     }
-    Ok(realised)
+    Ok(report.event)
 }
 
 fn token_id(id: u64) -> Vec<u8> {
-    let mut bytes = vec![0; 24];
-    bytes.extend_from_slice(&id.to_be_bytes());
+    let mut bytes = vec![0; 32];
+    bytes[24..].copy_from_slice(&id.to_be_bytes());
     bytes
 }
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs()
 }

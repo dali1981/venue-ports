@@ -9,16 +9,16 @@ pub mod tx;
 pub use rpc::{BlockTag, EvmRpc, Receipt, RpcError, RpcLog};
 pub use tx::{EvmSender, FeePolicy, PollSettings, Signer, TxOutcome};
 
-use crate::dex::Prepared;
+use crate::dex::EvmCall;
 use alloy_primitives::{keccak256, B256};
 
-/// A key correlating a `Prepared` value with the context an adapter's
-/// `prepare()` stashed for it, so `execute()` can recover what it needs
-/// without the trait signature carrying it.
-pub(crate) fn prepared_key(prepared: &Prepared) -> B256 {
-    let mut buf = Vec::with_capacity(prepared.to.len() + prepared.calldata.len() + 16);
-    buf.extend_from_slice(&prepared.to);
-    buf.extend_from_slice(&prepared.calldata);
-    buf.extend_from_slice(&prepared.value.to_be_bytes());
+/// A key correlating an `EvmCall` with the context an adapter's `prepare()`
+/// stashed for it, so `execute()` can recover what it needs without the
+/// trait signature carrying it.
+pub(crate) fn prepared_key(call: &EvmCall) -> B256 {
+    let mut buf = Vec::with_capacity(call.to.len() + call.calldata.len() + 16);
+    buf.extend_from_slice(&call.to);
+    buf.extend_from_slice(&call.calldata);
+    buf.extend_from_slice(&call.value.to_be_bytes());
     keccak256(buf)
 }

@@ -172,6 +172,10 @@ impl BybitLive {
             commission_asset,
             provenance: Provenance::Landed,
             order_ref,
+            client_order_id: Some(order_link_id.to_string()),
+            venue_time_ms: order.updated_time.as_deref().and_then(|ms| ms.parse().ok()),
+            // This adapter reads the order, not its executions.
+            trades: Vec::new(),
         })
     }
 }
@@ -316,7 +320,8 @@ mod tests {
                 "orderStatus": status,
                 "avgPrice": avg_price,
                 "cumExecQty": qty,
-                "cumExecFee": fee
+                "cumExecFee": fee,
+                "updatedTime": "1684738540561"
             }]},
             "retExtInfo": {}, "time": 2
         }))
@@ -373,6 +378,10 @@ mod tests {
             link_id.starts_with("vp-") && link_id.len() <= 36,
             "{link_id}"
         );
+        assert_eq!(fill.client_order_id, Some(link_id));
+        assert_eq!(fill.venue_time_ms, Some(1_684_738_540_561));
+        assert!(fill.trades.is_empty(), "this adapter lists no trades");
+        crate::testkit::contract::assert_fill_shape(&fill, adapter.label());
     }
 
     #[tokio::test]

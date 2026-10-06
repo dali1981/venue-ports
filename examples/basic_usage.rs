@@ -3,7 +3,7 @@
 //! This crate does not quote routes, size orders, or decide anything (see
 //! `SPEC.md` §2's non-goals) — a real caller would get `route`/`order`
 //! below from elsewhere (a router's own quote endpoint, its own sizing
-//! logic) and would replace `EvmStub`/`CexStub` with `EvmSimulated`/
+//! logic) and would replace `DexStub`/`CexStub` with `EvmSimulated`/
 //! `EvmLive` and a venue's `Live` adapter once it wants a real (or
 //! simulated) fill instead of a programmed one.
 
@@ -11,8 +11,10 @@ use std::str::FromStr;
 
 use rust_decimal::Decimal;
 use venue_ports::cex::{CexExecutor, CexStub, OrderRequest, OrderSide, OrderStateUnknown};
-use venue_ports::dex::evm::EvmStub;
-use venue_ports::dex::{DexExecutor, Outcome, RouteQuote, SwapRequest};
+use venue_ports::dex::{
+    DexExecutor, DexStub, Outcome, Payer, PriorityBid, RouteQuote, SwapRequest,
+};
+use venue_ports::Network;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -22,11 +24,11 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_dex_leg() -> anyhow::Result<()> {
-    let dex = EvmStub::new();
+    let dex = DexStub::new();
 
     // Stands in for a route an aggregator already priced upstream.
     let route = RouteQuote {
-        chain_id: 1,
+        network: Network::evm(1),
         token_in: vec![0xA0; 20],
         token_out: vec![0xB1; 20],
         amount_in: 1_000_000,
@@ -36,8 +38,10 @@ async fn run_dex_leg() -> anyhow::Result<()> {
     let req = SwapRequest {
         sender: vec![0xC2; 20],
         recipient: vec![0xC2; 20],
+        payer: Payer::Sender,
         min_amount_out: 900_000,
         deadline_unix_secs: 0,
+        priority: PriorityBid::Policy,
     };
 
     let prepared = dex.prepare(&route, &req).await?;
@@ -65,6 +69,9 @@ async fn run_dex_leg() -> anyhow::Result<()> {
                 "[{}] swap timed out — outcome unknown, resolve out of band",
                 dex.label()
             );
+        }
+        Outcome::Expired => {
+            println!("[{}] swap expired — it can never land", dex.label());
         }
     }
 
