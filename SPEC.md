@@ -521,7 +521,14 @@ Rules:
 The EVM chain family's plumbing is shared by every EVM adapter rather than copied into each:
 `src/evm/rpc.rs` (`EvmRpc`: JSON-RPC, `eth_call` with `from` and state overrides, receipts,
 revert-reason replay, hex/ABI helpers) and `src/evm/erc20.rs` (selectors, balance and allowance reads,
-storage-slot probing).
+storage-slot probing). The probing is one prober for every adapter: a token's `balanceOf` and `allowance`
+mappings are found once per token, in one `eth_call` each, by writing a sentinel of its own into the slot
+each candidate base would put the entry at and reading back which one the token returns. The candidates are
+the first 24 storage slots and OpenZeppelin v5's ERC-7201 namespace for its upgradeable ERC-20
+(`erc7201:openzeppelin.storage.ERC20`, where MORPHO on Base keeps its state: the balances at the namespace,
+the allowances one slot on, both checked against the storage `ERC20Upgradeable` v5.6.1 and v5.7.0 write). A
+token that keeps them anywhere else is an error naming what was probed, and a node that did not answer is an
+error, never "no candidate".
 
 ### The Solana family — one sender per wallet and cluster
 

@@ -191,14 +191,13 @@ impl EvmSimulated {
             Payer::CalledContract => router,
         };
         let amount_in = format_u256(U256::from(ctx.amount_in));
-        let balance_index =
+        let balance_slot =
             erc20::find_balance_slot(&self.rpc, &self.slots, ctx.token_in, holder, tag).await?;
-        let balance_slot = erc20::mapping_slot(holder, balance_index);
         set_slot(&mut overrides, ctx.token_in, balance_slot, &amount_in);
 
         match ctx.payer {
             Payer::Sender => {
-                let allowance_index = erc20::find_allowance_slot(
+                let allowance_slot = erc20::find_allowance_slot(
                     &self.rpc,
                     &self.slots,
                     ctx.token_in,
@@ -207,7 +206,6 @@ impl EvmSimulated {
                     tag,
                 )
                 .await?;
-                let allowance_slot = erc20::allowance_slot(ctx.sender, router, allowance_index);
                 set_slot(&mut overrides, ctx.token_in, allowance_slot, &amount_in);
             }
             // The contract pays the venue from its own balance: no allowance.
@@ -525,7 +523,15 @@ mod tests {
         // The allowance override must have gone to the router the route
         // actually calls (SPEC.md §5's explicit pitfall), not some other
         // address.
-        assert_eq!(adapter.slots.allowance_index(token, router_addr), Some(0));
+        let calls = eth_calls(&server).await;
+        let overrides = &swap_call(&calls, &calldata)["params"][2][token.to_string()]["stateDiff"];
+        let sender = Address::from([0xCC; 20]);
+        assert_eq!(
+            overrides[allowance_slot(sender, router_addr, 0).to_string()],
+            format_u256(U256::from(1_000u64)),
+            "the sender's allowance to the router"
+        );
+        assert_eq!(adapter.slots.allowance_base(token), Some(0u64.into()));
     }
 
     /// Every request of `method` a mock node received, as its JSON body.
@@ -562,6 +568,48 @@ mod tests {
                 .unwrap()
                 .starts_with(&hex_data(&ALLOWANCE_SELECTOR))
         })
+    }
+
+    /// MORPHO on Base keeps its state under OpenZeppelin v5's ERC-7201
+    /// namespace, not in a low slot: the balance override goes where the
+    /// namespace puts the sender's balance, and the allowance override one
+    /// slot on from it, to the router the route calls.
+    #[tokio::test]
+    async fn a_token_under_openzeppelins_namespace_is_overridden_there() {
+        use crate::evm::erc20::{OZ_ERC20_ALLOWANCES, OZ_ERC20_NAMESPACE};
+
+        let server = MockServer::start().await;
+        let router = [0x11; 20];
+        let calldata = vec![0x01, 0x02, 0x03, 0x04];
+        let token = Address::from([0xAA; 20]);
+        let sender = Address::from([0xCC; 20]);
+        let balance_slot = mapping_slot(sender, OZ_ERC20_NAMESPACE);
+        let allowance = allowance_slot(sender, Address::from(router), OZ_ERC20_ALLOWANCES);
+        mount_slot_probe(&server, BALANCE_OF_SELECTOR, balance_slot).await;
+        mount_slot_probe(&server, ALLOWANCE_SELECTOR, allowance).await;
+        mount_swap(
+            &server,
+            &calldata,
+            U256::from(777u64).to_be_bytes::<32>().to_vec(),
+        )
+        .await;
+
+        let adapter = EvmSimulated::new(EvmRpc::new(server.uri()));
+        let prepared = adapter
+            .prepare(&route(payload_for(router, &calldata)), &request())
+            .await
+            .unwrap();
+        let realised = adapter.execute(&prepared, Some(42)).await.unwrap();
+        assert_eq!(realised.amount_out, Some(777));
+
+        let calls = eth_calls(&server).await;
+        let diff = swap_call(&calls, &calldata)["params"][2][token.to_string()]["stateDiff"]
+            .as_object()
+            .unwrap();
+        assert_eq!(diff.len(), 2, "the balance and the allowance: {diff:?}");
+        let amount = format_u256(U256::from(1_000u64));
+        assert_eq!(diff[&balance_slot.to_string()], amount);
+        assert_eq!(diff[&allowance.to_string()], amount);
     }
 
     /// A contract that keeps its own inventory: the balance goes on the
@@ -1180,8 +1228,8 @@ mod tests {
             .expect("allowance storage slot should be probeable on real USDC");
 
         eprintln!(
-            "real Sepolia USDC @ {block:?}: balanceOf slot index {balance_index}, \
-             allowance slot index {allowance_index}"
+            "real Sepolia USDC @ {block:?}: balanceOf slot {balance_index}, \
+             allowance slot {allowance_index}"
         );
     }
 

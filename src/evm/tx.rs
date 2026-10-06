@@ -447,7 +447,7 @@ impl EvmSender {
                  to send a transaction that would revert"
             ),
             Backend::Fork => {
-                let index = erc20::find_balance_slot(
+                let slot = erc20::find_balance_slot(
                     &self.rpc,
                     &self.slots,
                     token,
@@ -455,7 +455,6 @@ impl EvmSender {
                     BlockTag::Latest,
                 )
                 .await?;
-                let slot = erc20::mapping_slot(holder, index);
                 self.rpc
                     .call(
                         "anvil_setStorageAt",
@@ -1268,8 +1267,8 @@ pub(crate) mod tests {
                 .mount(&server)
                 .await;
         }
-        // A token whose `balanceOf` mapping is at slot 0: a probe touching the
-        // holder's slot reads the marker, and a plain read reads what
+        // A token whose `balanceOf` mapping is at slot 0: a probe reads back
+        // what it wrote into the holder's slot, and a plain read reads what
         // `anvil_setStorageAt` last wrote there.
         let written = Arc::new(Mutex::new(U256::ZERO));
         let written_by_node = written.clone();
@@ -1278,16 +1277,12 @@ pub(crate) mod tests {
             .respond_with(move |req: &wiremock::Request| {
                 let body: Value = req.body_json().unwrap();
                 let value = match body["params"].get(2) {
-                    Some(overrides) => {
-                        if overrides[token.to_string()]["stateDiff"]
-                            .get(holder_slot.to_string())
-                            .is_some()
-                        {
-                            erc20::probe_marker()
-                        } else {
-                            U256::ZERO
-                        }
-                    }
+                    Some(overrides) => overrides[token.to_string()]["stateDiff"]
+                        .get(holder_slot.to_string())
+                        .and_then(|written| written.as_str())
+                        .map_or(U256::ZERO, |written| {
+                            crate::evm::rpc::parse_hex_u256(written).unwrap()
+                        }),
                     None => *written_by_node.lock().unwrap(),
                 };
                 ok(json!(format_u256(value)))
