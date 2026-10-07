@@ -1,7 +1,8 @@
 # Proposed changes
 
 **Status: V0–V4 are accepted into `SPEC.md` and built. V5 is accepted (1 October 2026) and copied
-into `SPEC.md`; it is phase 15, in progress.** V0–V4 are phases 10–14 of `IMPLEMENTATION_PLAN.md`,
+into `SPEC.md`; it is phase 15, in progress. V6 (7 October 2026) is copied into `SPEC.md` and is phase 16,
+on branch `m10c-balances-resolution`.** V0–V4 are phases 10–14 of `IMPLEMENTATION_PLAN.md`,
 which records what each still needs before it counts as done — mostly testnet keys and a Base fork.
 
 Each file here specifies one change to the crate, to be built in this repository. `SPEC.md` stays
@@ -21,6 +22,7 @@ turns an action the consumer has already decided on into an outcome, which is al
 | [V3](V3-liquidity-port.md) | The liquidity port: mint, increase, decrease, collect and burn on concentrated-liquidity position managers, with stub, fork-simulated and live adapters | V0 | an anvil fork (Simulated); a funded testnet key (Live) | 6.5 |
 | [V4](V4-cex-account-reads.md) | `CexAccount`, a read-only port for a perp position, margin and funding as the venue reports them | V2's REST client | futures testnet keys | 1.5 |
 | [V5](V5-venues-and-solana.md) | One contract per port for every venue (commands, events, capabilities); `Prepared` as an enum; `Network`; per-family cost; the Solana family; Jupiter and Orca Whirlpool | V3 | Surfpool (Simulated) | — |
+| [V6](V6-balances-and-resolution.md) | `EvmBalanceReader` and `SpotBalanceReader`; `EvmLive::resolve` and `Resolution`; `CexOrders::order_state`; a signing sender on anvil is `Simulated` | V0, V1 | anvil (gated tests) | 3 |
 | **Total (V0–V4)** | | | | **13** |
 
 ## Order

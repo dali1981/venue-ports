@@ -590,6 +590,39 @@ Order of work, each step compiled and tested before the next (V5 §11):
     over a life and the spent rent equals what the new array holds. All three Whirlpool Surfpool tests
     pass; 202 unit tests pass; clippy is clean.
 
+## Phase 16 — balance reads, resolving an unknown order, a fork is `Simulated` (V6)
+
+[V6](specs/V6-balances-and-resolution.md), requested 7 October 2026 by a consumer that runs against a fork and
+the Binance spot testnet and reconciles its books to the unit (arb-searcher's M10c, F5). Its signatures are in
+`SPEC.md` §2, §5, §6, §6c, §7 and §8. Branch `m10c-balances-resolution`, from `a914b5b` (`main` on origin).
+**Not pushed and not merged; the consumer's pin moves only on the owner's word.**
+
+Order of work, each step compiled and tested before the next:
+
+1. **The sender.** `EvmSender::connect` reads `web3_clientVersion` once and is `Simulated` on anvil;
+   `EvmSender::resolve` returns a typed `TxReplacedOrDropped` for a replaced or dropped transaction, so a failed
+   read and a drop can be told apart. No EVM number moves.
+2. **`EvmBalanceReader`**: `EvmRpc::balance_at`, `EvmBalances`, `EvmBalanceStub`, `evm_balance_reader_contract`.
+3. **`SpotBalanceReader`**: `BinanceRest` and `BinanceLive` over `GET /api/v3/account?omitZeroBalances=true`,
+   `SpotBalanceStub`, `spot_balance_reader_contract`.
+4. **`EvmLive::resolve`**: `Resolution`; the swap's context kept by hash when a send ends `TimedOut`; the
+   transfer-log decoders shared with `execute`.
+5. **`CexOrders`**: `OrderState`, `BinanceLive`'s single status read and the trade lines of a fill (the code
+   `execute` uses), `NotFound` held back until `recvWindow` and the clock bound have passed for a lost request;
+   `CexStub`; `cex_orders_contract`.
+6. **Gated tests** on `EVM_ANVIL_RPC_URL`.
+
+- Done when: the contract suites pass against the stubs, the `wiremock` cases pass, the anvil tests pass on a
+  node, `cargo test`, `cargo fmt --check` and `cargo clippy` are clean, and every figure that was in the suite
+  before is unchanged.
+- **Status: built; the stub and `wiremock` criteria are met; the anvil tests are written and gated, not yet
+  run.** The Binance bodies the readers are tested on are copied from the documentation
+  (<https://github.com/binance/binance-spot-api-docs>, `rest-api.md`: account information, query order, new
+  order `FULL`), each marked `TODO(R2)` for the recorded testnet bodies. `BinanceFuturesLive` and `BybitLive`
+  have no `CexOrders`.
+- **`PriorityBid::AbovePolicyPerGas` stays refused**: `EvmSender` takes no priority bid and `EvmLive::prepare`
+  refuses one above zero by name, so a signing sender sends at its `FeePolicy` only.
+
 ## Tracking
 
 Each phase's "Done when" line is its exit criterion. Treat §9 of `SPEC.md` as the authoritative

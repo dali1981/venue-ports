@@ -24,7 +24,7 @@ This crate does **not**:
 - decide whether a trade is worth taking, or size one;
 - track positions, balances, or capital — hold, compute, or cache them — or enforce any risk policy.
   *Reading* what a venue reports about an account, at the moment it is asked, is not tracking:
-  nothing is kept between calls and nothing is derived (§6b);
+  nothing is kept between calls and nothing is derived (§6b, §6c);
 - persist anything — every call returns a value; what the caller does with it (log it, write it to a
   database, throw it away) is entirely the caller's concern;
 - know anything about a specific trading strategy. A market-making system, a directional system, and
@@ -469,6 +469,43 @@ pub trait DexExecutor: Send + Sync {
 `Stub` is chain-family-agnostic and is not duplicated per chain. The trait does not change for a
 second family: only `Prepared`, `Outcome` and `TxCost` gained the Solana forms above.
 
+### Resolving a swap left unknown
+
+An `EvmLive` send that ends `Outcome::TimedOut` is not over. `EvmLive` keeps what it needs to read the
+swap's result by the transaction's hash, until the chain has decided it, and a caller asks again:
+
+```rust
+// src/dex/mod.rs
+/// What became of a swap whose adapter gave up waiting, as the chain says now.
+#[derive(Debug, Clone)]
+pub enum Resolution {
+    /// Not decided: the node still knows the transaction, or its nonce is unused and another node may yet
+    /// broadcast it. Ask again.
+    Pending,
+    /// It ended: mined, a revert included. A success carries `amount_in` and `amount_out` read exactly as a
+    /// sent swap's are (what the pool took is what is booked).
+    Done(Realised),
+    /// Replaced or dropped, and did not land.
+    Gone,
+}
+
+// src/dex/evm/live.rs
+impl EvmLive {
+    /// `tx_hash` is the hash an `execute` of this adapter ended `TimedOut` with (`Realised.tx_ref`).
+    pub async fn resolve(&self, tx_hash: B256) -> Result<Resolution>;
+}
+```
+
+- `Gone` is only for a transaction the node no longer knows whose nonce has been used. `EvmSender::resolve`
+  returns an `Err` for that and for a failed RPC read; the first is a `TxReplacedOrDropped` (found with
+  `downcast_ref`, with the message it always had), the second leaves the sender's latch intact and is an `Err`
+  of `EvmLive::resolve` too. A failed read is never `Gone`.
+- A hash this adapter did not time out is an `Err`. Resolve through `EvmLive`, not through the sender: the
+  sender's `resolve` clears its latch and hands the outcome to its caller, after which `EvmLive::resolve` of
+  that hash is an `Err`.
+- `Done`'s amounts come from the same transfer-log decoders `execute` uses.
+- A swap's context is kept in memory only: after a restart there is nothing to resolve through.
+
 ### The EVM sender — one per wallet and chain
 
 Every adapter that sends from an EVM wallet (`EvmLive`, and `EvmLiquidity` in §5b) sends through the
@@ -496,11 +533,14 @@ pub enum TxOutcome {
 pub struct FeePolicy { pub base_fee_multiplier: u32, pub fallback_priority_fee_wei: u128 }
 
 impl EvmSender {
-    /// Checks `eth_chainId` against `chain_id`. Returns an error if this
-    /// process already holds an `EvmSender` for the same (address, chain_id).
+    /// Checks `eth_chainId` against `chain_id`, and reads `web3_clientVersion` once: a node that reports
+    /// `anvil` makes this sender `Simulated`. Returns an error if this process already holds an
+    /// `EvmSender` for the same (address, chain_id).
     pub async fn connect(rpc: EvmRpc, signer: Signer, chain_id: u64, fees: FeePolicy) -> Result<Arc<Self>>;
     pub fn address(&self) -> Address;
     pub fn chain_id(&self) -> u64;
+    /// `Simulated` for a fork sender, and for a signing sender whose node is anvil; `Landed` otherwise.
+    pub fn provenance(&self) -> Provenance;
 
     /// Build, sign, broadcast and poll one transaction to a terminal
     /// outcome, holding the send lock throughout. Returns an error without
@@ -519,7 +559,8 @@ impl EvmSender {
     /// clears it. Returns `None` if it is still pending. Once the node no
     /// longer knows the hash and the account's `latest` nonce has moved past
     /// it, it was replaced or dropped: that is reported as an error naming the
-    /// hash, and the hash is cleared.
+    /// hash (a `TxReplacedOrDropped`), and the hash is cleared. A failed read is another error and
+    /// leaves the hash.
     pub async fn resolve(&self) -> Result<Option<TxOutcome>>;
 
     /// The node this sender talks to, for reads alongside its sends.
@@ -544,6 +585,13 @@ Rules:
 - **Nothing is sent over an unresolved timeout.** After a `TimedOut`, every send is refused until
   `resolve` has cleared the hash. This makes `Outcome::TimedOut`'s "resolve before anything else" rule
   impossible to skip.
+- **A fork never reads as a landing.** `connect` reads `web3_clientVersion` once and keeps the answer. A
+  node whose version starts with `anvil` makes the sender `Simulated`, so every outcome an adapter reports
+  through it says so, and a fork run signed with a real key cannot be read as a mainnet trade. A node that
+  answers with an error object (it has no such method) is not anvil; a node that cannot be asked at all is an
+  error. A signing sender still never writes a balance (`ensure_balance`), anvil included.
+- **The sender prices a transaction by its `FeePolicy` alone.** It takes no priority bid: `EvmLive` refuses
+  `PriorityBid::AbovePolicyPerGas` above zero, by name, over a signing sender and a fork sender alike.
 - **No convenience constructor builds a sender inside an adapter.** It would make a second sender for
   the same wallet the easy thing to write.
 
@@ -1120,6 +1168,47 @@ after the fact says its top-level message twice; an `OrderStateUnknown` this cra
 A second venue (a different exchange, with a different wire protocol) gets its own `Live`
 implementation; the trait does not change.
 
+### Resolving an order left unknown
+
+An `OrderStateUnknown` names an order the venue may have filled. `CexOrders` asks the venue again, by the
+client order id the adapter itself gave it:
+
+```rust
+// src/cex/orders.rs
+#[derive(Debug, Clone)]
+pub enum OrderState {
+    /// Ended `FILLED`: the whole fill.
+    Filled(CexFill),
+    /// Ended with part filled and the rest not (`EXPIRED`, `CANCELED`, `EXPIRED_IN_MATCH`: a market order
+    /// that ran out of book, for example). What `execute` returns as a partial `CexFill`.
+    PartlyFilled(CexFill),
+    /// Ended with nothing filled: the venue accepted the order and it ended in `status`.
+    Rejected { order_ref: u64, status: String },
+    /// The venue has no such order, and can no longer accept the request that placed it: nothing filled.
+    NotFound,
+    /// Not settled: still working, or the venue does not know it yet and could still accept the lost
+    /// request. Ask again.
+    Open,
+}
+
+#[async_trait]
+pub trait CexOrders: Send + Sync {
+    async fn order_state(&self, symbol: &str, client_order_id: &str) -> Result<OrderState>;
+    fn label(&self) -> &'static str;
+}
+```
+
+- **One read, no waiting.** The same status query `execute` follows an order with, once, and the trade lines
+  of a fill read as `execute` reads them. The caller sets the schedule.
+- **`Err` is a read that failed.** Ask again. It is never `NotFound`.
+- **`NotFound` is conclusive only after `recvWindow` and the clock's error bound have passed** since the
+  request that placed the order was signed. `BinanceLive` remembers that moment for each placing request whose
+  answer it lost, until the order's state has been read; "no such order" before then is `Open`. For an id it
+  holds no lost request for, "no such order" is `NotFound` at once.
+- No caller chooses a client order id, so a resolver cannot turn a resend into a first send; Binance refuses a
+  reused id only while the first order is open.
+- `BinanceLive` and `CexStub` implement it. `BinanceFuturesLive` and `BybitLive` do not.
+
 ## 6b. Reading a perp account
 
 A consumer holding a perp position needs three facts only the venue knows: the position the venue
@@ -1193,6 +1282,55 @@ account was read, testnet or production, is the adapter's `label()` and base URL
   position per symbol; more than one row for a symbol is an error, never a sum.
 - **`CexAccountStub`** — programmable values and errors; records its calls.
 
+## 6c. Reading balances
+
+A consumer that keeps its own books reconciles them against what a venue holds. The `BalanceReader` port is
+one trait per kind of account: the figure the venue reports, at the moment (and, on EVM, the block) it is
+asked, exact. Nothing is cached, summed or valued (§2).
+
+```rust
+// src/balance/mod.rs
+#[async_trait]
+pub trait EvmBalanceReader: Send + Sync {
+    /// `address`'s native balance in wei at `block`.
+    async fn native(&self, address: Address, block: BlockTag) -> Result<ChainAmount>;
+    /// `holder`'s `balanceOf` of `token` at `block`.
+    async fn token(&self, token: Address, holder: Address, block: BlockTag) -> Result<ChainAmount>;
+    fn label(&self) -> &'static str;
+}
+
+pub struct SpotBalance { pub asset: String, pub free: Decimal, pub locked: Decimal }
+
+pub struct SpotAccountBalances {
+    /// Only assets the account holds some of: an asset that is absent is held at zero.
+    pub balances: Vec<SpotBalance>,
+    /// The venue's time of the account's last change (`updateTime`), in Unix ms.
+    pub update_time_ms: Option<u64>,
+}
+
+#[async_trait]
+pub trait SpotBalanceReader: Send + Sync {
+    async fn balances(&self) -> Result<SpotAccountBalances>;
+    fn label(&self) -> &'static str;
+}
+```
+
+- An amount above `u128` is an error naming the token and holder, never truncated.
+- A read at a past block needs a node that serves that state (an archive node, or a fork that holds the
+  history); a node that cannot is an `Err`, never the latest value.
+- `locked` is what an open order holds: still the account's.
+- Reads carry no `Provenance`: nothing is sent.
+
+### Required implementations (balance reads)
+
+- **`EvmBalances`** — over an `EvmRpc`: `eth_getBalance` and `balanceOf` at the block named
+  (`EvmRpc::balance_at`; `balance` is `Latest`).
+- **`BinanceRest`, `BinanceLive`** (spot) — `GET /api/v3/account?omitZeroBalances=true`, through the signed
+  client, so the clock and the error rule are the order path's.
+- **`EvmBalanceStub`, `SpotBalanceStub`** — programmable values and errors, recording their calls. The EVM
+  stub answers from a history (a value set at block `b` holds until a later block sets another); a read before
+  the first value is an error, never zero.
+
 ## 7. Contract tests — what keeps the stub honest
 
 A stub that quietly drifts from what `Simulated`/`Live` actually do is worse than no stub: code built
@@ -1203,7 +1341,8 @@ production does.
 
 The rule that prevents it: **one shared test suite per port, written generically over "any
 `impl DexExecutor`" / "any `impl CexExecutor`" / "any `impl LiquidityExecutor`" / "any
-`impl CexAccount`"**, that every implementation must pass:
+`impl CexAccount`" / "any `impl EvmBalanceReader`" / "any `impl SpotBalanceReader`" / "any
+`impl CexOrders`"**, that every implementation must pass:
 
 ```rust
 // sketch — the real suite lives in `src/testkit/contract.rs`
@@ -1238,6 +1377,9 @@ The suites, all in `src/testkit/contract.rs`:
 | `cex_spot_rejects_reduce_only` | every spot `CexExecutor` | `reduce_only: true` is an error, and nothing reaches the venue |
 | `liquidity_executor_contract` | every `LiquidityExecutor`: `LiquidityStub`, `EvmLiquidity` on anvil, `WhirlpoolLiquidity` on Surfpool, and a consumer's paper model | the sequence below |
 | `cex_account_contract` | every `CexAccount` | `isolated_margin.is_some() == (margin_mode == Isolated)`; `qty == 0` implies no liquidation price; funding sorted by `ts_ms`, every `ts_ms >= since_ms`, no repeated `venue_ref`; `asset` never empty |
+| `evm_balance_reader_contract` | every `EvmBalanceReader` | a read at a named block twice gives the same answer; `Latest` answers |
+| `spot_balance_reader_contract` | every `SpotBalanceReader` | no asset empty or repeated; `free` and `locked` never negative |
+| `cex_orders_contract` | every `CexOrders` | a fill's shape (`assert_fill_shape`) with a positive quantity; `NotFound`, `Open` and `Rejected` carry nothing to check |
 
 `liquidity_executor_contract` runs one sequence against every liquidity venue, and asserts the same
 things of each:
@@ -1279,6 +1421,7 @@ venue-ports/
 ├── Cargo.toml
 └── src/
     ├── lib.rs
+    ├── balance/              # §6c: EvmBalanceReader, SpotBalanceReader, EvmBalances, the two stubs
     ├── evm/                  # the EVM chain family's plumbing, shared by every EVM adapter (§5)
     │   ├── mod.rs
     │   ├── rpc.rs            # EvmRpc: JSON-RPC, eth_call (with `from` and state overrides),
@@ -1306,6 +1449,7 @@ venue-ports/
     ├── cex/
     │   ├── mod.rs            # CexExecutor, OrderRequest, OrderStateUnknown, CexFill
     │   ├── account.rs        # § 6b: CexAccount, PerpPosition, MarginState, FundingPayment
+    │   ├── orders.rs         # § 6: CexOrders, OrderState
     │   ├── stub.rs           # CexStub
     │   ├── account_stub.rs   # CexAccountStub
     │   ├── binance/          # shared by spot and futures:
