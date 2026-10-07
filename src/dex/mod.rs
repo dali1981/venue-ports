@@ -332,6 +332,23 @@ pub struct Realised {
     pub tx_ref: Option<Vec<u8>>, // a transaction hash / signature, chain-specific encoding
 }
 
+/// What became of a swap whose adapter gave up waiting ([`Outcome::TimedOut`]),
+/// as the chain says now (`SPEC.md` §5, "Resolving a swap left unknown";
+/// `EvmLive::resolve`).
+#[derive(Debug, Clone)]
+pub enum Resolution {
+    /// Not decided: the node still knows the transaction, or its nonce is
+    /// unused and another node may yet broadcast it. Ask again.
+    Pending,
+    /// It ended: mined, a revert included. A success carries `amount_in` and
+    /// `amount_out` read exactly as a sent swap's are (what the pool took is
+    /// what is booked), and the cost its receipt reports.
+    Done(Realised),
+    /// Replaced or dropped, and did not land: the node no longer knows the
+    /// transaction and its nonce has been used.
+    Gone,
+}
+
 #[async_trait]
 pub trait DexExecutor: Send + Sync {
     /// Turn a quoted route into something the network can run. May call

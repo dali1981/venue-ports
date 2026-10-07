@@ -47,6 +47,14 @@
 //! landed swap with none is an error naming its transaction, as one with no
 //! output `Transfer` is.
 //!
+//! **A swap that timed out can be resolved later** ([`EvmLive::resolve`]).
+//! When a send ends `TimedOut`, the swap's context is kept by the
+//! transaction's hash, and `resolve(hash)` asks the sender about it once: still
+//! pending, mined (read exactly as `execute` reads a landed swap, through the
+//! same code), or replaced or dropped. A failed read is an error and keeps
+//! everything, so the same call can be made again. What is kept is in memory
+//! only: after a restart there is nothing to resolve through.
+//!
 //! **Over a fork sender** (`SPEC.md` §5b), this adapter is a swap simulator
 //! whose state persists between calls: its provenance is `Simulated`, and its
 //! `tx_ref` is the fork transaction's hash, as a live send's is. The payer
@@ -54,12 +62,12 @@
 //! writes it there.
 
 use crate::dex::{
-    ChainAmount, DexExecutor, EvmCall, EvmCost, Outcome, Payer, Prepared, Realised, RouteQuote,
-    SwapRequest, TxCost,
+    ChainAmount, DexExecutor, EvmCall, EvmCost, Outcome, Payer, Prepared, Realised, Resolution,
+    RouteQuote, SwapRequest, TxCost,
 };
 use crate::evm::erc20;
 use crate::evm::rpc::address_from_slice;
-use crate::evm::{prepared_key, EvmSender, RpcLog, TxOutcome};
+use crate::evm::{prepared_key, EvmSender, RpcLog, TxOutcome, TxReplacedOrDropped};
 use crate::Network;
 use crate::Provenance;
 use alloy_primitives::{Address, B256, U256};
@@ -68,6 +76,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+#[derive(Debug, Clone, Copy)]
 struct PendingLive {
     token_in: Address,
     token_out: Address,
@@ -78,9 +87,21 @@ struct PendingLive {
     deadline_unix_secs: u64,
 }
 
+/// A swap whose send ended `TimedOut`: what is needed to read its result from
+/// its receipt once the chain has one.
+#[derive(Debug, Clone, Copy)]
+struct TimedOutSwap {
+    swap: PendingLive,
+    router: Address,
+}
+
 pub struct EvmLive {
     sender: Arc<EvmSender>,
+    /// Prepared and not yet sent, by `prepared_key`.
     pending: Mutex<HashMap<B256, PendingLive>>,
+    /// Sent and ended `TimedOut`, by transaction hash, until [`EvmLive::resolve`]
+    /// has found how it ended.
+    timed_out: Mutex<HashMap<B256, TimedOutSwap>>,
 }
 
 impl EvmLive {
@@ -88,6 +109,7 @@ impl EvmLive {
         Self {
             sender,
             pending: Mutex::new(HashMap::new()),
+            timed_out: Mutex::new(HashMap::new()),
         }
     }
 
@@ -99,6 +121,144 @@ impl EvmLive {
 
     pub fn sender(&self) -> &Arc<EvmSender> {
         &self.sender
+    }
+
+    /// What became of a swap this adapter's `execute` ended `TimedOut`, asked
+    /// once: [`Resolution::Pending`] while the chain has not decided,
+    /// [`Resolution::Done`] with the swap's [`Realised`] once it is mined (a
+    /// revert included), [`Resolution::Gone`] once it was replaced or dropped.
+    /// `tx_hash` is the hash that `Realised.tx_ref` carried.
+    ///
+    /// A swap that is `Done` or `Gone` is forgotten, and the sender's latch is
+    /// clear, so it can send again. An `Err` is a read that failed, or a hash
+    /// this adapter did not time out, or one its sender no longer holds
+    /// unresolved (something resolved the sender directly, which hands the
+    /// outcome to that caller and not to this adapter: resolve through here).
+    /// After an `Err` from a failed read, everything is as it was, and the same
+    /// call can be made again. A failed read is never `Gone`.
+    pub async fn resolve(&self, tx_hash: B256) -> Result<Resolution> {
+        let TimedOutSwap { swap, router } = self
+            .timed_out
+            .lock()
+            .unwrap()
+            .get(&tx_hash)
+            .copied()
+            .ok_or_else(|| {
+            anyhow!(
+                "this EvmLive did not time out a swap with hash {tx_hash}, or has already \
+                     resolved it: nothing to resolve"
+            )
+        })?;
+        // Not the sender's own `resolve` for a hash it does not hold: that would
+        // clear and consume another adapter's unresolved transaction.
+        if self.sender.unresolved() != Some(tx_hash) {
+            bail!(
+                "swap {tx_hash} timed out, but its sender no longer holds it as unresolved: it \
+                 was resolved through the sender directly, which hands the outcome to that caller"
+            );
+        }
+        match self.sender.resolve().await {
+            Ok(Some(outcome)) => {
+                let (TxOutcome::Success { tx_hash: found, .. }
+                | TxOutcome::Reverted { tx_hash: found, .. }
+                | TxOutcome::TimedOut { tx_hash: found }) = &outcome;
+                if *found != tx_hash {
+                    bail!(
+                        "resolving swap {tx_hash}, the sender resolved {found} instead: it held \
+                         another transaction"
+                    );
+                }
+                let realised = self.realised(&swap, router, outcome).await?;
+                self.timed_out.lock().unwrap().remove(&tx_hash);
+                Ok(Resolution::Done(realised))
+            }
+            Ok(None) if self.sender.unresolved() == Some(tx_hash) => Ok(Resolution::Pending),
+            Ok(None) => bail!(
+                "swap {tx_hash} timed out, but its sender no longer holds it as unresolved: it \
+                 was resolved through the sender directly, which hands the outcome to that caller"
+            ),
+            Err(err) => match err.downcast_ref::<TxReplacedOrDropped>() {
+                Some(dropped) if dropped.tx_hash == tx_hash => {
+                    self.timed_out.lock().unwrap().remove(&tx_hash);
+                    Ok(Resolution::Gone)
+                }
+                _ => Err(err.context(format!("resolving swap {tx_hash}"))),
+            },
+        }
+    }
+
+    /// A swap's [`Realised`] from the outcome of its transaction. One reading,
+    /// whether `execute` waited for the transaction or `resolve` found it
+    /// later, so the amounts they report cannot disagree: what the pool took is
+    /// what is booked.
+    async fn realised(
+        &self,
+        ctx: &PendingLive,
+        router: Address,
+        outcome: TxOutcome,
+    ) -> Result<Realised> {
+        match outcome {
+            TxOutcome::Success {
+                block,
+                tx_hash,
+                logs,
+                cost,
+            } => {
+                let amount_out = decode_transfer_amount(&logs, ctx.token_out, ctx.recipient)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "swap landed (tx {tx_hash}) but no ERC-20 Transfer of the output \
+                             token to the recipient was found in its logs"
+                        )
+                    })?;
+                let payer = match ctx.payer {
+                    Payer::Sender => ctx.sender,
+                    Payer::CalledContract => router,
+                };
+                let amount_in =
+                    decode_amount_spent(&logs, ctx.token_in, payer).ok_or_else(|| {
+                        anyhow!(
+                            "swap landed (tx {tx_hash}) but no ERC-20 Transfer of the input token \
+                         out of its payer {payer} was found in its logs"
+                        )
+                    })?;
+                Ok(Realised {
+                    amount_out: Some(amount_out),
+                    amount_in: Some(amount_in),
+                    outcome: Outcome::Success,
+                    cost: TxCost::Evm(cost),
+                    at: block,
+                    provenance: self.sender.provenance(),
+                    tx_ref: Some(tx_hash.as_slice().to_vec()),
+                })
+            }
+            TxOutcome::Reverted {
+                block,
+                tx_hash,
+                reason,
+                cost,
+            } => Ok(Realised {
+                amount_out: None,
+                amount_in: None,
+                outcome: Outcome::Reverted { reason },
+                cost: TxCost::Evm(cost),
+                at: block,
+                provenance: self.sender.provenance(),
+                tx_ref: Some(tx_hash.as_slice().to_vec()),
+            }),
+            TxOutcome::TimedOut { tx_hash } => {
+                let at = self.sender.rpc().block_number().await.unwrap_or(0);
+                Ok(Realised {
+                    amount_out: None,
+                    amount_in: None,
+                    outcome: Outcome::TimedOut,
+                    cost: TxCost::Evm(EvmCost::default()),
+                    at,
+                    provenance: self.sender.provenance(),
+                    tx_ref: Some(tx_hash.as_slice().to_vec()),
+                })
+            }
+        }
     }
 }
 
@@ -205,72 +365,19 @@ impl DexExecutor for EvmLive {
             Payer::CalledContract => {}
         }
 
-        match self
+        let outcome = self
             .sender
             .send_and_confirm(router, prepared.calldata.clone(), U256::ZERO)
-            .await?
-        {
-            TxOutcome::Success {
-                block,
-                tx_hash,
-                logs,
-                cost,
-            } => {
-                let amount_out = decode_transfer_amount(&logs, ctx.token_out, ctx.recipient)
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "swap landed (tx {tx_hash}) but no ERC-20 Transfer of the output \
-                             token to the recipient was found in its logs"
-                        )
-                    })?;
-                let payer = match ctx.payer {
-                    Payer::Sender => ctx.sender,
-                    Payer::CalledContract => router,
-                };
-                let amount_in =
-                    decode_amount_spent(&logs, ctx.token_in, payer).ok_or_else(|| {
-                        anyhow!(
-                            "swap landed (tx {tx_hash}) but no ERC-20 Transfer of the input token \
-                         out of its payer {payer} was found in its logs"
-                        )
-                    })?;
-                Ok(Realised {
-                    amount_out: Some(amount_out),
-                    amount_in: Some(amount_in),
-                    outcome: Outcome::Success,
-                    cost: TxCost::Evm(cost),
-                    at: block,
-                    provenance: self.sender.provenance(),
-                    tx_ref: Some(tx_hash.as_slice().to_vec()),
-                })
-            }
-            TxOutcome::Reverted {
-                block,
-                tx_hash,
-                reason,
-                cost,
-            } => Ok(Realised {
-                amount_out: None,
-                amount_in: None,
-                outcome: Outcome::Reverted { reason },
-                cost: TxCost::Evm(cost),
-                at: block,
-                provenance: self.sender.provenance(),
-                tx_ref: Some(tx_hash.as_slice().to_vec()),
-            }),
-            TxOutcome::TimedOut { tx_hash } => {
-                let at = self.sender.rpc().block_number().await.unwrap_or(0);
-                Ok(Realised {
-                    amount_out: None,
-                    amount_in: None,
-                    outcome: Outcome::TimedOut,
-                    cost: TxCost::Evm(EvmCost::default()),
-                    at,
-                    provenance: self.sender.provenance(),
-                    tx_ref: Some(tx_hash.as_slice().to_vec()),
-                })
-            }
+            .await?;
+        if let TxOutcome::TimedOut { tx_hash } = &outcome {
+            // The sender keeps the hash unresolved; keep what is needed to read
+            // the swap's result by it, for `resolve`.
+            self.timed_out
+                .lock()
+                .unwrap()
+                .insert(*tx_hash, TimedOutSwap { swap: ctx, router });
         }
+        self.realised(&ctx, router, outcome).await
     }
 
     fn label(&self) -> &'static str {
@@ -940,6 +1047,315 @@ mod tests {
         let prepared = live.prepare(&route, &req).await.unwrap();
         let err = live.execute(&prepared, None).await.unwrap_err();
         assert!(err.to_string().contains("unresolved"));
+    }
+
+    const ROUTER: Address = Address::new([0x11; 20]);
+    const POOL: Address = Address::new([0x22; 20]);
+    const TOKEN_IN: Address = Address::new([0xAA; 20]);
+    const TOKEN_OUT: Address = Address::new([0xBB; 20]);
+    const RECIPIENT: Address = Address::new([0xDD; 20]);
+
+    fn rpc_ok(result: Value) -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .set_body_json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+    }
+
+    /// An adapter whose one swap of 1 000 has timed out: the node knows the
+    /// transaction and has no receipt for it. Returns the guard of the "no
+    /// receipt" mock, which a test drops when the transaction is mined.
+    async fn timed_out_swap() -> Result<(MockServer, EvmLive, B256, wiremock::MockGuard)> {
+        let server = MockServer::start().await;
+        mount_send_plumbing(&server).await;
+        mount_sufficient_allowance(&server).await;
+        let no_receipt = Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "eth_getTransactionReceipt"}),
+            ))
+            .respond_with(rpc_ok(Value::Null))
+            .mount_as_scoped(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "eth_getTransactionByHash"}),
+            ))
+            .respond_with(rpc_ok(json!({ "hash": "0x01" })))
+            .mount(&server)
+            .await;
+
+        let sender = connect(&server).await;
+        sender.set_poll_settings(PollSettings {
+            interval: Duration::from_millis(5),
+            timeout: Duration::from_millis(20),
+        });
+        let live = EvmLive::new(sender);
+        let prepared = live
+            .prepare(
+                &route(ROUTER, TOKEN_IN, TOKEN_OUT, &[0xCA, 0xFE]),
+                &request(live.address(), RECIPIENT),
+            )
+            .await?;
+        let realised = live.execute(&prepared, None).await?;
+        assert!(matches!(realised.outcome, Outcome::TimedOut));
+        let tx_ref = realised
+            .tx_ref
+            .ok_or_else(|| anyhow!("a timeout names its hash"))?;
+        let tx_hash = B256::try_from(tx_ref.as_slice())?;
+        Ok((server, live, tx_hash, no_receipt))
+    }
+
+    /// The pool took 600 of the 1 000 offered, and paid 550.
+    fn pool_took_600(sender: Address) -> Vec<Value> {
+        vec![
+            transfer(TOKEN_IN, sender, POOL, 600),
+            transfer(TOKEN_OUT, POOL, RECIPIENT, 550),
+        ]
+    }
+
+    /// While the node still knows the transaction the swap is pending, however
+    /// often it is asked; once it is mined the result is what `execute` would
+    /// have reported for the same receipt, what the pool took included; then
+    /// the swap is forgotten and the sender can send again.
+    #[tokio::test]
+    async fn a_timed_out_swap_found_mined_is_done_with_what_the_pool_took() -> Result<()> {
+        let (server, live, tx_hash, no_receipt) = timed_out_swap().await?;
+
+        assert!(matches!(live.resolve(tx_hash).await?, Resolution::Pending));
+        assert!(matches!(live.resolve(tx_hash).await?, Resolution::Pending));
+        assert_eq!(live.sender().unresolved(), Some(tx_hash));
+
+        drop(no_receipt);
+        let receipt = json!({
+            "status": "0x1", "blockNumber": "0x2b",
+            "logs": pool_took_600(live.address()),
+            "gasUsed": "0x249f0", "effectiveGasPrice": "0x77359400", "l1Fee": "0x7",
+        });
+        mount_receipt(&server, receipt).await;
+        let Resolution::Done(realised) = live.resolve(tx_hash).await? else {
+            bail!("a mined swap is Done");
+        };
+
+        assert_eq!(realised.amount_in, Some(600), "the offer was 1 000");
+        assert_eq!(realised.amount_out, Some(550));
+        assert!(matches!(realised.outcome, Outcome::Success));
+        assert_eq!(realised.at, 0x2b);
+        assert_eq!(realised.provenance, Provenance::Landed);
+        assert_eq!(realised.tx_ref, Some(tx_hash.as_slice().to_vec()));
+
+        // The same receipt, found by a send that waited for it.
+        let sent = swap_landing_with(Payer::Sender, pool_took_600).await?;
+        assert_eq!(
+            (sent.amount_in, sent.amount_out),
+            (realised.amount_in, realised.amount_out)
+        );
+        assert_eq!(sent.outcome, realised.outcome);
+        assert_eq!(sent.provenance, realised.provenance);
+        // What it cost is what its receipt says.
+        assert_eq!(
+            realised.cost,
+            TxCost::Evm(EvmCost {
+                gas_used: Some(150_000),
+                effective_gas_price_wei: Some(2_000_000_000),
+                l1_fee_wei: Some(7),
+            })
+        );
+
+        // Forgotten, and the sender is free.
+        assert_eq!(live.sender().unresolved(), None);
+        let err = live.resolve(tx_hash).await.unwrap_err();
+        assert!(err.to_string().contains("nothing to resolve"), "{err}");
+        Ok(())
+    }
+
+    /// A swap that landed and reverted is `Done` too, with the replayed reason
+    /// and no amounts: it took nothing and paid nothing.
+    #[tokio::test]
+    async fn a_timed_out_swap_found_reverted_is_done_with_its_reason() -> Result<()> {
+        let (server, live, tx_hash, no_receipt) = timed_out_swap().await?;
+        drop(no_receipt);
+        mount_receipt(
+            &server,
+            json!({
+                "status": "0x0", "blockNumber": "0x2b", "logs": [],
+                "gasUsed": "0x249f0", "effectiveGasPrice": "0x77359400",
+            }),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "eth_call"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1,
+                "error": { "code": 3, "message": "execution reverted",
+                           "data": hex_data(&encode_error_string("Too little received")) },
+            })))
+            .mount(&server)
+            .await;
+
+        let Resolution::Done(realised) = live.resolve(tx_hash).await? else {
+            bail!("a mined swap is Done");
+        };
+
+        assert!(
+            matches!(&realised.outcome, Outcome::Reverted { reason } if reason == "Too little received"),
+            "{:?}",
+            realised.outcome
+        );
+        assert_eq!((realised.amount_in, realised.amount_out), (None, None));
+        assert_eq!(realised.at, 0x2b);
+        assert_eq!(realised.tx_ref, Some(tx_hash.as_slice().to_vec()));
+        assert_eq!(live.sender().unresolved(), None);
+        Ok(())
+    }
+
+    /// `Gone` is for a transaction the node no longer knows whose nonce was
+    /// used. Until the nonce is used another node may yet broadcast it, so the
+    /// swap is still pending.
+    #[tokio::test]
+    async fn a_swap_replaced_or_dropped_is_gone() -> Result<()> {
+        let (server, live, tx_hash, _no_receipt) = timed_out_swap().await?;
+
+        // The node forgets it, but its nonce (5) is unused: still pending.
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "eth_getTransactionByHash"}),
+            ))
+            .respond_with(rpc_ok(Value::Null))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        assert!(matches!(live.resolve(tx_hash).await?, Resolution::Pending));
+        assert_eq!(live.sender().unresolved(), Some(tx_hash));
+
+        // Something else took nonce 5.
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "eth_getTransactionCount", "params": [live.address().to_string(), "latest"]}),
+            ))
+            .respond_with(rpc_ok(json!("0x6")))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        assert!(matches!(live.resolve(tx_hash).await?, Resolution::Gone));
+
+        // Forgotten, and the sender is free to send again.
+        assert_eq!(live.sender().unresolved(), None);
+        assert!(live.resolve(tx_hash).await.is_err());
+        Ok(())
+    }
+
+    /// A failed read says nothing about the swap: it is an error, never `Gone`
+    /// and never a result, and the swap stays resolvable by the same call.
+    #[tokio::test]
+    async fn an_rpc_error_while_resolving_is_an_error_and_keeps_the_swap() -> Result<()> {
+        let (server, live, tx_hash, no_receipt) = timed_out_swap().await?;
+
+        drop(no_receipt);
+        let failing = Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "eth_getTransactionReceipt"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1,
+                "error": { "code": -32005, "message": "rate limit exceeded" },
+            })))
+            .mount_as_scoped(&server)
+            .await;
+        for _ in 0..2 {
+            let err = live.resolve(tx_hash).await.unwrap_err();
+            assert!(
+                format!("{err:#}").contains("rate limit exceeded"),
+                "{err:#}"
+            );
+            assert!(err.downcast_ref::<TxReplacedOrDropped>().is_none());
+            assert_eq!(live.sender().unresolved(), Some(tx_hash));
+        }
+
+        // The node answers again: the same swap resolves.
+        drop(failing);
+        mount_receipt(
+            &server,
+            json!({ "status": "0x1", "blockNumber": "0x2b", "logs": pool_took_600(live.address()) }),
+        )
+        .await;
+        assert!(matches!(
+            live.resolve(tx_hash).await?,
+            Resolution::Done(realised) if realised.amount_in == Some(600)
+        ));
+        Ok(())
+    }
+
+    /// A hash this adapter did not time out is not its to resolve, and asking
+    /// leaves the swap it did time out untouched.
+    #[tokio::test]
+    async fn a_hash_this_adapter_did_not_time_out_is_an_error() -> Result<()> {
+        let (_server, live, tx_hash, _no_receipt) = timed_out_swap().await?;
+
+        let err = live.resolve(B256::repeat_byte(0x07)).await.unwrap_err();
+
+        assert!(err.to_string().contains("did not time out"), "{err}");
+        assert_eq!(live.sender().unresolved(), Some(tx_hash));
+        assert!(matches!(live.resolve(tx_hash).await?, Resolution::Pending));
+        Ok(())
+    }
+
+    /// Resolving the sender directly hands the outcome to its caller; the swap
+    /// is then not this adapter's to read, and says so.
+    #[tokio::test]
+    async fn a_swap_the_sender_was_resolved_for_directly_is_an_error_here() -> Result<()> {
+        let (server, live, tx_hash, no_receipt) = timed_out_swap().await?;
+        drop(no_receipt);
+        mount_receipt(
+            &server,
+            json!({ "status": "0x1", "blockNumber": "0x2b", "logs": [] }),
+        )
+        .await;
+        assert!(live.sender().resolve().await?.is_some());
+
+        let err = live.resolve(tx_hash).await.unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("resolved through the sender directly"),
+            "{err}"
+        );
+        Ok(())
+    }
+
+    /// The signing sender prices a transaction by its fee policy alone, and
+    /// `EvmLive` refuses a bid above it by name, never sending without it. A
+    /// bid of nothing is the policy.
+    #[tokio::test]
+    async fn a_bid_above_the_fee_policy_is_refused_by_name_over_a_signing_sender() -> Result<()> {
+        let (server, live) = offline_live().await;
+        let route = route(ROUTER, TOKEN_IN, TOKEN_OUT, &[0xCA, 0xFE]);
+        let bid = |priority| SwapRequest {
+            priority,
+            ..request(live.address(), RECIPIENT)
+        };
+
+        live.prepare(&route, &bid(PriorityBid::AbovePolicyPerGas(0)))
+            .await?;
+        let err = live
+            .prepare(&route, &bid(PriorityBid::AbovePolicyPerGas(1)))
+            .await
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("EvmLive") && message.contains("fee policy only"),
+            "{message}"
+        );
+        let sent = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.body_json::<Value>()
+                    .is_ok_and(|b| b["method"] == "eth_sendRawTransaction")
+            })
+            .count();
+        assert_eq!(sent, 0);
+        Ok(())
     }
 
     /// Real Sepolia, all three legs SPEC.md §3 describes for a DEX port,
