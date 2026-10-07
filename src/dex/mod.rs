@@ -335,6 +335,9 @@ pub struct Realised {
 /// What became of a swap whose adapter gave up waiting ([`Outcome::TimedOut`]),
 /// as the chain says now (`SPEC.md` §5, "Resolving a swap left unknown";
 /// `EvmLive::resolve`).
+// One is returned per swap left unknown, so the size of `Realised` costs nothing, and boxing it would
+// make every consumer's `Done(realised)` pattern a box.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Resolution {
     /// Not decided: the node still knows the transaction, or its nonce is

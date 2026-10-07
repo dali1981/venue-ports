@@ -58,6 +58,7 @@ mod tests {
     use super::*;
     use crate::evm::erc20::BALANCE_OF_SELECTOR;
     use crate::evm::rpc::{format_u256, hex_data};
+    use anyhow::bail;
     use serde_json::{json, Value};
     use wiremock::matchers::{body_partial_json, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -170,6 +171,70 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("missing trie node"), "{err:#}");
+        Ok(())
+    }
+
+    /// Against a real node: a block is history. The balance at a block read
+    /// before a transaction moved it is still what it was after, and `latest`
+    /// is what it became. A token is read by `balanceOf` at a block too: here a
+    /// contract whose every call returns 42 (`PUSH1 42, PUSH1 0, MSTORE, PUSH1
+    /// 32, PUSH1 0, RETURN`).
+    ///
+    /// Gated on `EVM_ANVIL_RPC_URL` (plain anvil or a fork); a no-op when unset.
+    #[tokio::test]
+    async fn against_anvil_a_past_blocks_balance_is_read_after_it_moved() -> Result<()> {
+        use crate::evm::tx::tests::{anvil, ANVIL_DEV_KEY_0};
+        use crate::evm::{EvmSender, FeePolicy, Signer, TxOutcome};
+
+        let Some((rpc, _anvil)) = anvil().await else {
+            return Ok(());
+        };
+        let balances = EvmBalances::new(rpc.clone());
+        let sender = EvmSender::connect(
+            rpc.clone(),
+            Signer::from_private_key_hex(ANVIL_DEV_KEY_0)?,
+            rpc.chain_id().await?,
+            FeePolicy::default(),
+        )
+        .await?;
+        let account = sender.address();
+
+        let block = rpc.block_number().await?;
+        let before = balances.native(account, BlockTag::Number(block)).await?;
+        let TxOutcome::Success { .. } = sender
+            .send_and_confirm(Address::new([0x77; 20]), Vec::new(), U256::from(1_000u64))
+            .await?
+        else {
+            bail!("a plain transfer on anvil should succeed");
+        };
+
+        assert_eq!(
+            balances.native(account, BlockTag::Number(block)).await?,
+            before,
+            "the block read earlier is history"
+        );
+        let after = balances.native(account, BlockTag::Latest).await?;
+        assert!(
+            after < before,
+            "the transfer and its gas moved {before} to {after}"
+        );
+
+        // A token: code the node holds, read through `balanceOf`.
+        let token = Address::new([0xC0; 20]);
+        rpc.call(
+            "anvil_setCode",
+            json!([token.to_string(), "0x602a60005260206000f3"]),
+        )
+        .await?;
+        rpc.call("evm_mine", json!([])).await?;
+        assert_eq!(balances.token(token, account, BlockTag::Latest).await?, 42);
+        let mined = rpc.block_number().await?;
+        assert_eq!(
+            balances
+                .token(token, account, BlockTag::Number(mined))
+                .await?,
+            42
+        );
         Ok(())
     }
 }

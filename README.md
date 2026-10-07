@@ -22,6 +22,7 @@ stub), the test strategy that keeps the stub honest, and acceptance criteria. Se
 | CEX — Binance USDⓈ-M futures | done (`CexStub`, with a reduce-only mode) | needs futures testnet keys; the gated §9.2 run is written | built (`BinanceFuturesLive`), unit-tested against a mocked server, not yet run against the real testnet |
 | Liquidity (EVM position managers) | done (`LiquidityStub`) | `EvmLiquidity` over a fork sender meets §9.2 for Uniswap v3 on anvil (100 lives reconciled to the wei); Slipstream needs a Base fork | built (`EvmLiquidity` over a signing sender); no live life taken yet |
 | Perp account reads | done (`CexAccountStub`) | needs futures testnet keys; the gated run is written | built (`BinanceFuturesAccount`), unit-tested against a mocked server |
+| Balance reads, resolving an unknown swap or order (V6, phase 16) | done (`EvmBalanceStub`, `SpotBalanceStub`, `CexStub`) | `against_anvil_*` tests written, gated on `EVM_ANVIL_RPC_URL`, not yet run | built (`EvmBalances`, spot account reads on `BinanceRest`/`BinanceLive`, `EvmLive::resolve`, `CexOrders` on `BinanceLive`), unit-tested against mocked servers on the documentation's bodies; a signing sender on anvil is `Simulated` |
 
 Every `Stub` implementation passes the shared contract-test suites (`src/testkit/contract.rs`) and is
 ready to build a trading system against today. See [`examples/basic_usage.rs`](examples/basic_usage.rs)

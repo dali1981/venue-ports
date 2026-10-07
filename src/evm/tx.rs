@@ -1369,7 +1369,7 @@ pub(crate) mod tests {
 
     /// Anvil's first well-known dev account, funded on every anvil node and
     /// fork. Public, so worthless anywhere else.
-    const ANVIL_DEV_KEY_0: &str =
+    pub(crate) const ANVIL_DEV_KEY_0: &str =
         "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
     /// The unresolved-timeout rule against a real node: with automine off a
@@ -1428,6 +1428,36 @@ pub(crate) mod tests {
             other => panic!("expected the mined transaction's receipt, got {other:?}"),
         }
         assert_eq!(sender.unresolved(), None);
+    }
+
+    /// A signing sender whose node is anvil is `Simulated`, whatever key signs:
+    /// what it sends to a fork must never read as a mainnet trade. A fork sender
+    /// says the same, and both send for real to the node.
+    #[tokio::test]
+    async fn against_anvil_a_signing_sender_is_simulated() {
+        let Some((rpc, _anvil)) = anvil().await else {
+            return;
+        };
+        let chain_id = rpc.chain_id().await.unwrap();
+        let sender = EvmSender::connect(
+            rpc.clone(),
+            Signer::from_private_key_hex(ANVIL_DEV_KEY_0).unwrap(),
+            chain_id,
+            FeePolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sender.provenance(), Provenance::Simulated);
+
+        // It signs and sends for real: the transaction lands on the node.
+        let TxOutcome::Success { tx_hash, .. } = sender
+            .send_and_confirm(Address::from([0x77; 20]), Vec::new(), U256::from(1u64))
+            .await
+            .unwrap()
+        else {
+            panic!("a plain transfer on anvil should succeed");
+        };
+        assert!(rpc.transaction_receipt(tx_hash).await.unwrap().is_some());
     }
 
     #[tokio::test]

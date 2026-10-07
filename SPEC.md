@@ -1382,7 +1382,7 @@ The suites, all in `src/testkit/contract.rs`:
 | `cex_account_contract` | every `CexAccount` | `isolated_margin.is_some() == (margin_mode == Isolated)`; `qty == 0` implies no liquidation price; funding sorted by `ts_ms`, every `ts_ms >= since_ms`, no repeated `venue_ref`; `asset` never empty |
 | `evm_balance_reader_contract` | every `EvmBalanceReader` | a read at a named block twice gives the same answer; `Latest` answers |
 | `spot_balance_reader_contract` | every `SpotBalanceReader` | no asset empty or repeated; `free` and `locked` never negative |
-| `cex_orders_contract` | every `CexOrders` | a fill's shape (`assert_fill_shape`) with a positive quantity; `NotFound`, `Open` and `Rejected` carry nothing to check |
+| `cex_orders_contract` | every `CexOrders` | a fill's shape (`assert_fill_shape`) with a positive quantity, naming the id it was found by when sent; a rejection names its status; `NotFound` and `Open` carry nothing to check |
 
 `liquidity_executor_contract` runs one sequence against every liquidity venue, and asserts the same
 things of each:

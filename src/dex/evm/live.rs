@@ -1358,6 +1358,110 @@ mod tests {
         Ok(())
     }
 
+    /// Runtime code that, called with anything, emits two ERC-20 `Transfer`s of
+    /// itself: 1 000 from itself to `pool`, and 900 from `pool` to `recipient`.
+    /// With `Payer::CalledContract`, a swap through it takes 1 000 and pays 900.
+    fn two_transfer_code(this: Address, pool: Address, recipient: Address) -> Vec<u8> {
+        let mut code = Vec::new();
+        for (from, to, value) in [(this, pool, 1_000u16), (pool, recipient, 900)] {
+            code.extend([0x61, (value >> 8) as u8, value as u8]); // PUSH2 value
+            code.extend([0x60, 0x00, 0x52]); // PUSH1 0, MSTORE: memory[0..32] = value
+            for word in [pad_address(to), pad_address(from), transfer_topic().0] {
+                code.push(0x7f); // PUSH32 topic2, then topic1, then topic0
+                code.extend(word);
+            }
+            code.extend([0x60, 0x20, 0x60, 0x00]); // PUSH1 32 (size), PUSH1 0 (offset)
+            code.push(0xa3); // LOG3
+        }
+        code.push(0x00); // STOP
+        code
+    }
+
+    /// The whole road against a real node, in the shape a consumer meets it: with
+    /// automine off a swap through a signing sender times out and is `Simulated`
+    /// (the node is anvil); it is pending while nothing is mined, and `Done` with
+    /// what the contract took and paid once a block is.
+    ///
+    /// Gated on `EVM_ANVIL_RPC_URL`, a plain anvil with no block time; a no-op
+    /// when unset.
+    #[tokio::test]
+    async fn against_anvil_a_timed_out_swap_is_pending_then_done_with_its_amounts() -> Result<()> {
+        use crate::evm::tx::tests::{anvil, ANVIL_DEV_KEY_0};
+
+        let Some((rpc, _anvil)) = anvil().await else {
+            return Ok(());
+        };
+        let contract = Address::new([0xC1; 20]);
+        rpc.call(
+            "anvil_setCode",
+            json!([
+                contract.to_string(),
+                hex_data(&two_transfer_code(contract, POOL, RECIPIENT))
+            ]),
+        )
+        .await?;
+
+        let sender = EvmSender::connect(
+            rpc.clone(),
+            Signer::from_private_key_hex(ANVIL_DEV_KEY_0)?,
+            rpc.chain_id().await?,
+            FeePolicy::default(),
+        )
+        .await?;
+        sender.set_poll_settings(PollSettings {
+            interval: Duration::from_millis(50),
+            timeout: Duration::from_millis(300),
+        });
+        let live = EvmLive::new(sender);
+        let prepared = live
+            .prepare(
+                &route(contract, contract, contract, &[0xCA, 0xFE]),
+                &SwapRequest {
+                    payer: Payer::CalledContract,
+                    ..request(live.address(), RECIPIENT)
+                },
+            )
+            .await?;
+
+        rpc.call("evm_setAutomine", json!([false])).await?;
+        let timed_out = live.execute(&prepared, None).await;
+        let pending = match &timed_out {
+            Ok(realised) => match &realised.tx_ref {
+                Some(tx_ref) => Some(live.resolve(B256::try_from(tx_ref.as_slice())?).await),
+                None => None,
+            },
+            Err(_) => None,
+        };
+        rpc.call("evm_mine", json!([])).await?;
+        rpc.call("evm_setAutomine", json!([true])).await?;
+
+        let timed_out = timed_out?;
+        assert!(
+            matches!(timed_out.outcome, Outcome::TimedOut),
+            "{timed_out:?}"
+        );
+        assert_eq!(timed_out.provenance, Provenance::Simulated);
+        let tx_hash = B256::try_from(
+            timed_out
+                .tx_ref
+                .ok_or_else(|| anyhow!("a timeout names its hash"))?
+                .as_slice(),
+        )?;
+        let pending = pending.ok_or_else(|| anyhow!("the swap was asked about"))?;
+        assert!(matches!(pending?, Resolution::Pending));
+
+        let Resolution::Done(realised) = live.resolve(tx_hash).await? else {
+            bail!("the swap was mined");
+        };
+        assert!(matches!(realised.outcome, Outcome::Success), "{realised:?}");
+        assert_eq!(realised.amount_in, Some(1_000));
+        assert_eq!(realised.amount_out, Some(900));
+        assert_eq!(realised.provenance, Provenance::Simulated);
+        assert_eq!(realised.tx_ref, Some(tx_hash.as_slice().to_vec()));
+        assert_eq!(live.sender().unresolved(), None);
+        Ok(())
+    }
+
     /// Real Sepolia, all three legs SPEC.md §3 describes for a DEX port,
     /// same pool, same input size: **quoted** (Uniswap's own `QuoterV2` —
     /// independent of this crate), **simulated** (`EvmSimulated`'s
