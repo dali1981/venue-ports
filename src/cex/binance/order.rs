@@ -39,6 +39,22 @@ pub(crate) trait VenueOrder: DeserializeOwned {
     fn status(&self) -> &str;
 }
 
+/// One status query: `order_path` asked about the order placed under
+/// `client_order_id`. [`track`] repeats it until the order settles; a caller
+/// that wants one answer reads it once.
+pub(crate) async fn read_order<T: VenueOrder>(
+    client: &BinanceClient,
+    order_path: &str,
+    symbol: &str,
+    client_order_id: &str,
+) -> Result<T, ApiError> {
+    let params = [
+        ("symbol", symbol.to_string()),
+        ("origClientOrderId", client_order_id.to_string()),
+    ];
+    client.signed::<T>(Method::GET, order_path, &params).await
+}
+
 /// What asking the venue about an order came to.
 enum Tracked<T> {
     /// The venue reports the order in a terminal state.
@@ -77,10 +93,6 @@ async fn track<T: VenueOrder>(
     let timings = client.timings().clone();
     let deadline = Instant::now() + timings.poll_timeout;
     let window_ends = lost_signed_at.map(|signed_at| client.recv_window_ends(signed_at));
-    let params = [
-        ("symbol", symbol.to_string()),
-        ("origClientOrderId", client_order_id.to_string()),
-    ];
     let mut order_ref = known_order_id;
     let mut problem = anyhow!("the venue has not answered yet");
 
@@ -89,7 +101,7 @@ async fn track<T: VenueOrder>(
         // asked after the window was certainly sent after it.
         let asked_at = Instant::now();
         let asked_after_window = window_ends.is_none_or(|ends| asked_at > ends);
-        match client.signed::<T>(Method::GET, order_path, &params).await {
+        match read_order::<T>(client, order_path, symbol, client_order_id).await {
             Ok(order) => {
                 order_ref = Some(order.order_id());
                 if is_terminal(order.status()) {

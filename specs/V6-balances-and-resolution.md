@@ -57,9 +57,12 @@ pub struct SpotAccountBalances {
 #[async_trait]
 pub trait SpotBalanceReader: Send + Sync {
     async fn balances(&self) -> Result<SpotAccountBalances>;
-    fn label(&self) -> &'static str;
 }
 ```
+
+`SpotBalanceReader` and `CexOrders` have no `label()`: the adapters that implement them (`BinanceLive`, `CexStub`)
+already have one from `CexExecutor`, and a second would make `adapter.label()` ambiguous wherever both traits are
+in scope.
 
 - An amount above `u128` is an error naming the token and holder, never truncated (`ChainAmount` is `u128`).
 - A balance read at a past block needs a node that serves that block's state: an archive node, or a fork that
@@ -71,7 +74,7 @@ pub trait SpotBalanceReader: Send + Sync {
 | --- | --- |
 | `EvmBalances` | `eth_getBalance` and `balanceOf` through an `EvmRpc`, at the block named. `EvmRpc` gains `balance_at(address, block)`; `balance` is `balance_at(…, Latest)` |
 | `BinanceRest`, `BinanceLive` (spot) | `GET /api/v3/account?omitZeroBalances=true`, through the signed client |
-| `EvmBalanceStub`, `SpotBalanceStub` | Programmable values and errors; each records its calls. The EVM stub answers from a history: a value set at block `b` holds until a later block sets another, and a read before the first value is an error, never zero |
+| `EvmBalanceStub`, `SpotBalanceStub` | Programmable values and errors; the EVM stub records its calls, the spot stub counts them. The EVM stub answers from a history: a value set at block `b` holds until a later block sets another, and a read before the first value is an error, never zero |
 
 ### Resolving a swap (`SPEC.md` §5)
 
@@ -135,7 +138,6 @@ pub enum OrderState {
 pub trait CexOrders: Send + Sync {
     /// The state of the order this adapter placed under `client_order_id` (the id an `OrderStateUnknown` names).
     async fn order_state(&self, symbol: &str, client_order_id: &str) -> Result<OrderState>;
-    fn label(&self) -> &'static str;
 }
 ```
 

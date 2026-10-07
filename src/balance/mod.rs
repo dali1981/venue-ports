@@ -72,10 +72,11 @@ impl SpotAccountBalances {
 
 /// What an exchange spot account holds. A failed read is an `Err`; nothing was
 /// sent.
+///
+/// It has no `label()`: the adapters that implement it also place orders, and
+/// a second `label` would make `adapter.label()` ambiguous wherever both traits
+/// are in scope.
 #[async_trait]
 pub trait SpotBalanceReader: Send + Sync {
     async fn balances(&self) -> Result<SpotAccountBalances>;
-
-    /// A short, stable label for logging, e.g. `"binance-spot-balances"`.
-    fn label(&self) -> &'static str;
 }

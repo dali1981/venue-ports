@@ -1194,7 +1194,6 @@ pub enum OrderState {
 #[async_trait]
 pub trait CexOrders: Send + Sync {
     async fn order_state(&self, symbol: &str, client_order_id: &str) -> Result<OrderState>;
-    fn label(&self) -> &'static str;
 }
 ```
 
@@ -1207,7 +1206,9 @@ pub trait CexOrders: Send + Sync {
   holds no lost request for, "no such order" is `NotFound` at once.
 - No caller chooses a client order id, so a resolver cannot turn a resend into a first send; Binance refuses a
   reused id only while the first order is open.
-- `BinanceLive` and `CexStub` implement it. `BinanceFuturesLive` and `BybitLive` do not.
+- `BinanceLive` and `CexStub` implement it. `BinanceFuturesLive` and `BybitLive` do not. It has no `label()`:
+  both already have one from `CexExecutor`, and a second would make `adapter.label()` ambiguous wherever both
+  traits are in scope.
 
 ## 6b. Reading a perp account
 
@@ -1311,9 +1312,10 @@ pub struct SpotAccountBalances {
 #[async_trait]
 pub trait SpotBalanceReader: Send + Sync {
     async fn balances(&self) -> Result<SpotAccountBalances>;
-    fn label(&self) -> &'static str;
 }
 ```
+
+`SpotBalanceReader` has no `label()`, for the reason `CexOrders` has none: `BinanceLive` already has one.
 
 - An amount above `u128` is an error naming the token and holder, never truncated.
 - A read at a past block needs a node that serves that state (an archive node, or a fork that holds the
@@ -1327,7 +1329,8 @@ pub trait SpotBalanceReader: Send + Sync {
   (`EvmRpc::balance_at`; `balance` is `Latest`).
 - **`BinanceRest`, `BinanceLive`** (spot) — `GET /api/v3/account?omitZeroBalances=true`, through the signed
   client, so the clock and the error rule are the order path's.
-- **`EvmBalanceStub`, `SpotBalanceStub`** — programmable values and errors, recording their calls. The EVM
+- **`EvmBalanceStub`, `SpotBalanceStub`** — programmable values and errors; the EVM stub records its calls and
+  the spot stub counts them. The EVM
   stub answers from a history (a value set at block `b` holds until a later block sets another); a read before
   the first value is an error, never zero.
 

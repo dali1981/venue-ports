@@ -63,10 +63,6 @@ impl SpotBalanceReader for BinanceRest {
             .with_context(|| format!("reading GET {ACCOUNT_PATH}"))?;
         Ok(account.into())
     }
-
-    fn label(&self) -> &'static str {
-        "binance-spot-balances"
-    }
 }
 
 /// The account `BinanceLive` trades on, read through its own client.
@@ -74,10 +70,6 @@ impl SpotBalanceReader for BinanceRest {
 impl SpotBalanceReader for BinanceLive {
     async fn balances(&self) -> Result<SpotAccountBalances> {
         self.rest().balances().await
-    }
-
-    fn label(&self) -> &'static str {
-        "binance-spot-balances"
     }
 }
 

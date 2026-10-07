@@ -167,10 +167,6 @@ impl SpotBalanceReader for SpotBalanceStub {
             .clone()
             .ok_or_else(|| anyhow!("no balances were set on this stub"))
     }
-
-    fn label(&self) -> &'static str {
-        "spot-balance-stub"
-    }
 }
 
 #[cfg(test)]

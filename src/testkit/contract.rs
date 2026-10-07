@@ -6,7 +6,7 @@
 //! deliberate, human-triggered run (`SPEC.md` §7's table).
 
 use crate::balance::{EvmBalanceReader, SpotBalanceReader};
-use crate::cex::{CexAccount, MarginMode};
+use crate::cex::{CexAccount, CexOrders, MarginMode, OrderState};
 use crate::cex::{CexExecutor, CexFill, OrderRequest, OrderStateUnknown};
 use crate::dex::{DexExecutor, Outcome, RouteQuote, SwapRequest};
 use crate::evm::BlockTag;
@@ -451,6 +451,47 @@ pub async fn cex_account_contract(account: &dyn CexAccount, fixture: CexAccountC
     );
 }
 
+/// Inputs for one run of [`cex_orders_contract`]: an order the venue holds.
+#[derive(Debug, Clone)]
+pub struct CexOrdersContractFixture {
+    pub symbol: String,
+    /// The id the adapter gave the order.
+    pub client_order_id: String,
+}
+
+/// Shape assertions every `CexOrders` must satisfy (`SPEC.md` §6): a state that
+/// carries a fill carries a fill of something, shaped as a fill is
+/// ([`assert_fill_shape`]) and naming the id it was found by when it was sent;
+/// a rejection names the status it ended in. `NotFound` and `Open` carry
+/// nothing to check.
+pub async fn cex_orders_contract(orders: &dyn CexOrders, fixture: CexOrdersContractFixture) {
+    let label = "a CexOrders";
+    let state = orders
+        .order_state(&fixture.symbol, &fixture.client_order_id)
+        .await
+        .unwrap();
+    match state {
+        OrderState::Filled(fill) | OrderState::PartlyFilled(fill) => {
+            assert_fill_shape(&fill, label);
+            assert!(
+                fill.filled_qty > Decimal::ZERO,
+                "on {label}: a fill of nothing: {fill:?}"
+            );
+            if fill.provenance == Provenance::Landed {
+                assert_eq!(
+                    fill.client_order_id.as_deref(),
+                    Some(fixture.client_order_id.as_str()),
+                    "on {label}: a fill names the id it was found by"
+                );
+            }
+        }
+        OrderState::Rejected { status, .. } => {
+            assert!(!status.is_empty(), "on {label}: a rejection with no status")
+        }
+        OrderState::NotFound | OrderState::Open => {}
+    }
+}
+
 /// Inputs for one run of [`evm_balance_reader_contract`]: the accounts to read,
 /// and a block the reader can answer for.
 #[derive(Debug, Clone)]
@@ -505,7 +546,7 @@ pub async fn evm_balance_reader_contract(
 /// no asset empty or repeated, `free` and `locked` never negative, and only
 /// assets the account holds some of are listed.
 pub async fn spot_balance_reader_contract(reader: &dyn SpotBalanceReader) {
-    let label = reader.label();
+    let label = "a SpotBalanceReader";
     let account = reader.balances().await.unwrap();
     let mut seen = HashSet::new();
     for balance in &account.balances {
@@ -768,5 +809,46 @@ mod tests {
             update_time_ms: Some(1),
         });
         spot_balance_reader_contract(&stub).await;
+    }
+
+    #[tokio::test]
+    async fn cex_stub_order_states_satisfy_the_orders_contract() {
+        use crate::cex::CexFill;
+
+        let fill = |client_order_id: Option<&str>| CexFill {
+            filled_qty: rust_decimal::Decimal::from_str("4").unwrap(),
+            filled_price: rust_decimal::Decimal::from_str("150").unwrap(),
+            commission: rust_decimal::Decimal::ZERO,
+            commission_asset: "USDT".to_string(),
+            provenance: Provenance::Simulated,
+            order_ref: None,
+            client_order_id: client_order_id.map(str::to_string),
+            venue_time_ms: None,
+            trades: Vec::new(),
+        };
+        for (id, state) in [
+            ("vp-1", OrderState::Filled(fill(None))),
+            ("vp-2", OrderState::PartlyFilled(fill(None))),
+            (
+                "vp-3",
+                OrderState::Rejected {
+                    order_ref: 3,
+                    status: "REJECTED".to_string(),
+                },
+            ),
+            ("vp-4", OrderState::NotFound),
+            ("vp-5", OrderState::Open),
+        ] {
+            let stub = CexStub::new();
+            stub.program_order_state(id, state);
+            cex_orders_contract(
+                &stub,
+                CexOrdersContractFixture {
+                    symbol: "SOLUSDT".to_string(),
+                    client_order_id: id.to_string(),
+                },
+            )
+            .await;
+        }
     }
 }

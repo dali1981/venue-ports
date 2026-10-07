@@ -1,7 +1,8 @@
 //! The CEX port. See `SPEC.md` §6. Types and the `CexExecutor` trait land
 //! in Phase 6, `CexStub` alongside them, a venue's `Live` adapter in Phase 7
 //! (`IMPLEMENTATION_PLAN.md`). Reading a perp account (`CexAccount`, §6b)
-//! lives in `account`.
+//! lives in `account`; resolving an order left unknown (`CexOrders`, §6) in
+//! `orders`.
 
 use crate::Provenance;
 use anyhow::Result;
@@ -15,6 +16,7 @@ mod account_stub;
 mod binance;
 mod binance_futures;
 mod bybit;
+mod orders;
 mod stub;
 
 pub use account::{CexAccount, FundingPayment, MarginMode, MarginState, PerpPosition};
@@ -27,7 +29,8 @@ pub use binance_futures::{
     BinanceFuturesAccount, BinanceFuturesConfig, BinanceFuturesLive, BinanceFuturesRest,
 };
 pub use bybit::{BybitConfig, BybitLive, BybitRest};
-pub use stub::{CexStub, RecordedCall};
+pub use orders::{CexOrders, OrderState};
+pub use stub::{CexStub, OrderStateCall, RecordedCall};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderSide {
