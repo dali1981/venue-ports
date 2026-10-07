@@ -64,6 +64,12 @@ impl BinanceLive {
         Self { rest, step_size }
     }
 
+    /// The REST client this adapter trades through, which the account reads
+    /// share.
+    pub(crate) fn rest(&self) -> &BinanceRest {
+        &self.rest
+    }
+
     fn round_to_step(&self, symbol: &str, quantity: Decimal) -> Result<Decimal> {
         let step = self.step_size.get(symbol).ok_or_else(|| {
             anyhow!("no LOT_SIZE step configured for symbol {symbol} — refusing to send an unrounded quantity")

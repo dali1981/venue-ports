@@ -9,6 +9,7 @@
 //! with Binance USDⓈ-M futures (`crate::cex::binance_futures`), which speaks
 //! the same conventions on another host.
 
+mod balances;
 pub(crate) mod client;
 pub(crate) mod clock;
 mod live;
