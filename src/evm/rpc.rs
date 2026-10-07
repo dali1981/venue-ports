@@ -288,8 +288,17 @@ impl EvmRpc {
     }
 
     pub async fn balance(&self, address: Address) -> Result<U256> {
+        self.balance_at(address, BlockTag::Latest).await
+    }
+
+    /// `address`'s native balance in wei at `block`. A block whose state the
+    /// node no longer serves is an error, as for any read at a past block.
+    pub async fn balance_at(&self, address: Address, block: BlockTag) -> Result<U256> {
         let result = self
-            .call("eth_getBalance", json!([address.to_string(), "latest"]))
+            .call(
+                "eth_getBalance",
+                json!([address.to_string(), block.param()]),
+            )
             .await?;
         parse_hex_u256(
             result

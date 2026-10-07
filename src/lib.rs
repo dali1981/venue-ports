@@ -9,6 +9,7 @@ mod provenance;
 pub use network::Network;
 pub use provenance::Provenance;
 
+pub mod balance;
 pub mod cex;
 pub mod dex;
 pub mod evm;
