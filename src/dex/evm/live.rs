@@ -135,7 +135,10 @@ impl EvmLive {
     /// unresolved (something resolved the sender directly, which hands the
     /// outcome to that caller and not to this adapter: resolve through here).
     /// After an `Err` from a failed read, everything is as it was, and the same
-    /// call can be made again. A failed read is never `Gone`.
+    /// call can be made again. A failed read is never `Gone`. A swap that landed
+    /// with logs its decoders cannot read is an `Err` too, as from `execute`,
+    /// but one answer only: it is decided, so it is forgotten, and the same call
+    /// again says there is nothing to resolve.
     pub async fn resolve(&self, tx_hash: B256) -> Result<Resolution> {
         let TimedOutSwap { swap, router } = self
             .timed_out
@@ -168,9 +171,13 @@ impl EvmLive {
                          another transaction"
                     );
                 }
-                let realised = self.realised(&swap, router, outcome).await?;
+                // The sender has handed the outcome over and cleared its latch:
+                // the swap is decided, whether or not its logs can be read, so
+                // it is forgotten before they are.
                 self.timed_out.lock().unwrap().remove(&tx_hash);
-                Ok(Resolution::Done(realised))
+                Ok(Resolution::Done(
+                    self.realised(&swap, router, outcome).await?,
+                ))
             }
             Ok(None) if self.sender.unresolved() == Some(tx_hash) => Ok(Resolution::Pending),
             Ok(None) => bail!(
@@ -1280,6 +1287,36 @@ mod tests {
             live.resolve(tx_hash).await?,
             Resolution::Done(realised) if realised.amount_in == Some(600)
         ));
+        Ok(())
+    }
+
+    /// A swap that landed with logs the decoders cannot read is an error, as it
+    /// is from `execute`, and it is one answer: the sender has handed over the
+    /// outcome and cleared its latch, so the swap is decided and forgotten, and a
+    /// second ask says there is nothing to resolve, not that something else
+    /// resolved it.
+    #[tokio::test]
+    async fn a_timed_out_swap_that_lands_undecodable_is_an_error_once_and_forgotten() -> Result<()>
+    {
+        let (server, live, tx_hash, no_receipt) = timed_out_swap().await?;
+        drop(no_receipt);
+        mount_receipt(
+            &server,
+            json!({ "status": "0x1", "blockNumber": "0x2b", "logs": [] }),
+        )
+        .await;
+
+        let err = live.resolve(tx_hash).await.unwrap_err();
+        assert!(
+            err.to_string().contains("no ERC-20 Transfer")
+                && err.to_string().contains(&tx_hash.to_string()),
+            "{err}"
+        );
+        assert_eq!(live.sender().unresolved(), None);
+
+        let again = live.resolve(tx_hash).await.unwrap_err();
+        assert!(again.to_string().contains("nothing to resolve"), "{again}");
+        assert!(live.timed_out.lock().unwrap().is_empty());
         Ok(())
     }
 

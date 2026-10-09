@@ -503,7 +503,9 @@ impl EvmLive {
 - A hash this adapter did not time out is an `Err`. Resolve through `EvmLive`, not through the sender: the
   sender's `resolve` clears its latch and hands the outcome to its caller, after which `EvmLive::resolve` of
   that hash is an `Err`.
-- `Done`'s amounts come from the same transfer-log decoders `execute` uses.
+- `Done`'s amounts come from the same transfer-log decoders `execute` uses. A swap that landed with logs they
+  cannot read is an `Err`, as from `execute`, and one answer only: it is decided, so it is forgotten, and
+  `resolve` of that hash again is an `Err` saying there is nothing to resolve.
 - A swap's context is kept in memory only: after a restart there is nothing to resolve through.
 
 ### The EVM sender — one per wallet and chain

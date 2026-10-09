@@ -65,6 +65,11 @@ returns the same error, adds state for a case `execute` already answers once.
 Proposed failing test: `a_timed_out_swap_that_lands_undecodable_is_an_error_once_and_forgotten`: the probe
 above, asserting the second call says "nothing to resolve" and `timed_out` is empty.
 
+**Status: fixed**, on the owner's word, in its own commit. The test above was written first and failed on the
+second assertion (the second ask said "resolved through the sender directly"); the entry is now removed as soon
+as the sender has handed the outcome over, before the logs are decoded. `resolve`'s doc comment and
+`SPEC.md` §5 say that such a swap is an `Err` once and then forgotten.
+
 ## Observations (not defects against V6's text; a decision is wanted)
 
 ### O1 — `connect` fails open on any JSON-RPC error from `web3_clientVersion`
