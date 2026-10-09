@@ -284,3 +284,110 @@ what the venue checks, `play(case)`, one test per case plus a failing variant) a
   (`run_in_background` and `&`).
 - Nothing in steps 5 and 6 was run against a venue; the status line stays *written, offline-tested, not run against a
   production venue*.
+
+## 10. Update after step 7 and part of step 8 (read this first)
+
+Written by the session that built LV2a and started LV2b, which stopped because its context was tight. The branch
+`v7-production-validation` is pushed and is the only copy. **A session that starts from a clone should `git fetch` and
+`git log origin/v7-production-validation` first: the session that wrote this one began on a stale checkout, did some work
+twice, and rebased.**
+
+### 10.1 State
+
+| Step | State | Commits |
+|---|---|---|
+| 1, 3, 4, 5, 6 | Done (§1) | see §1 |
+| 2. Recorded bodies | **Partly.** The catalogue and its honesty test are in; the six `TODO(R2)` bodies are now documented fixtures. The testnet recording itself is still not in the repo | `b305e58` |
+| 7. LV2a | **Done** | `1bf4714` |
+| 8. LV2b | **Code and pure checks done; the mock-chain self-tests are not written** | `83c4ce9` |
+| 9. Docs | **Not started** | |
+| LV1 case mutation check (§9.4) | **Not done** | |
+
+Baseline: `cargo fmt --check` clean, `cargo clippy --all-targets` clean, `cargo test` **574 passed, 0 failed, 5 ignored**
+(`binance_spot_testnet` and the four `production_*` tests, which `cargo test --lib production -- --ignored --list` lists:
+`production_lv1_binance`, `production_lv1_base`, `production_lv2a_exchange`, `production_lv2b_chain`).
+
+### 10.2 What step 2 did, and a decision it took that the owner has not seen
+
+`fixtures/binance-spot/documented/` holds the six bodies the tests had inline (byte for byte, extracted by script), read with
+`include_str!`. `docs/responses/binance-spot.md` and `evm.md` have a row for each, origin `documented` or `synthetic`, plus rows for
+what is not provoked on purpose. `src/catalogue.rs::catalogue_matches_fixtures` checks that every fixture has a row, every row's
+body and test exist and the test's source names the body (with ten tests of its own rules). **The `TODO(R2)` markers are gone from
+the source** because the gap now lives in the catalogue, as the spec says gaps should; if the owner would rather they stay until
+the recording arrives, put the comments back. `specs/V7-questions.md` Q1 and Q2 say what the recording would close.
+
+### 10.3 LV2a (`src/production/lv2a_exchange.rs`, `exchange_checks.rs`)
+
+Ten round trips (a market buy, then a sell of what it delivered): trip 1 about 6 USD (more if the symbol's minimum notional
+needs it), trip 2 asks for a quantity half a step off the step, the rest `VP_ORDER_USD`. Per leg: book (5 levels), balances,
+ledger permit, order (the line carries `references`), then E6, E1, E2, E3, E5, E4 as lines; any failure stops the run and a line
+says what the account holds. A buy too small to be sold back above the minimum notional (with a one per cent move) is skipped,
+not placed. Harness additions it needed: `Wire::sending` and `Gate::exchanges` (when each request left and came back, and the raw
+reply), `Run::call_graded` with `Grade::{Pass, Fail, Skip}` (a check may skip), `Run::computed` (a check line with no request).
+Self-tests: a stateful mock exchange (`MiniExchange` in the test module) with a knob for each way it can disagree; the case code
+was broken 16 ways and `exchange_checks` 24 ways with `scripts/mutate-check.py`, and every mutation was caught but one that is
+equivalent (a sort key). `SPEC` rows for it are in §9 below.
+
+### 10.4 LV2b (`src/production/lv2b_chain.rs`, `chain_checks.rs`) — what is left
+
+Done: `chain_checks.rs` is complete and tested (the independent decoding of the raw receipt, X1 to X6, `swap_references` with every
+field of the spec's table, `null` where absent); `lv2b_chain.rs` has `Settings::from_env` (the key taken once with `Env::take`),
+the calldata functions, a `Pacer` (exponential, seeded; tested), the flow (`setup`, `swap`, `send_and_gather`, `checks`, `exit`),
+and the ignored `production_lv2b_chain`. `EvmRpc` gained a `#[cfg(test)]` tap (`RpcTap`, `RpcEvent::{Broadcast, Receipt}`) so a
+swap's `sent_ns` and `first_seen_ns` are the client's own; `sealed_ns` is the first `eth_blockNumber` sample at or past the
+block, polled by a background `Sampler` while the swap is in flight.
+
+**Not done, and the next job: the mock-chain self-tests of the flow.** The flow compiles and has never run, even against a mock.
+Write a `MiniChain` (a stateful JSON-RPC `wiremock` `Respond`, like `MiniExchange` in `lv2a_exchange.rs`) that answers
+`eth_chainId` (0x2105), `web3_clientVersion`, `eth_blockNumber` (lagging the mined block by a few polls, so `sealed_ns` is later
+than `first_seen_ns`), `eth_getBlockByNumber` (`baseFeePerGas`), `eth_maxPriorityFeePerGas`, `eth_estimateGas`,
+`eth_getTransactionCount`, `eth_sendRawTransaction` (decode with `alloy_consensus::TxEnvelope::decode_2718`, as `src/evm/tx.rs`
+tests do; mine one block per transaction; apply `approve` and the router's `swapExactTokensForTokens`),
+`eth_getTransactionReceipt` (with `transactionIndex`, `gasUsed`, `effectiveGasPrice`, `l1Fee`, logs with `logIndex`, noise
+`Transfer`s to other addresses and tokens), `eth_getBalance` and `eth_call` `balanceOf` at a block (keep a snapshot per block),
+`allowance`, `decimals`, the pool's `stable`/`factory`, the router's `getAmountsOut`, `eth_getBlockTransactionCountByNumber`, and
+`eth_getTransactionByHash`; the router's replay by `eth_call` at the swap's block must return the revert reason for a swap that
+reverted. Use a distinct key per test (`Throwaway::generate()` plus `key_hex()`; `EvmSender::connect` keeps a per-process
+registry), `Lv2bChain::against_mocks()` (remove its `#[allow(dead_code)]`), `Settings.poll` of a few ms and `mean_interval` zero.
+Tests to write, each with a passing and a failing variant: a swap pair lands and all six checks pass with the references of the
+table; sixty swaps alternate direction and hold only the last buy's output; each of X1 to X6 fails on the mock changed in one
+field (the evidence read of the receipt differs from the poll's, a native balance charged extra, a token balance leaking, the
+nonce skipping, a different block in the raw receipt); a landing six blocks after the send stops the run; a swap that reverts
+(forced, and by a slip over 30 bps) records its reason and X1/X2 skip; one revert in ten swaps does not stop the run and one in
+four does; a spend cap stops the run; the order cap; the halt file between two calls; a dry run prints the first reads and sends
+none; record mode names `NNN-quote`, `NNN-swap` and so on; the key is in no line; a local or anvil node is refused when
+`allow_local` is false; a node on another chain id is refused at connect. Then break the flow ten ways with `scripts/mutate-check.py`.
+
+### 10.5 Decisions the owner has not seen (flag them)
+
+1. LV2a books fills at their own prices in the ledger, and a commission the ledger cannot value (BNB) stops the run: switch "pay
+   fees with BNB" off for the account. E4 and E5 are exact (E4 to one unit of the last decimal): `specs/V7-questions.md` Q4, Q5.
+2. LV2a's order of checks after an order: E6 (from the raw reply the gate saw), E1, E2, E3, E5, E4; the first failure stops the run.
+   LV2b computes all six checks of a swap and then stops if any failed.
+3. LV2b pre-approves with `ensure_allowance` (exact amount) before the swap, so the swap's nonce advances by exactly one and the
+   send block is read after the approval. A swap that reverts counts against the 10 % rule from the first swap (one revert in
+   four is over; one in ten is not).
+4. The LV2b ledger rule and the wallet valuation: Q7. The Aerodrome ABI is unchecked: Q3.
+5. `Run::computed` lines have `outcome.kind = ok` and no request; a skipped check (`skipped_window`, `skipped_asset`) is a
+   `skipped` verdict with that word at the start of its reason.
+
+### 10.6 Still to do after LV2b
+
+- **Step 9, docs** (§6 above and the list in the spec): `SPEC.md` §6 (the typed refusal: type, `refusal_of`, `ApiError` not an
+  `Error`), a new §6d for the six reads, §7's table for the production tier; `README.md` status rows (*written, offline-tested, not
+  run against a production venue*); `specs/README.md` already has the V7 row; `IMPLEMENTATION_PLAN.md` Phase 17; catalogue rows
+  for the step 4 reads (`synthetic` for `apiRestrictions` and `exchangeInfo`, `documented` for the rest) and for the mini
+  venue/exchange refusal bodies (documented codes and messages; their HTTP statuses are assumed). Add LV2a/LV2b rows to
+  `docs/responses/`. Keep `catalogue_matches_fixtures` green: a row needs a body under `fixtures/` and a test that names it, or `—`.
+- **Mutation-check the LV1 case code** (§9.4): `python3 -I scripts/mutate-check.py FILE MUTATIONS.json FILTER...`; the JSON is a
+  list of `{name, old, new}` (the `old` text must occur once). The LV2a mutation lists are in the commit message of `1bf4714`
+  in spirit: break each `check`/`Grade` wiring, the sizing and the stops.
+- Open decisions for the owner are §4 and `specs/V7-questions.md` (Q1 to Q7).
+
+### 10.7 Traps met in this session
+
+- The checkout was stale at the start (the branch had moved): `git fetch` before reading anything.
+- `cargo fmt` rewrites files under you, so a scripted edit after it can silently not match: `grep` that it landed.
+- `Decimal` division and subtraction keep trailing zeros (`"0.0"`): `.normalize()` before `to_string()` in a reference.
+- A `clippy::type_complexity` on an array of `(&str, fn(&mut T))`: give it a `type` alias.
+- Do not run an `--ignored` test: there is no key, no money and no route to the venues here.
