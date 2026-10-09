@@ -1741,16 +1741,48 @@ mod tests {
             );
             assert!(references["revert"].is_null());
             assert!(references["decision_simulation"].is_null());
-            // The calldata is the router's swap.
-            let calldata = references["calldata"].as_str().unwrap();
-            assert!(calldata.starts_with(&format!(
-                "0x{}",
-                hex::encode(Router::swapExactTokensForTokensCall::SELECTOR)
-            )));
+            // The calldata is the router's swap, as the spec builds it: the route
+            // through the pool (its `stable` flag and factory, as the pool says),
+            // the signer as recipient, a deadline a minute ahead, and 30 basis
+            // points of slippage under the quote.
+            let calldata = hex::decode(
+                references["calldata"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("0x"),
+            )
+            .unwrap();
+            let swap = Router::swapExactTokensForTokensCall::abi_decode(&calldata).unwrap();
+            assert_eq!(swap.amountIn, U256::from(record.amount_in));
+            assert_eq!(swap.routes.len(), 1);
+            let route = &swap.routes[0];
+            assert_eq!(
+                (route.from, route.to, route.stable, route.factory),
+                (record.from, record.to, false, mini::FACTORY)
+            );
+            assert_eq!(swap.to, lab.signer());
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let deadline = u64::try_from(swap.deadline).unwrap();
+            assert!(
+                (now + 55..=now + 61).contains(&deadline),
+                "the deadline is {deadline}, now is {now}"
+            );
+            assert_eq!(
+                swap.amountOutMin,
+                U256::from(record.amount_out) * U256::from(9_970u64) / U256::from(10_000u64)
+            );
             // The quote it was sent against was read just before, and the swap
             // delivered it to the unit.
             let quote = &references["quote_pre_send"];
             assert_eq!(quote["amount_out"], record.amount_out.to_string());
+            // It was read at a block the chain had reached, before the swap's.
+            assert!(
+                (mini::FIRST_BLOCK..record.block).contains(&number(&quote["block"])),
+                "{quote}"
+            );
             assert_eq!(
                 d(references["amount_out_vs_quote_bps"].as_str().unwrap()),
                 Decimal::ZERO
@@ -1772,6 +1804,24 @@ mod tests {
         assert_eq!(lab.chain.allowance(mini::TOKEN_IN), U256::ZERO);
         assert_eq!(lab.chain.allowance(mini::TOKEN_OUT), U256::ZERO);
         assert_eq!(lab.chain.account().token_out, 0);
+        // Each swap was quoted at `pending`, the block it would be mined in, not
+        // at the last sealed one.
+        let quoted_at: Vec<_> = lab
+            .chain
+            .asked()
+            .into_iter()
+            .filter(|(method, params)| {
+                method == "eth_call"
+                    && params[0]["data"].as_str().is_some_and(|data| {
+                        data.starts_with(&format!(
+                            "0x{}",
+                            hex::encode(Router::getAmountsOutCall::SELECTOR)
+                        ))
+                    })
+                    && params[1] == "pending"
+            })
+            .collect();
+        assert_eq!(quoted_at.len(), 2, "{quoted_at:?}");
         lab.setup.clean_up();
     }
 
@@ -1963,7 +2013,9 @@ mod tests {
         lab.setup.clean_up();
     }
 
-    /// Each figure of the cost, on its own.
+    /// Each figure of the cost, on its own. First as the sender's poll gave it
+    /// (what `Realised` is built from) against the chain's own record, which the
+    /// balances still agree with; then as the evidence reads it against the poll.
     #[tokio::test]
     async fn x3_each_figure_of_the_cost_must_be_the_receipts() {
         for (field, named) in [
@@ -1971,10 +2023,19 @@ mod tests {
             ("effectiveGasPrice", "effective_gas_price_wei"),
             ("l1Fee", "l1_fee_wei"),
         ] {
-            let (lab, played) =
-                one_swap_on(&format!("x3-{field}"), with_tweak(one_more(field))).await;
+            let polled = Knobs {
+                poll_tweak: Some(one_more(field)),
+                ..Knobs::default()
+            };
+            let (lab, played) = one_swap_on(&format!("x3-poll-{field}"), polled).await;
             assert_the_check_failed(&lab, &played, "X3", named);
-            passed(&played, &["X1", "X2", "X5", "X6"]);
+            // The fee on the chain's books is the receipt's: only the cost is wrong.
+            passed(&played, &["X1", "X2", "X4", "X5", "X6"]);
+            lab.setup.clean_up();
+
+            let (lab, played) =
+                one_swap_on(&format!("x3-evidence-{field}"), with_tweak(one_more(field))).await;
+            assert_the_check_failed(&lab, &played, "X3", named);
             lab.setup.clean_up();
         }
     }
@@ -2253,6 +2314,45 @@ mod tests {
         for check in ["X1", "X2", "X3", "X4", "X5", "X6"] {
             assert!(played.of(check).is_empty(), "{check}");
         }
+        lab.setup.clean_up();
+    }
+
+    /// A quote that cannot be read ends the run: the swap is not sized, and the
+    /// next one would not be either.
+    #[tokio::test]
+    async fn a_quote_that_cannot_be_read_ends_the_run_before_anything_is_sent() {
+        let lab = Lab::new(
+            "quote",
+            Knobs {
+                quote_reverts: true,
+                ..Knobs::default()
+            },
+        )
+        .await;
+        let played = play(&lab, 3).await;
+
+        let quote_reads = lab
+            .chain
+            .asked()
+            .iter()
+            .filter(|(method, params)| {
+                method == "eth_call"
+                    && params[1] == "pending"
+                    && params[0]["data"].as_str().is_some_and(|data| {
+                        data.starts_with(&format!(
+                            "0x{}",
+                            hex::encode(Router::getAmountsOutCall::SELECTOR)
+                        ))
+                    })
+            })
+            .count();
+        assert_eq!(
+            quote_reads, 1,
+            "the run goes on after a quote it cannot read"
+        );
+        assert_eq!(lab.chain.times_asked("eth_sendRawTransaction"), 0);
+        assert!(played.swaps().is_empty());
+        assert!(!played.clean, "{:#?}", played.cases());
         lab.setup.clean_up();
     }
 

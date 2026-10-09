@@ -106,8 +106,15 @@ pub(super) struct Knobs {
     pub(super) token_leak: u128,
     /// After a swap the signer's nonce is one higher than it should be.
     pub(super) nonce_skip: bool,
-    /// Applied to a swap's receipt every time it is served after the first.
+    /// Applied to a swap's receipt every time it is served after the first: the
+    /// evidence a check reads differs from what the sender's poll was given.
     pub(super) evidence_tweak: Option<Tweak>,
+    /// Applied to a swap's receipt the first time it is served: what `Realised`
+    /// is built from differs from the chain's own record, which the evidence and
+    /// the balances still give.
+    pub(super) poll_tweak: Option<Tweak>,
+    /// The router's `getAmountsOut` reverts.
+    pub(super) quote_reverts: bool,
 }
 
 impl Default for Knobs {
@@ -131,6 +138,8 @@ impl Default for Knobs {
             token_leak: 0,
             nonce_skip: false,
             evidence_tweak: None,
+            poll_tweak: None,
+            quote_reverts: false,
         }
     }
 }
@@ -649,6 +658,11 @@ impl Chain {
                 self.served = self.served.max(mined.block);
                 self.seal_left = Some(self.knobs.seal_lag_polls);
             }
+            if mined.swap {
+                if let Some(tweak) = &self.knobs.poll_tweak {
+                    tweak(&mut receipt, self.signer);
+                }
+            }
         } else if mined.swap {
             if let Some(tweak) = &self.knobs.evidence_tweak {
                 tweak(&mut receipt, self.signer);
@@ -675,6 +689,9 @@ impl Chain {
         if to == ROUTER && selector == Router::getAmountsOutCall::SELECTOR {
             let decoded = Router::getAmountsOutCall::abi_decode(&data)
                 .map_err(|err| refusal(-32000, format!("getAmountsOut: {err}")))?;
+            if self.knobs.quote_reverts {
+                return Err(reverted("Router: INSUFFICIENT_LIQUIDITY"));
+            }
             let from = decoded
                 .routes
                 .first()
