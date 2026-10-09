@@ -88,7 +88,7 @@ const CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
 /// block, for its sealed time.
 const SEAL_TIMEOUT: Duration = Duration::from_secs(15);
 
-mod abi {
+pub(super) mod abi {
     // An Aerodrome (Solidly-fork) router. See the module docs on where this comes from.
     alloy_sol_types::sol! {
         struct Route {
@@ -438,8 +438,7 @@ impl<'a> Lv2bChain<'a> {
     }
 
     /// For a self-test: short waits, and a mock node on this machine is a node.
-    /// Unused until the mock-chain self-tests are written (`specs/V7-handover.md` §10).
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn against_mocks(mut self) -> Self {
         self.request_timeout = Duration::from_secs(2);
         self.confirm_timeout = Duration::from_secs(10);
@@ -1351,10 +1350,18 @@ impl<'a> Lv2bChain<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::evm::erc20::transfer_topic;
+    use crate::evm::rpc::format_u256;
+    use crate::production::chain_checks::SWAP_REFERENCE_FIELDS;
     use crate::production::env::{MapEnv, ProcessEnv};
     use crate::production::gate::Echo;
     use crate::production::lv1_base::Throwaway;
+    use crate::production::mini_chain::{self as mini, Knobs, MiniChain, Tweak};
+    use crate::production::testing::Setup;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::str::FromStr;
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer};
 
     fn d(text: &str) -> Decimal {
         Decimal::from_str(text).unwrap()
@@ -1511,6 +1518,1024 @@ mod tests {
         assert_eq!(amount_out_of(&reply).unwrap(), U256::from(9));
         assert!(amount_out_of(&[]).is_err());
         assert_eq!(decimal_of(U256::from(1_500_000u64), 6).unwrap(), d("1.5"));
+    }
+
+    // --- the flow, against a mock chain ---
+
+    /// The key a provider's URL carries in its path: it must reach no line.
+    const KEY_IN_PATH: &str = "KEY-IN-PATH-9f3a41";
+
+    /// A run against a mock chain, in a scratch directory.
+    struct Lab {
+        server: MockServer,
+        chain: MiniChain,
+        setup: Setup,
+        key: Throwaway,
+    }
+
+    impl Lab {
+        async fn new(name: &str, knobs: Knobs) -> Self {
+            let key = Throwaway::generate().unwrap();
+            let chain = MiniChain::new(key.signer().unwrap().address(), knobs);
+            let server = MockServer::start().await;
+            Mock::given(any())
+                .respond_with(chain.clone())
+                .mount(&server)
+                .await;
+            let setup = Setup::new(name, &server)
+                .with(
+                    "VP_BASE_RPC_URL",
+                    &format!("{}/v2/{KEY_IN_PATH}", server.uri()),
+                )
+                .with("VP_ROUTER", &mini::ROUTER.to_string())
+                .with("VP_POOL", &mini::POOL.to_string())
+                .with("VP_TOKEN_IN", &mini::TOKEN_IN.to_string())
+                .with("VP_TOKEN_OUT", &mini::TOKEN_OUT.to_string())
+                .with("VP_NATIVE_USD", "3000")
+                .with("VP_SIGNER_KEY_HEX", key.key_hex());
+            Self {
+                server,
+                chain,
+                setup,
+                key,
+            }
+        }
+
+        fn with(mut self, key: &str, value: &str) -> Self {
+            self.setup = self.setup.with(key, value);
+            self
+        }
+
+        fn signer(&self) -> Address {
+            self.key.signer().unwrap().address()
+        }
+
+        async fn received(&self) -> usize {
+            self.server.received_requests().await.unwrap().len()
+        }
+    }
+
+    /// What a run left: its lines, their text, and whether it was clean.
+    struct Played {
+        lines: Vec<Value>,
+        text: String,
+        clean: bool,
+    }
+
+    impl Played {
+        fn of(&self, case: &str) -> Vec<&Value> {
+            self.lines
+                .iter()
+                .filter(|line| line["case"] == case)
+                .collect()
+        }
+
+        fn verdicts(&self, case: &str) -> Vec<&str> {
+            self.of(case)
+                .iter()
+                .map(|line| line["verdict"].as_str().unwrap())
+                .collect()
+        }
+
+        /// The lines of the swaps themselves: the ones that carry `references`.
+        fn swaps(&self) -> Vec<&Value> {
+            self.lines
+                .iter()
+                .filter(|line| line["references"].is_object())
+                .collect()
+        }
+
+        fn exit(&self) -> &Value {
+            self.of("EXIT").pop().expect("an EXIT line")
+        }
+
+        fn cases(&self) -> Vec<(&str, &str)> {
+            self.lines
+                .iter()
+                .map(|line| {
+                    (
+                        line["case"].as_str().unwrap(),
+                        line["verdict"].as_str().unwrap(),
+                    )
+                })
+                .collect()
+        }
+    }
+
+    async fn play(lab: &Lab, swaps: usize) -> Played {
+        play_tuned(lab, swaps, |_| {}).await
+    }
+
+    async fn play_tuned(lab: &Lab, swaps: usize, tune: impl FnOnce(&mut Lv2bChain<'_>)) -> Played {
+        let env = lab.setup.env();
+        // The run reads the key first, so that no line can hold it.
+        let run = Run::start(&env, "base", "mock-base", Echo::Quiet).expect("the run's settings");
+        let (mut settings, signer) = Settings::from_env(&env).expect("the case settings");
+        settings.swaps = swaps;
+        settings.mean_interval = Duration::ZERO;
+        settings.poll = Duration::from_millis(2);
+        let mut lv2b = Lv2bChain::new(&run, settings).against_mocks();
+        tune(&mut lv2b);
+        lv2b.run_all(signer).await.expect("the run");
+        Played {
+            lines: lab.setup.lines(),
+            text: std::fs::read_to_string(lab.setup.out.join("results.jsonl")).unwrap(),
+            clean: run.finish().is_ok(),
+        }
+    }
+
+    fn number(value: &Value) -> u64 {
+        value
+            .as_u64()
+            .unwrap_or_else(|| panic!("{value} is not a number"))
+    }
+
+    // --- one pair of swaps, every check passing ---
+
+    #[tokio::test]
+    async fn a_swap_pair_lands_and_all_six_checks_pass_with_the_references_of_the_table() {
+        let lab = Lab::new(
+            "pair",
+            Knobs {
+                neighbours_ahead: 2,
+                neighbours_behind: 1,
+                ..Knobs::default()
+            },
+        )
+        .await;
+        let played = play(&lab, 2).await;
+
+        assert!(played.clean, "{:#?}", played.cases());
+        for check in ["X1", "X2", "X3", "X4", "X5", "X6"] {
+            assert_eq!(played.verdicts(check), ["pass", "pass"], "{check}");
+        }
+        assert_eq!(played.exit()["verdict"], "pass");
+
+        let records = lab.chain.swaps();
+        let swaps = played.swaps();
+        assert_eq!((swaps.len(), records.len()), (2, 2));
+        // The first swap buys with the input token, the second sells what it bought.
+        assert_eq!(
+            (records[0].from, records[0].to),
+            (mini::TOKEN_IN, mini::TOKEN_OUT)
+        );
+        assert_eq!(
+            (records[1].from, records[1].to),
+            (mini::TOKEN_OUT, mini::TOKEN_IN)
+        );
+        assert_eq!(records[1].amount_in, records[0].amount_out);
+        // Swaps are numbered as they are sent, and each follows its approval:
+        // nonces 0 and 2 are approvals, 1 and 3 are the swaps.
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.number, r.nonce))
+                .collect::<Vec<_>>(),
+            [(1, 1), (2, 3)]
+        );
+        // The chain's own books: the signer's native balance fell across each
+        // swap's block by exactly gas x price + the L1 fee, with no help from
+        // the code under test.
+        for record in &records {
+            let fell = lab.chain.account_at(record.block - 1).native
+                - lab.chain.account_at(record.block).native;
+            assert_eq!(
+                fell,
+                u128::from(record.gas_used) * record.effective_gas_price + record.l1_fee
+            );
+            assert_eq!(
+                record.effective_gas_price,
+                mini::BASE_FEE + mini::PRIORITY_FEE
+            );
+            assert!(record.reverted.is_none());
+        }
+
+        for (line, record) in swaps.iter().zip(&records) {
+            let references = &line["references"];
+            for field in SWAP_REFERENCE_FIELDS {
+                assert!(references.get(field).is_some(), "{field}: {references}");
+            }
+            assert_eq!(references["tx_hash"], record.hash.to_string());
+            assert_eq!(references["router"], mini::ROUTER.to_string());
+            assert_eq!(references["token_in"], record.from.to_string());
+            assert_eq!(references["token_out"], record.to.to_string());
+            assert_eq!(references["amount_in"], record.amount_in.to_string());
+            assert_eq!(references["amount_in_taken"], record.amount_in.to_string());
+            assert_eq!(references["amount_out"], record.amount_out.to_string());
+            // Where it landed: its block, its place in it, and how long the block is.
+            assert_eq!(number(&references["inclusion_block"]), record.block);
+            assert_eq!(number(&references["transaction_index"]), 2);
+            assert_eq!(number(&references["block_tx_count"]), 4);
+            // Its cost, as the receipt has it.
+            assert_eq!(number(&references["gas_used"]), record.gas_used);
+            assert_eq!(
+                references["effective_gas_price_wei"],
+                record.effective_gas_price.to_string()
+            );
+            assert_eq!(references["l1_fee_wei"], record.l1_fee.to_string());
+            // The swap's five Transfers, by the block-wide index of each log.
+            assert_eq!(
+                references["transfer_log_indices"],
+                json!([8, 9, 10, 11]),
+                "{references}"
+            );
+            assert!(references["revert"].is_null());
+            assert!(references["decision_simulation"].is_null());
+            // The calldata is the router's swap.
+            let calldata = references["calldata"].as_str().unwrap();
+            assert!(calldata.starts_with(&format!(
+                "0x{}",
+                hex::encode(Router::swapExactTokensForTokensCall::SELECTOR)
+            )));
+            // The quote it was sent against was read just before, and the swap
+            // delivered it to the unit.
+            let quote = &references["quote_pre_send"];
+            assert_eq!(quote["amount_out"], record.amount_out.to_string());
+            assert_eq!(
+                d(references["amount_out_vs_quote_bps"].as_str().unwrap()),
+                Decimal::ZERO
+            );
+            // The clock: quoted, sent, first seen, then sealed.
+            let (quoted, sent, seen, sealed) = (
+                number(&quote["local_ns"]),
+                number(&references["sent_ns"]),
+                number(&references["first_seen_ns"]),
+                number(&references["sealed_ns"]),
+            );
+            assert!(
+                quoted < sent && sent <= seen && seen <= sealed,
+                "quoted {quoted}, sent {sent}, first seen {seen}, sealed {sealed}"
+            );
+        }
+        // Exact approvals, spent: nothing is left allowed, and the wallet holds
+        // only what a sell leaves of the output token (nothing).
+        assert_eq!(lab.chain.allowance(mini::TOKEN_IN), U256::ZERO);
+        assert_eq!(lab.chain.allowance(mini::TOKEN_OUT), U256::ZERO);
+        assert_eq!(lab.chain.account().token_out, 0);
+        lab.setup.clean_up();
+    }
+
+    #[tokio::test]
+    async fn sixty_swaps_alternate_direction_and_hold_nothing_at_the_end() {
+        let lab = Lab::new("sixty", Knobs::default()).await;
+        let played = play(&lab, 60).await;
+
+        assert!(played.clean, "{:#?}", played.cases().last());
+        let swaps = played.swaps();
+        assert_eq!(swaps.len(), 60);
+        for (index, line) in swaps.iter().enumerate() {
+            let (token_in, token_out) = if index % 2 == 0 {
+                (mini::TOKEN_IN, mini::TOKEN_OUT)
+            } else {
+                (mini::TOKEN_OUT, mini::TOKEN_IN)
+            };
+            let references = &line["references"];
+            assert_eq!(references["token_in"], token_in.to_string(), "swap {index}");
+            assert_eq!(
+                references["token_out"],
+                token_out.to_string(),
+                "swap {index}"
+            );
+        }
+        for check in ["X1", "X2", "X3", "X4", "X5", "X6"] {
+            assert_eq!(played.verdicts(check), vec!["pass"; 60], "{check}");
+        }
+        // Sixty swaps, each approved for exactly its amount: a nonce for each
+        // approval and each swap, and nothing left allowed.
+        assert_eq!(lab.chain.nonce(), 120);
+        assert_eq!(lab.chain.allowance(mini::TOKEN_IN), U256::ZERO);
+        assert_eq!(lab.chain.allowance(mini::TOKEN_OUT), U256::ZERO);
+        assert_eq!(lab.chain.account().token_out, 0);
+        assert_eq!(played.exit()["verdict"], "pass");
+        assert!(played.exit()["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("60 of 60 swaps made;"));
+        lab.setup.clean_up();
+    }
+
+    #[tokio::test]
+    async fn an_odd_number_of_swaps_ends_holding_the_last_buys_output_and_says_so() {
+        let lab = Lab::new("odd", Knobs::default()).await;
+        let played = play(&lab, 3).await;
+
+        assert!(played.clean);
+        let records = lab.chain.swaps();
+        // buy, sell, buy: the last buy's output is held.
+        assert_eq!(records[2].amount_in, 10_000_000);
+        assert_eq!(lab.chain.account().token_out, records[2].amount_out);
+        let reason = played.exit()["reason"].as_str().unwrap().to_string();
+        assert!(
+            reason.contains(&format!(
+                "the wallet still holds {} of the output token",
+                records[2].amount_out
+            )),
+            "{reason}"
+        );
+        lab.setup.clean_up();
+    }
+
+    /// A swap of 10 USD, half a swap back and a swap that took less than it
+    /// was given: what a router refunds is not what it took.
+    #[tokio::test]
+    async fn a_refund_of_the_input_is_not_part_of_what_the_swap_took() {
+        let lab = Lab::new(
+            "refund",
+            Knobs {
+                refund_in: 500,
+                ..Knobs::default()
+            },
+        )
+        .await;
+        let played = play(&lab, 1).await;
+
+        assert!(played.clean, "{:#?}", played.cases());
+        for check in ["X1", "X2", "X5"] {
+            assert_eq!(played.verdicts(check), ["pass"], "{check}");
+        }
+        let references = &played.swaps()[0]["references"];
+        assert_eq!(references["amount_in"], "10000000");
+        assert_eq!(references["amount_in_taken"], "9999500");
+        // Five Transfers now: the input, the refund, the two that are not the
+        // swap's, and the output.
+        assert_eq!(references["transfer_log_indices"], json!([0, 1, 2, 3, 4]));
+        lab.setup.clean_up();
+    }
+
+    // --- each exact check fails on the chain changed in one field ---
+
+    /// `by` added to the first Transfer of `token` to the signer (or, with
+    /// `to == false`, from it) in a receipt.
+    fn bump_transfer(token: Address, to: bool, by: u64) -> Tweak {
+        Arc::new(move |receipt: &mut Value, signer: Address| {
+            // topics: the signature, then `from`, then `to`.
+            let topic = if to { 2 } else { 1 };
+            for log in receipt["logs"].as_array_mut().unwrap() {
+                if log["address"] == token.to_string()
+                    && log["topics"][0] == transfer_topic().to_string()
+                    && log["topics"][topic] == mini::word(signer)
+                {
+                    let value = U256::from_str_radix(
+                        log["data"].as_str().unwrap().trim_start_matches("0x"),
+                        16,
+                    )
+                    .unwrap()
+                        + U256::from(by);
+                    log["data"] = json!(format_u256(value));
+                    return;
+                }
+            }
+            panic!("no Transfer of {token} to tweak in {receipt}");
+        })
+    }
+
+    /// A receipt quantity (`gasUsed`, `l1Fee`, …) one higher, as served.
+    fn one_more(field: &'static str) -> Tweak {
+        Arc::new(move |receipt: &mut Value, _| {
+            let current = receipt[field].as_str().unwrap();
+            let value = u128::from_str_radix(current.trim_start_matches("0x"), 16).unwrap();
+            receipt[field] = json!(format!("0x{:x}", value + 1));
+        })
+    }
+
+    fn set_field(field: &'static str, value: &'static str) -> Tweak {
+        Arc::new(move |receipt: &mut Value, _| receipt[field] = json!(value))
+    }
+
+    fn with_tweak(tweak: Tweak) -> Knobs {
+        Knobs {
+            evidence_tweak: Some(tweak),
+            ..Knobs::default()
+        }
+    }
+
+    /// One swap on a chain that disagrees with the adapter in one field, and
+    /// what the run says of it.
+    async fn one_swap_on(name: &str, knobs: Knobs) -> (Lab, Played) {
+        let lab = Lab::new(name, knobs).await;
+        let played = play(&lab, 1).await;
+        (lab, played)
+    }
+
+    /// The check failed with a reason holding `needle`, the run stopped, and
+    /// nothing after the swap was sent.
+    fn assert_the_check_failed(lab: &Lab, played: &Played, check: &str, needle: &str) {
+        let lines = played.of(check);
+        assert_eq!(lines.len(), 1, "{:#?}", played.cases());
+        assert_eq!(lines[0]["verdict"], "fail", "{}", lines[0]);
+        let reason = lines[0]["reason"].as_str().unwrap();
+        assert!(reason.contains(needle), "{needle:?} not in {reason:?}");
+        assert!(!played.clean);
+        assert!(
+            played.exit()["reason"]
+                .as_str()
+                .unwrap()
+                .contains("(the run stopped)"),
+            "{}",
+            played.exit()
+        );
+        // An approval and the swap: nothing more was sent.
+        assert_eq!(lab.chain.times_asked("eth_sendRawTransaction"), 2);
+    }
+
+    fn passed(played: &Played, checks: &[&str]) {
+        for check in checks {
+            assert_eq!(played.verdicts(check), ["pass"], "{check}");
+        }
+    }
+
+    #[tokio::test]
+    async fn x1_an_output_the_receipt_does_not_show_fails() {
+        let (lab, played) =
+            one_swap_on("x1", with_tweak(bump_transfer(mini::TOKEN_OUT, true, 1))).await;
+        assert_the_check_failed(&lab, &played, "X1", "Realised.amount_out is");
+        // Only the evidence differs: the input side and the cost still agree.
+        passed(&played, &["X2", "X3", "X4", "X5", "X6"]);
+        lab.setup.clean_up();
+    }
+
+    #[tokio::test]
+    async fn x2_an_input_the_receipt_does_not_show_fails() {
+        let (lab, played) =
+            one_swap_on("x2", with_tweak(bump_transfer(mini::TOKEN_IN, false, 1))).await;
+        assert_the_check_failed(&lab, &played, "X2", "Realised.amount_in is");
+        passed(&played, &["X1", "X3", "X4", "X5", "X6"]);
+        lab.setup.clean_up();
+    }
+
+    /// Each figure of the cost, on its own.
+    #[tokio::test]
+    async fn x3_each_figure_of_the_cost_must_be_the_receipts() {
+        for (field, named) in [
+            ("gasUsed", "gas_used"),
+            ("effectiveGasPrice", "effective_gas_price_wei"),
+            ("l1Fee", "l1_fee_wei"),
+        ] {
+            let (lab, played) =
+                one_swap_on(&format!("x3-{field}"), with_tweak(one_more(field))).await;
+            assert_the_check_failed(&lab, &played, "X3", named);
+            passed(&played, &["X1", "X2", "X5", "X6"]);
+            lab.setup.clean_up();
+        }
+    }
+
+    /// The first measurement of an L1 fee is a balance that fell by exactly the
+    /// receipt's fee: one wei more is a failure.
+    #[tokio::test]
+    async fn x4_a_balance_that_fell_by_more_than_the_fee_fails() {
+        let (lab, played) = one_swap_on(
+            "x4",
+            Knobs {
+                native_extra_charge: 1,
+                ..Knobs::default()
+            },
+        )
+        .await;
+        assert_the_check_failed(&lab, &played, "X4", "the receipt's fee is");
+        passed(&played, &["X1", "X2", "X3", "X5", "X6"]);
+        lab.setup.clean_up();
+    }
+
+    #[tokio::test]
+    async fn x5_a_token_balance_that_moved_by_more_than_the_swap_fails() {
+        let (lab, played) = one_swap_on(
+            "x5",
+            Knobs {
+                token_leak: 1,
+                ..Knobs::default()
+            },
+        )
+        .await;
+        assert_the_check_failed(&lab, &played, "X5", "did not change by the swap");
+        passed(&played, &["X1", "X2", "X3", "X4", "X6"]);
+        lab.setup.clean_up();
+    }
+
+    #[tokio::test]
+    async fn x6_a_nonce_that_skipped_fails() {
+        let (lab, played) = one_swap_on(
+            "x6-nonce",
+            Knobs {
+                nonce_skip: true,
+                ..Knobs::default()
+            },
+        )
+        .await;
+        assert_the_check_failed(&lab, &played, "X6", "not up by one");
+        passed(&played, &["X1", "X2", "X3", "X4", "X5"]);
+        lab.setup.clean_up();
+    }
+
+    /// The landing: the block, the hash and the status of the raw receipt, each
+    /// against what `Realised` says.
+    #[tokio::test]
+    async fn x6_a_landing_the_raw_receipt_does_not_confirm_fails() {
+        for (tweak, needle) in [
+            (set_field("blockNumber", "0x1"), "Realised.at is"),
+            (
+                set_field(
+                    "transactionHash",
+                    "0x2222222222222222222222222222222222222222222222222222222222222222",
+                ),
+                "Realised.tx_ref is",
+            ),
+            (set_field("status", "0x0"), "the outcome is"),
+        ] {
+            let (lab, played) = one_swap_on("x6-landing", with_tweak(tweak)).await;
+            assert_the_check_failed(&lab, &played, "X6", needle);
+            lab.setup.clean_up();
+        }
+    }
+
+    // --- the landing: late, reverted, never ---
+
+    /// A landing four blocks after the send is the edge of what is allowed; five
+    /// ends the run.
+    #[tokio::test]
+    async fn a_landing_five_blocks_after_the_send_stops_the_run_and_four_does_not() {
+        let at = |empty_blocks_before| Knobs {
+            // The node reports each block as soon as its receipt is served, so
+            // the block read before the send is the approval's.
+            seal_lag_polls: 0,
+            empty_blocks_before,
+            ..Knobs::default()
+        };
+
+        let lab = Lab::new("late-4", at(3)).await;
+        let played = play(&lab, 1).await;
+        assert!(played.clean, "{:#?}", played.cases());
+        assert_eq!(played.verdicts("X6"), ["pass"]);
+        lab.setup.clean_up();
+
+        let lab = Lab::new("late-5", at(4)).await;
+        let played = play(&lab, 1).await;
+        let late: Vec<_> = played
+            .lines
+            .iter()
+            .filter(|line| line["verdict"] == "fail")
+            .collect();
+        assert_eq!(late.len(), 1, "{:#?}", played.cases());
+        let reason = late[0]["reason"].as_str().unwrap();
+        assert!(reason.contains("5 blocks after the send"), "{reason}");
+        // The swap itself was exact: the stop is the landing's.
+        for check in ["X1", "X2", "X3", "X4", "X5", "X6"] {
+            assert_eq!(played.verdicts(check), ["pass"], "{check}");
+        }
+        assert!(!played.clean);
+        assert!(played.exit()["reason"]
+            .as_str()
+            .unwrap()
+            .contains("(the run stopped)"));
+        lab.setup.clean_up();
+    }
+
+    /// A swap the router reverts keeps its reason, moves no tokens, and ends the
+    /// run when it is more than one in ten.
+    #[tokio::test]
+    async fn a_swap_that_reverts_records_its_reason_and_skips_the_amount_checks() {
+        let lab = Lab::new(
+            "revert",
+            Knobs {
+                forced_revert: BTreeSet::from([1]),
+                ..Knobs::default()
+            },
+        )
+        .await;
+        let played = play(&lab, 1).await;
+
+        let references = &played.swaps()[0]["references"];
+        assert_eq!(references["revert"], "Pool: LOCKED");
+        // A swap that reverted has no amounts, and moved no tokens.
+        assert!(references["amount_out"].is_null());
+        assert!(references["amount_in_taken"].is_null());
+        assert!(references["amount_out_vs_quote_bps"].is_null());
+        assert_eq!(played.verdicts("X1"), ["skipped"]);
+        assert_eq!(played.verdicts("X2"), ["skipped"]);
+        assert!(played.of("X1")[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("reverted"));
+        // It still cost its fee, to the unit, and consumed its nonce.
+        passed(&played, &["X3", "X4", "X5", "X6"]);
+        let record = &lab.chain.swaps()[0];
+        assert_eq!(record.reverted.as_deref(), Some("Pool: LOCKED"));
+        assert_eq!(record.gas_used, mini::REVERT_GAS);
+        assert_eq!(references["gas_used"], mini::REVERT_GAS);
+        assert_eq!(lab.chain.account().token_out, 0);
+        // One revert in one swap is more than a tenth.
+        let failed: Vec<_> = played
+            .of("LV2b")
+            .into_iter()
+            .filter(|l| l["verdict"] == "fail")
+            .collect();
+        assert_eq!(failed.len(), 1, "{:#?}", played.cases());
+        assert!(failed[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("1 of 1 swaps reverted: more than 10 %"));
+        assert!(!played.clean);
+        lab.setup.clean_up();
+    }
+
+    /// The router refuses a delivery under `amountOutMin` (30 bps under the
+    /// quote); one under that is slippage, and is kept.
+    #[tokio::test]
+    async fn a_slip_over_thirty_basis_points_reverts_and_one_under_does_not() {
+        let slipping = |bps| Knobs {
+            slip_bps: BTreeMap::from([(1, bps)]),
+            ..Knobs::default()
+        };
+
+        let lab = Lab::new("slip-29", slipping(29)).await;
+        let played = play(&lab, 1).await;
+        assert!(played.clean, "{:#?}", played.cases());
+        let references = &played.swaps()[0]["references"];
+        assert!(references["revert"].is_null());
+        // Signed, in basis points of the quote: it delivered 29 under it.
+        let bps = d(references["amount_out_vs_quote_bps"].as_str().unwrap());
+        assert!(
+            bps < d("-28.9") && bps > d("-29.1"),
+            "the swap delivered {bps} bps against its quote"
+        );
+        passed(&played, &["X1", "X2", "X3", "X4", "X5", "X6"]);
+        lab.setup.clean_up();
+
+        let lab = Lab::new("slip-31", slipping(31)).await;
+        let played = play(&lab, 1).await;
+        let references = &played.swaps()[0]["references"];
+        assert_eq!(references["revert"], "Router: INSUFFICIENT_OUTPUT_AMOUNT");
+        assert!(!played.clean);
+        lab.setup.clean_up();
+    }
+
+    /// One revert in ten swaps is not over the tenth; one in four is.
+    #[tokio::test]
+    async fn one_swap_in_ten_reverting_does_not_stop_the_run_and_one_in_four_does() {
+        let reverting = |swap| Knobs {
+            forced_revert: BTreeSet::from([swap]),
+            ..Knobs::default()
+        };
+
+        let lab = Lab::new("revert-1-in-10", reverting(10)).await;
+        let played = play(&lab, 10).await;
+        assert_eq!(played.swaps().len(), 10);
+        assert_eq!(played.swaps()[9]["references"]["revert"], "Pool: LOCKED");
+        assert!(played.clean, "{:#?}", played.cases().last());
+        assert_eq!(played.exit()["verdict"], "pass");
+        assert!(played.exit()["reason"]
+            .as_str()
+            .unwrap()
+            .contains("1 reverted"));
+        lab.setup.clean_up();
+
+        let lab = Lab::new("revert-1-in-4", reverting(4)).await;
+        let played = play(&lab, 10).await;
+        assert_eq!(played.swaps().len(), 4, "the run ends at the fourth swap");
+        assert!(!played.clean);
+        assert!(played.lines.iter().any(|line| line["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("1 of 4 swaps reverted: more than 10 %"))));
+        lab.setup.clean_up();
+    }
+
+    /// A swap that is accepted and never mined is a failure that names its
+    /// hash, and every reference that needs a landing is `null`, not zero.
+    #[tokio::test]
+    async fn a_swap_that_is_never_mined_is_a_timeout_with_null_references() {
+        let lab = Lab::new(
+            "timeout",
+            Knobs {
+                never_mines_swap: true,
+                ..Knobs::default()
+            },
+        )
+        .await;
+        let played = play_tuned(&lab, 1, |chain| {
+            chain.confirm_timeout = Duration::from_millis(150);
+        })
+        .await;
+
+        let failed: Vec<_> = played
+            .lines
+            .iter()
+            .filter(|line| line["verdict"] == "fail")
+            .collect();
+        assert_eq!(failed.len(), 1, "{:#?}", played.cases());
+        assert!(failed[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("timed out waiting for a receipt"));
+        assert!(!played.clean);
+
+        let references = &played.swaps()[0]["references"];
+        for field in SWAP_REFERENCE_FIELDS {
+            assert!(references.get(field).is_some(), "{field}");
+        }
+        // Sent, so it has a hash and a clock; never seen, sealed or placed.
+        assert!(references["tx_hash"].is_string() && references["sent_ns"].is_number());
+        for absent in [
+            "first_seen_ns",
+            "sealed_ns",
+            "transaction_index",
+            "block_tx_count",
+            "transfer_log_indices",
+            "gas_used",
+            "effective_gas_price_wei",
+            "l1_fee_wei",
+            "amount_in_taken",
+            "amount_out",
+            "amount_out_vs_quote_bps",
+            "revert",
+        ] {
+            assert!(references[absent].is_null(), "{absent}: {references}");
+        }
+        // No check ran on a swap with no receipt.
+        for check in ["X1", "X2", "X3", "X4", "X5", "X6"] {
+            assert!(played.of(check).is_empty(), "{check}");
+        }
+        lab.setup.clean_up();
+    }
+
+    /// A node whose estimate of the swap reverts: the sender refuses to
+    /// broadcast it, and the line still names every reference.
+    #[tokio::test]
+    async fn a_swap_whose_estimate_reverts_is_never_broadcast() {
+        let lab = Lab::new(
+            "estimate",
+            Knobs {
+                estimate_reverts: true,
+                ..Knobs::default()
+            },
+        )
+        .await;
+        let played = play(&lab, 1).await;
+
+        // The approval went; the swap did not.
+        assert_eq!(lab.chain.times_asked("eth_sendRawTransaction"), 1);
+        assert!(lab.chain.swaps().is_empty());
+        let line = played.swaps()[0];
+        assert_ne!(line["verdict"], "pass", "{line}");
+        let references = &line["references"];
+        for field in SWAP_REFERENCE_FIELDS {
+            assert!(references.get(field).is_some(), "{field}");
+        }
+        for absent in ["tx_hash", "sent_ns", "inclusion_block", "gas_used"] {
+            assert!(references[absent].is_null(), "{absent}: {references}");
+        }
+        assert!(!played.clean);
+        lab.setup.clean_up();
+    }
+
+    // --- the ledger, the halt file, the dry run ---
+
+    #[tokio::test]
+    async fn the_ledger_refuses_a_swap_over_the_order_cap_before_anything_is_signed() {
+        let lab = Lab::new("order-cap", Knobs::default())
+            .await
+            .with("VP_ORDER_CAP_USD", "5");
+        let played = play(&lab, 1).await;
+
+        let halted = played.of("LV2b").pop().unwrap();
+        assert_eq!(halted["verdict"], "halted");
+        assert!(halted["reason"].as_str().unwrap().contains("order cap"));
+        // Not even the approval was sent.
+        assert_eq!(lab.chain.times_asked("eth_sendRawTransaction"), 0);
+        assert!(!played.clean);
+        lab.setup.clean_up();
+    }
+
+    #[tokio::test]
+    async fn the_ledger_refuses_a_swap_that_could_pass_the_spend_cap() {
+        let lab = Lab::new("spend-cap", Knobs::default())
+            .await
+            .with("VP_SPEND_CAP_USD", "9");
+        let played = play(&lab, 1).await;
+
+        let halted = played.of("LV2b").pop().unwrap();
+        assert_eq!(halted["verdict"], "halted");
+        assert!(halted["reason"]
+            .as_str()
+            .unwrap()
+            .contains("could pass the cap"));
+        assert_eq!(lab.chain.times_asked("eth_sendRawTransaction"), 0);
+        lab.setup.clean_up();
+    }
+
+    /// With gas worth a fortune (`VP_NATIVE_USD`), the first swap's fees alone
+    /// are a loss over the cap: the run stops after the swap that caused it.
+    #[tokio::test]
+    async fn a_loss_over_the_spend_cap_stops_the_run_after_the_swap_that_caused_it() {
+        let lab = Lab::new("loss", Knobs::default())
+            .await
+            .with("VP_NATIVE_USD", "30000000");
+        let played = play(&lab, 3).await;
+
+        assert_eq!(played.swaps().len(), 1, "{:#?}", played.cases());
+        // The swap itself was exact.
+        passed(&played, &["X1", "X2", "X3", "X4", "X5", "X6"]);
+        let halted = played
+            .of("LV2b")
+            .into_iter()
+            .find(|line| line["verdict"] == "halted")
+            .expect("a halted line");
+        assert!(
+            halted["reason"]
+                .as_str()
+                .unwrap()
+                .contains("over its cap of 30 USD"),
+            "{halted}"
+        );
+        assert!(!played.clean);
+        lab.setup.clean_up();
+    }
+
+    #[tokio::test]
+    async fn the_halt_file_stops_the_run_between_two_calls() {
+        let lab = Lab::new("halt", Knobs::default()).await;
+        let halt = lab.setup.halt.clone();
+        lab.chain.on_method(move |method| {
+            // Written as the approval is sent: the swap that follows is refused.
+            if method == "eth_sendRawTransaction" {
+                std::fs::write(&halt, "stop").unwrap();
+            }
+        });
+        let played = play(&lab, 2).await;
+
+        assert_eq!(lab.chain.times_asked("eth_sendRawTransaction"), 1);
+        assert!(lab.chain.swaps().is_empty());
+        assert!(played.lines.iter().any(|line| line["verdict"] == "halted"));
+        assert!(!played.clean);
+        lab.setup.clean_up();
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_prints_the_first_read_and_sends_nothing() {
+        let lab = Lab::new("dry", Knobs::default())
+            .await
+            .with("VP_DRY_RUN", "1");
+        let env = lab.setup.env();
+        let run = Run::start(&env, "base", "mock-base", Echo::Quiet).unwrap();
+        let (mut settings, signer) = Settings::from_env(&env).unwrap();
+        settings.swaps = 1;
+        let lv2b = Lv2bChain::new(&run, settings).against_mocks();
+        lv2b.run_all(signer).await.unwrap();
+
+        assert_eq!(lab.received().await, 0, "{:?}", lab.chain.asked());
+        let printed = run.gate().printed();
+        assert!(
+            printed
+                .iter()
+                .any(|line| line.contains("web3_clientVersion")),
+            "{printed:#?}"
+        );
+        assert!(!printed
+            .iter()
+            .any(|line| line.contains("eth_sendRawTransaction")));
+        let lines = lab.setup.lines();
+        assert!(
+            lines.iter().all(|line| line["verdict"] == "skipped"),
+            "{lines:#?}"
+        );
+        assert!(run.finish().is_ok());
+        lab.setup.clean_up();
+    }
+
+    // --- the record, the key, the node ---
+
+    #[tokio::test]
+    async fn record_mode_names_each_reply_for_its_swap() {
+        let lab = Lab::new("record", Knobs::default()).await;
+        let record = lab.setup.record.display().to_string();
+        let lab = lab.with("VP_RECORD_DIR", &record);
+        let played = play(&lab, 1).await;
+        assert!(played.clean);
+
+        let dir = &lab.setup.record;
+        for file in ["50-client-version", "001-quote", "001-swap"] {
+            assert!(dir.join(format!("{file}.json")).exists(), "{file}");
+            assert!(dir.join(format!("{file}.status")).exists(), "{file}");
+        }
+        // The swap's file is the raw receipt, as the node sent it.
+        let receipt: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("001-swap.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            receipt["result"]["transactionHash"],
+            played.swaps()[0]["references"]["tx_hash"]
+        );
+        assert_eq!(played.swaps()[0]["body_file"], "001-swap.json");
+        // Nothing recorded holds the key or the provider's.
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let body = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            assert!(!body.contains(lab.key.key_hex()) && !body.contains(KEY_IN_PATH));
+        }
+        lab.setup.clean_up();
+    }
+
+    #[tokio::test]
+    async fn the_signers_key_and_the_providers_are_in_no_line() {
+        let lab = Lab::new("secrets", Knobs::default()).await;
+        let played = play(&lab, 2).await;
+
+        assert!(!played.text.contains(lab.key.key_hex()));
+        assert!(!played.text.contains(KEY_IN_PATH));
+        // The provider is named by its host alone, and the key is not a line.
+        assert!(played.text.contains("[provider]") || played.text.contains("127.0.0.1"));
+        // The signer's address is public, and is on its lines.
+        assert!(played.text.contains(&lab.signer().to_string()));
+        lab.setup.clean_up();
+    }
+
+    /// Outside a self-test a node on this machine is refused before a request
+    /// is made.
+    #[tokio::test]
+    async fn a_node_on_this_machine_is_refused_before_anything_is_asked() {
+        let lab = Lab::new("local", Knobs::default()).await;
+        let env = lab.setup.env();
+        let run = Run::start(&env, "base", "mock-base", Echo::Quiet).unwrap();
+        let (mut settings, signer) = Settings::from_env(&env).unwrap();
+        settings.swaps = 1;
+        let err = Lv2bChain::new(&run, settings)
+            .run_all(signer)
+            .await
+            .expect_err("refused");
+        assert!(format!("{err:#}").contains("127.0.0.1"), "{err:#}");
+        assert_eq!(lab.received().await, 0);
+        lab.setup.clean_up();
+    }
+
+    #[tokio::test]
+    async fn an_anvil_is_refused_before_a_sender_connects() {
+        let lab = Lab::new(
+            "anvil",
+            Knobs {
+                client_version: "anvil/v1.0.0".to_string(),
+                ..Knobs::default()
+            },
+        )
+        .await;
+        let played = play(&lab, 1).await;
+
+        assert_eq!(played.verdicts("GUARD"), ["fail"]);
+        assert!(played.of("GUARD")[0]["reason"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("anvil"));
+        assert_eq!(lab.chain.times_asked("eth_chainId"), 0);
+        assert_eq!(lab.chain.times_asked("eth_sendRawTransaction"), 0);
+        assert!(!played.clean);
+        lab.setup.clean_up();
+    }
+
+    #[tokio::test]
+    async fn a_node_on_another_chain_is_refused_at_connect_naming_both_ids() {
+        let lab = Lab::new(
+            "chain",
+            Knobs {
+                chain_id: 1,
+                ..Knobs::default()
+            },
+        )
+        .await;
+        let played = play(&lab, 1).await;
+
+        let refused = played
+            .lines
+            .iter()
+            .find(|line| line["verdict"] == "fail")
+            .expect("a failed line");
+        // The verdict's reason is generic; the node's words are the outcome's,
+        // with the provider's URL scrubbed.
+        assert_eq!(refused["outcome"]["kind"], "not_sent");
+        let said = refused["outcome"]["msg"].as_str().unwrap();
+        assert!(
+            said.contains("is on chain 1") && said.contains("8453") && said.contains("[provider]"),
+            "{refused}"
+        );
+        assert_eq!(lab.chain.times_asked("eth_sendRawTransaction"), 0);
+        assert_eq!(lab.chain.times_asked("eth_getBalance"), 0);
+        assert!(!played.clean);
+        lab.setup.clean_up();
+    }
+
+    #[tokio::test]
+    async fn a_pool_that_cannot_be_read_ends_the_run_before_any_swap() {
+        let lab = Lab::new(
+            "pool",
+            Knobs {
+                stable_reverts: true,
+                ..Knobs::default()
+            },
+        )
+        .await;
+        let played = play(&lab, 1).await;
+
+        assert!(played.lines.iter().any(|line| line["verdict"] == "fail"));
+        assert_eq!(lab.chain.times_asked("eth_sendRawTransaction"), 0);
+        assert!(played.swaps().is_empty());
+        assert!(!played.clean);
+        lab.setup.clean_up();
     }
 
     // --- the test a person runs ---

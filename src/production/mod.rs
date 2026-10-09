@@ -38,6 +38,8 @@ pub(crate) mod lv1_base;
 pub(crate) mod lv1_binance;
 pub(crate) mod lv2a_exchange;
 pub(crate) mod lv2b_chain;
+#[cfg(test)]
+mod mini_chain;
 pub(crate) mod record;
 pub(crate) mod results;
 pub(crate) mod sizing;
