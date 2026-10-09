@@ -94,8 +94,15 @@ refuse the connect: V7's `production_lv1_base` C4 records what real providers an
 ### O2 — `label()` of `EvmLive` and `EvmLiquidity` follows the sender's provenance
 
 A signing sender on anvil is now `Simulated`, so `EvmLive::label()` is `"evm-live-fork"` and
-`EvmLiquidity`'s `"evm-liquidity-fork"` for it. V6's text and `SPEC.md` do not mention labels. Nothing in this
-crate branches on a label. Consistent with the intent; undocumented.
+`EvmLiquidity`'s `"evm-liquidity-fork"` for it. V6's text does not say so. Nothing in this crate branches on a
+label. Consistent with the intent; undocumented.
+
+**Status: done**, on the owner's word, in its own commit. A correction to the observation: `SPEC.md` §5b already
+said `EvmLiquidity`'s label is `"evm-liquidity-live"` or `"evm-liquidity-fork"` "from the sender", and the fork
+sender's label was tested; what was undocumented and untested was that a *signing* sender on anvil takes the
+`-fork` label. No behaviour changes, so no test could fail first: `SPEC.md` §5 now has a bullet saying it, and
+`the_label_follows_the_senders_provenance` (one test in `EvmLive`'s module, one in `EvmLiquidity`'s) pins both
+labels for a signing sender on a node that reports `anvil` and on one that does not.
 
 ### O3 — pre-existing, moved by V6, not changed: `at: 0` when the block number cannot be read
 

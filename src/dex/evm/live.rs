@@ -438,7 +438,9 @@ mod tests {
     use crate::dex::PriorityBid;
     use crate::evm::erc20::{transfer_topic, ALLOWANCE_SELECTOR};
     use crate::evm::rpc::{encode_error_string, format_u256, hex_data, pad_address};
-    use crate::evm::tx::tests::{connect, mount_receipt, mount_send_plumbing, SEPOLIA};
+    use crate::evm::tx::tests::{
+        connect, connect_to_a_node_that_reports, mount_receipt, mount_send_plumbing, SEPOLIA,
+    };
     use crate::evm::{EvmRpc, FeePolicy, PollSettings, Signer};
     use serde_json::{json, Value};
     use std::time::Duration;
@@ -494,6 +496,18 @@ mod tests {
         mount_send_plumbing(&server).await;
         let live = EvmLive::new(connect(&server).await);
         (server, live)
+    }
+
+    /// The label follows the sender's provenance: a signing sender on anvil is
+    /// `Simulated`, so its adapter says it is a fork, as a fork sender's does.
+    #[tokio::test]
+    async fn the_label_follows_the_senders_provenance() {
+        let on_a_chain =
+            EvmLive::new(connect_to_a_node_that_reports(json!("Geth/v1.14.0-stable")).await);
+        let on_anvil = EvmLive::new(connect_to_a_node_that_reports(json!("anvil/v1.3.0")).await);
+
+        assert_eq!(on_a_chain.label(), "evm-live");
+        assert_eq!(on_anvil.label(), "evm-live-fork");
     }
 
     #[tokio::test]

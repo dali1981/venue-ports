@@ -594,6 +594,9 @@ Rules:
   version (another error object, a rate limit or a gateway's refusal included, or no answer at all) is an
   error, because the sender could not say what it sends to: it does not guess `Landed`. A signing sender
   still never writes a balance (`ensure_balance`), anvil included.
+- **An adapter's label follows its sender's provenance.** `EvmLive` is `"evm-live"` or `"evm-live-fork"`,
+  `EvmLiquidity` `"evm-liquidity-live"` or `"evm-liquidity-fork"`: a signing sender on anvil is `Simulated`, so
+  it carries the `-fork` label, as a fork sender does. Nothing in the crate branches on a label.
 - **The sender prices a transaction by its `FeePolicy` alone.** It takes no priority bid: `EvmLive` refuses
   `PriorityBid::AbovePolicyPerGas` above zero, by name, over a signing sender and a fork sender alike.
 - **No convenience constructor builds a sender inside an adapter.** It would make a second sender for

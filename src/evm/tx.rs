@@ -1167,8 +1167,9 @@ pub(crate) mod tests {
     }
 
     /// The node's own answer to `web3_clientVersion` decides the sender's
-    /// provenance, once, at `connect`.
-    async fn connect_to_a_node_that_reports(version: Value) -> Arc<EvmSender> {
+    /// provenance, once, at `connect`. The node is gone when this returns: a
+    /// test reads what the sender says it is, and sends nothing.
+    pub(crate) async fn connect_to_a_node_that_reports(version: Value) -> Arc<EvmSender> {
         let server = MockServer::start().await;
         mount_send_plumbing(&server).await;
         Mock::given(method("POST"))

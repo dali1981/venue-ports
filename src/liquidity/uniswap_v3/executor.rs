@@ -726,7 +726,9 @@ mod tests {
     use super::*;
     use crate::evm::erc20::{transfer_topic, ALLOWANCE_SELECTOR, BALANCE_OF_SELECTOR};
     use crate::evm::rpc::{encode_error_string, format_u256, hex_data, pad_address};
-    use crate::evm::tx::tests::{connect, mount_receipt, mount_send_plumbing, SEPOLIA};
+    use crate::evm::tx::tests::{
+        connect, connect_to_a_node_that_reports, mount_receipt, mount_send_plumbing, SEPOLIA,
+    };
     use crate::evm::tx::unique_test_signer;
     use crate::evm::{EvmRpc, FeePolicy, Signer};
     use crate::liquidity::Range;
@@ -740,6 +742,22 @@ mod tests {
     const TOKEN0: Address = Address::repeat_byte(0xA0);
     const TOKEN1: Address = Address::repeat_byte(0xB0);
     const ID: u64 = 7;
+
+    /// The label follows the sender's provenance: a signing sender on anvil is
+    /// `Simulated`, so its adapter says it is a fork, as a fork sender's does.
+    #[tokio::test]
+    async fn the_label_follows_the_senders_provenance() {
+        let label_on = |sender| EvmLiquidity::new(sender, MANAGER, ManagerAbi::UniswapV3).label();
+
+        assert_eq!(
+            label_on(connect_to_a_node_that_reports(json!("Geth/v1.14.0-stable")).await),
+            "evm-liquidity-live"
+        );
+        assert_eq!(
+            label_on(connect_to_a_node_that_reports(json!("anvil/v1.3.0")).await),
+            "evm-liquidity-fork"
+        );
+    }
 
     fn topic(address: Address) -> String {
         hex_data(&pad_address(address))
