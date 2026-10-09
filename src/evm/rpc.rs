@@ -136,6 +136,41 @@ pub struct Receipt {
 pub struct EvmRpc {
     url: String,
     http: reqwest::Client,
+    /// The production harness's tap (`src/production`): told when a transaction
+    /// is about to be broadcast and each time a receipt is asked for. Test
+    /// builds only; unset, the client is as it is.
+    #[cfg(test)]
+    tap: Option<RpcTap>,
+}
+
+/// What happened on the wire that a test taps: a signed transaction is about
+/// to be broadcast, or a receipt poll was answered.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RpcEvent {
+    /// `eth_sendRawTransaction` is about to be asked.
+    Broadcast,
+    /// A receipt was asked for `hash`, and the node did (or did not) have it.
+    Receipt { hash: B256, found: bool },
+}
+
+/// What a test hangs on [`EvmRpc::with_tap`].
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct RpcTap(std::sync::Arc<dyn Fn(RpcEvent) + Send + Sync>);
+
+#[cfg(test)]
+impl RpcTap {
+    pub(crate) fn new(tap: impl Fn(RpcEvent) + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(tap))
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for RpcTap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RpcTap")
+    }
 }
 
 impl EvmRpc {
@@ -152,7 +187,16 @@ impl EvmRpc {
                 .timeout(timeout)
                 .build()
                 .expect("a reqwest client with only a timeout set always builds"),
+            #[cfg(test)]
+            tap: None,
         }
+    }
+
+    /// This client, telling `tap` of each broadcast and each receipt poll.
+    #[cfg(test)]
+    pub(crate) fn with_tap(mut self, tap: RpcTap) -> Self {
+        self.tap = Some(tap);
+        self
     }
 
     pub fn url(&self) -> &str {
@@ -385,6 +429,10 @@ impl EvmRpc {
     }
 
     pub async fn send_raw_transaction(&self, raw: &[u8]) -> Result<()> {
+        #[cfg(test)]
+        if let Some(tap) = &self.tap {
+            (tap.0)(RpcEvent::Broadcast);
+        }
         self.call("eth_sendRawTransaction", json!([hex_data(raw)]))
             .await?;
         Ok(())
@@ -420,6 +468,13 @@ impl EvmRpc {
         let receipt = self
             .call("eth_getTransactionReceipt", json!([tx_hash.to_string()]))
             .await?;
+        #[cfg(test)]
+        if let Some(tap) = &self.tap {
+            (tap.0)(RpcEvent::Receipt {
+                hash: tx_hash,
+                found: !receipt.is_null(),
+            });
+        }
         if receipt.is_null() {
             return Ok(None);
         }

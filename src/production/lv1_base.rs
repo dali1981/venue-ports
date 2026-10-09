@@ -122,7 +122,7 @@ pub(crate) struct Throwaway {
 }
 
 impl Throwaway {
-    fn generate() -> Result<Self> {
+    pub(crate) fn generate() -> Result<Self> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         loop {
             let mut seed = Vec::new();
@@ -146,7 +146,13 @@ impl Throwaway {
         }
     }
 
-    fn signer(&self) -> Result<Signer> {
+    /// The key, for a self-test that hands it to a run through its environment.
+    #[cfg(test)]
+    pub(crate) fn key_hex(&self) -> &str {
+        &self.key_hex
+    }
+
+    pub(crate) fn signer(&self) -> Result<Signer> {
         Signer::from_private_key_hex(&self.key_hex)
     }
 }
@@ -165,14 +171,14 @@ impl Node {
 }
 
 /// The host of `url` alone: a provider's path and query are its key.
-fn host_of(url: &str) -> String {
+pub(crate) fn host_of(url: &str) -> String {
     reqwest::Url::parse(url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
         .unwrap_or_else(|| "unparsable-url".to_string())
 }
 
-fn rpc_request(method: &str, params: &[(&str, String)]) -> RequestRecord {
+pub(crate) fn rpc_request(method: &str, params: &[(&str, String)]) -> RequestRecord {
     RequestRecord {
         method: "RPC".to_string(),
         path: method.to_string(),

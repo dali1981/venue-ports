@@ -28,6 +28,7 @@
 //! made: it times the call, reads its outcome, judges it against what the case
 //! expects, and writes the line.
 
+pub(crate) mod chain_checks;
 pub(crate) mod env;
 pub(crate) mod exchange_checks;
 pub(crate) mod gate;
@@ -36,6 +37,7 @@ pub(crate) mod ledger;
 pub(crate) mod lv1_base;
 pub(crate) mod lv1_binance;
 pub(crate) mod lv2a_exchange;
+pub(crate) mod lv2b_chain;
 pub(crate) mod record;
 pub(crate) mod results;
 pub(crate) mod sizing;
