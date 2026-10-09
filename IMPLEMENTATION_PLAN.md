@@ -623,6 +623,40 @@ Order of work, each step compiled and tested before the next:
 - **`PriorityBid::AbovePolicyPerGas` stays refused**: `EvmSender` takes no priority bid and `EvmLive::prepare`
   refuses one above zero by name, so a signing sender sends at its `FeePolicy` only.
 
+## Phase 17 — a production test tier, and the reads it needs (V7)
+
+[V7](specs/V7-production-validation.md), requested by a consumer about to send its first real orders and swaps,
+that wants to know before any strategy runs what each venue answers: to a request it must refuse, to a read, and
+to one small order or swap at a time. Its signatures are in `SPEC.md` §5, §6, §6d, §7 and §8. Branch
+`v7-production-validation`, from `m10c-balances-resolution` (V6). **Pushed; no pull request; nothing merged.**
+
+Order of work, each step compiled and tested before the next:
+
+1. **A review of V6** (`specs/V7-review-of-V6.md`): one defect (an `EvmLive::resolve` of a swap that landed
+   undecodable was answered again after it was decided), fixed test first; two observations (a node that cannot
+   say whether it is anvil is not read as `Landed`; an adapter's label follows its sender's provenance).
+2. **Recorded bodies and the catalogue.** `docs/responses/` and `catalogue_matches_fixtures` are in; the six
+   `TODO(R2)` bodies are `fixtures/binance-spot/documented/` files. **The consumer's testnet recording was not
+   supplied** (`specs/V7-questions.md`, Q1), so no row is `testnet` or `production` yet.
+3. **`VenueRefusal`** and `refusal_of`, attached wherever a refusal becomes an error; `Display` unchanged.
+4. **The reads**: `account_commission`, `api_restrictions`, `book_ticker`, `symbol_rules`, `recent_trades`,
+   `order_book` on `BinanceRest`; `Receipt.transaction_index`, `EvmRpc::block_transaction_count`.
+5. **The harness**: host guard, spend ledger, halt file, dry run, record mode, results writer, request hooks.
+6. **LV1**: B1 to B10 for Binance spot, C1 to C6 for Base.
+7. **LV2a**: ten exchange round trips reconciled to the unit (E1 to E6), against a stateful mock exchange.
+8. **LV2b**: sixty router swaps reconciled to the chain's own record (X1 to X6), against a stateful mock chain.
+9. **Documents**: `SPEC.md`, this plan, the README, the catalogue.
+
+- Done when: `cargo fmt --check`, `cargo clippy --all-targets` and `cargo test` are clean, every figure that was in
+  the suite before is unchanged, every case has a passing and a failing self-test, `cargo test --lib production
+  -- --ignored --list` lists the four tests, a dry run of each prints its calls and sends none, and the catalogue
+  test passes.
+- **Status: written, offline-tested, not run against a production venue.** Running the four tests needs keys,
+  money and a route to `api.binance.com` and a Base node, which a person has. What a person must also settle:
+  the Aerodrome router's verified ABI (Q3), whether the testnet recording is wanted (Q1, Q2), how an account's
+  commission rates become a trade's commission (Q4), and what the first production recording says of the
+  assumed HTTP statuses of the refusals the mock serves.
+
 ## Tracking
 
 Each phase's "Done when" line is its exit criterion. Treat §9 of `SPEC.md` as the authoritative

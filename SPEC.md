@@ -597,6 +597,10 @@ Rules:
 - **An adapter's label follows its sender's provenance.** `EvmLive` is `"evm-live"` or `"evm-live-fork"`,
   `EvmLiquidity` `"evm-liquidity-live"` or `"evm-liquidity-fork"`: a signing sender on anvil is `Simulated`, so
   it carries the `-fork` label, as a fork sender does. Nothing in the crate branches on a label.
+- **A landing's position is read, not inferred.** `Receipt.transaction_index` is the receipt's
+  `transactionIndex` (`None` when the node leaves it out; a value that is not a hex quantity is an error), and
+  `EvmRpc::block_transaction_count(block)` is `eth_getBlockTransactionCountByNumber` (a block the node does
+  not have is an error naming it, never a count of zero). Nothing reads them but the production tier (§7).
 - **The sender prices a transaction by its `FeePolicy` alone.** It takes no priority bid: `EvmLive` refuses
   `PriorityBid::AbovePolicyPerGas` above zero, by name, over a signing sender and a fork sender alike.
 - **No convenience constructor builds a sender inside an adapter.** It would make a second sender for
@@ -1095,6 +1099,32 @@ and whatever else is in the chain, `OrderStateUnknown` included, is still found 
 it attaches the provenance with `with_provenance` when it returns the error. (`{:#}` of an error tagged
 after the fact says its top-level message twice; an `OrderStateUnknown` this crate builds does not.)
 
+**A refusal is typed.** When the venue read a request and refused it, it did not act on it, and the error's
+chain holds a `VenueRefusal`:
+
+```rust
+// src/cex/mod.rs
+pub struct VenueRefusal {
+    pub status: u16,
+    /// The venue's own code, when the body carried one (Binance: -1013, -2010, -2015, -1021, …).
+    pub code: Option<i64>,
+    pub msg: String,
+}                                                                   // Display, std::error::Error
+pub fn refusal_of(err: &anyhow::Error) -> Option<&VenueRefusal>;    // found with downcast_ref
+```
+
+A caller that must act differently on `-2010` (no balance), `-2015` (key, IP or permission) and `-1021`
+(clock) reads the code instead of searching the error's text. It is a layer of the chain, as
+`ErrorProvenance` is, and **the error's `Display` is unchanged**: `refused (HTTP 400, code -1013): …`, the
+text a caller that matched on it still sees. `downcast_ref::<OrderStateUnknown>()` finds what it found.
+It is attached wherever a refusal becomes an error: the order path (`execute`), `test_order`,
+`order_state`, the account and balance reads, every read of §6d, and the futures client, which shares the
+signed client. A reply that was lost (`Lost`) and a request that was never sent (`NotSent`) are **not**
+refusals: the venue may have acted on the first and says nothing of the second. (`ApiError`, the client's
+own type, is not a `std::error::Error`: it becomes an `anyhow::Error` through one `From`, so a call that
+forgets to convert does not compile. `BybitLive` has its own client and error type and carries no
+`VenueRefusal`.)
+
 ### Required implementations (CEX)
 
 - **`CexLive`** — places a real order against a venue's trading API. Responsible for: rounding
@@ -1341,6 +1371,35 @@ pub trait SpotBalanceReader: Send + Sync {
   stub answers from a history (a value set at block `b` holds until a later block sets another); a read before
   the first value is an error, never zero.
 
+## 6d. Binance spot: the rates, the key and the market
+
+A production run needs six answers the order path did not give: what the account pays on a symbol, what
+the key may do, the top of the book and its levels, a symbol's rules as a typed read, and the trades the
+venue lists. Each is an inherent method of `BinanceRest` (reachable from `BinanceLive` through `rest()`), as
+`test_order` is: they are Binance's own, and a second venue would motivate a trait. Nothing is sent that
+the venue would refuse after a round trip (an empty symbol, a `limit` outside what the venue accepts).
+
+| Method | Endpoint | Signed | Returns |
+|---|---|---|---|
+| `account_commission(symbol)` | `GET /api/v3/account/commission` (weight 20) | yes | `SymbolCommission { symbol, standard, special, tax: Commission, discount: CommissionDiscount }`; `Commission { maker, taker, buyer, seller }` |
+| `api_restrictions()` | `GET /sapi/v1/account/apiRestrictions` | yes; **production host only**: the testnet has no `/sapi`, and that refusal is itself a recorded case | `ApiRestrictions { ip_restrict, enable_reading, enable_withdrawals, enable_internal_transfer, enable_spot_and_margin_trading, enable_futures, enable_margin, create_time_ms: Option<u64> }` |
+| `book_ticker(symbol)` | `GET /api/v3/ticker/bookTicker` | no | `BookTicker { symbol, bid_price, bid_qty, ask_price, ask_qty }` |
+| `symbol_rules(symbol)` | `GET /api/v3/exchangeInfo?symbol=` | no | `SymbolRules { symbol, status, base_asset, quote_asset, lot_step, min_qty, min_notional: Option, apply_min_to_market: Option }`; `status == "TRADING"` is the one that trades |
+| `recent_trades(symbol, limit)` | `GET /api/v3/trades`, `limit` 1 to 1000 | no | `Vec<PublicTrade { id, price, qty, time_ms, is_buyer_maker }>` |
+| `order_book(symbol, limit)` | `GET /api/v3/depth`, `limit` 1 to 5000 | no | `OrderBookSnapshot { last_update_id, bids, asks }`, each side `(price, quantity)` best first |
+
+- **Exact.** Every price, quantity and rate is a `Decimal` parsed from the string the venue sent. A JSON
+  number where a string is documented is an error, never a float; a book side out of price order is an
+  error; `symbol_rules` is an error when the answer cannot round a quantity by (no `LOT_SIZE` filter, a
+  `stepSize` of zero) or has no row for the symbol asked.
+- **A field the venue omits** is `None`, or an error naming it, never a zero. `special` in
+  `SymbolCommission` is required, as the documentation has it; `CommissionRates`, which the order path reads
+  the same answer into, treats it as optional. If a real answer omits it, `account_commission` fails with a
+  missing-field error: `specs/V7-questions.md`.
+- **A refusal is an `Err` carrying a `VenueRefusal`** (§6). An answer that cannot be read is an `Err` that is
+  not one: the venue did not refuse it.
+- **Reads carry no `Provenance`**: nothing is sent that could trade.
+
 ## 7. Contract tests — what keeps the stub honest
 
 A stub that quietly drifts from what `Simulated`/`Live` actually do is worse than no stub: code built
@@ -1424,6 +1483,60 @@ The middle row is what makes the top row trustworthy: if `Stub` and `Simulated` 
 contract, the schedule catches it before anything is built on top of a fake that stopped matching
 reality.
 
+### The production tier (V7)
+
+The `Live` row above is a human, a key and money. V7 writes down what that person runs, so that the first
+real order or swap is one small step with a guard, a ledger and a record around it, and what each venue
+answered is kept.
+
+Four tests under `src/production/`, in-crate and `#[cfg(test)]` because the signed client is `pub(crate)`,
+each `#[ignore]`d and run by hand (`cargo test --lib production_lv1_binance -- --ignored --nocapture`):
+
+| Test | What it does | Spends |
+|---|---|---|
+| `production_lv1_binance` | B1 to B10: requests the venue must refuse (no signature, a wrong one, a stale timestamp, a key from a host not whitelisted, a key that may not trade, an order under the minimum, off the lot step, on an empty wallet, an unknown symbol), `test_order`, and the reads of §6d that need no trade (B10), with `enable_withdrawals == false`, `ip_restrict == true` and `status == "TRADING"` asserted | nothing: refused, or `/order/test` |
+| `production_lv1_base` | C1 to C6 for each provider in `VP_BASE_RPC_URLS`, with a throwaway key that holds nothing: an unfunded signer, an estimate that reverts, a wrong chain id, what the provider serves, a dead node, a pool's views | nothing |
+| `production_lv2a_exchange` | ten market round trips on `VP_SYMBOL` of about `VP_ORDER_USD`; E1 to E6 reconcile each order to the unit against `order_state`, `myTrades`, the public trades, the balances and the commission rate | the spread and twice the commission, bounded by the ledger |
+| `production_lv2b_chain` | sixty router swaps on Base, alternating direction at exponential intervals; X1 to X6 reconcile each against **an independent decoding of the raw receipt**, the signer's balances at the block before and at the block, and its nonce. The first measurement of a real L1 fee | the pool's fee, gas and the L1 fee, bounded by the ledger |
+
+**The harness** (`src/production/mod.rs`) is the same for all four. The Binance host must be exactly
+`https://api.binance.com` (the testnet, any other host and an unset variable are refused by name), and a
+node must not be on this machine or an anvil. `VP_SPEND_CAP_USD` has no default; each order's notional is
+checked against `VP_ORDER_CAP_USD` (default 12) **before it is signed**, and the ledger refuses the next call
+once the loss so far, valued at the fills' own prices, plus the order's whole notional could pass the cap. A
+value the ledger cannot compute (a commission paid in BNB, a quote asset that is not USD) stops the run and is
+never counted as zero. `VP_HALT_FILE` is checked before every call. `VP_DRY_RUN=1` prints each call (method,
+path, parameters; no key, signature or timestamp) and sends nothing. `VP_RECORD_DIR` saves each reply
+byte for byte but for the account's `uid`. `VP_OUT` receives `results.jsonl`, one line per call: the
+request, the outcome (`ok`, `refused`, `lost`, `not_sent`), what was expected, a verdict (`pass`, `fail`,
+`skipped`, `halted`, or **`unmapped`**, a reply in no row of the catalogue, which fails the run), and, for a
+call that trades, the `references` a consumer needs to split a slippage into its terms: the touch at send,
+the clock around the request, the venue's own time, the average fill, the quote and the calldata, when the
+transaction was first seen and sealed, where in its block it landed. **A reference that does not exist is
+`null`, never zero.** A key, a secret, a signature or a `uid` is never written.
+
+**Every case has an offline self-test**: the same case code runs against a `wiremock` server standing in for
+the venue, once with the reply it expects (the verdict is `pass`) and once with a different one (`fail` or
+`unmapped`, and it says why). LV2a's stand-in is a stateful exchange (`MiniExchange`: an account, a public
+tape, a two-level book, the key, signature, timestamp, lot step, minimum notional and balance checks) with a
+knob for each way it can disagree with the case; LV2b's is a stateful chain (`MiniChain`: it decodes the raw
+transactions it is sent, mines a block for each, keeps the signer's balances at every block and writes the
+swap's `Transfer` logs among others that are not its own) with a knob for each of X1 to X6 and for a swap that
+is late, reverted or never mined. The case code was broken on purpose, one change at a time
+(`scripts/mutate-check.py`), and each break was caught by a test.
+
+**What the self-tests do and do not say.** They prove that the case code reads a reply as it should and
+fails when the reply differs. They do not say what Binance or a Base node answers: every body a mock serves
+is `documented` or `synthetic` in the catalogue (`docs/responses/`), the HTTP status a mock serves with a
+refusal is assumed, and the Aerodrome router's ABI is from memory (`specs/V7-questions.md`, Q3). The
+**catalogue** has one row for each call and response variant, with the body (`fixtures/`), its origin
+(`production`, `testnet`, `documented`, `synthetic`, `not provokable`), the test that parses it and the typed
+result; `catalogue_matches_fixtures` fails if a file has no row, a row has no file or a row's test does not
+read its body. A production run's `VP_RECORD_DIR` is copied to `fixtures/<venue>/production/<date>/` by a
+person who has read it, and its rows become `production`.
+
+**Status: written, offline-tested, not run against a production venue.**
+
 ## 8. Module layout
 
 ```text
@@ -1438,6 +1551,11 @@ venue-ports/
     │   │                     # receipts, revert-reason replay, hex/ABI helpers
     │   ├── erc20.rs          # selectors; balance and allowance reads; storage-slot probing
     │   └── tx.rs             # Signer, EvmSender (signing and fork backends), TxOutcome, FeePolicy
+    ├── catalogue.rs          # §7: catalogue_matches_fixtures, keeping docs/responses honest
+    ├── production/           # §7, the production tier (test-only): the harness (guard, ledger, halt file,
+    │                         # dry run, record mode, results), LV1 (lv1_binance, lv1_base), LV2a
+    │                         # (lv2a_exchange, exchange_checks), LV2b (lv2b_chain, chain_checks) and the
+    │                         # stateful mocks they are tested against (MiniExchange, mini_chain)
     ├── network.rs            # Network (§4)
     ├── solana/               # the Solana family's plumbing (§5): rpc.rs (SolanaRpc),
     │                         # tx.rs (SolanaSender, SolanaTxOutcome), token.rs
@@ -1469,7 +1587,11 @@ venue-ports/
     │   │   │                 #   not sent / refused / lost
     │   │   ├── order.rs      #   finding an order by client order id, trade lines, the
     │   │   │                 #   one-commission-asset rule
+    │   │   ├── client/hooks.rs #   test-only request hooks: an explicit timestamp, no signature,
+    │   │   │                 #   a corrupted one; the production tier's seam into the client
     │   │   ├── rest.rs       # spot REST client
+    │   │   ├── reads.rs      # § 6d: account_commission, api_restrictions, book_ticker, symbol_rules,
+    │   │   │                 #   recent_trades, order_book
     │   │   └── live.rs       # BinanceLive (spot)
     │   ├── binance_futures/
     │   │   ├── rest.rs       # BinanceFuturesRest: signed fapi client, server-clock offset
@@ -1483,6 +1605,9 @@ venue-ports/
     └── testkit/
         └── contract.rs        # § 7's shared suites
 ```
+
+Beside `src/`: `fixtures/` (recorded and documented bodies), `docs/responses/` (the catalogue of §7) and
+`scripts/mutate-check.py` (breaks one line at a time and runs the tests that should notice).
 
 ## 9. Acceptance criteria
 
