@@ -13,7 +13,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod account;
 mod account_stub;
-mod binance;
+// `pub(crate)` so that the production tier (`src/production`, test builds only)
+// can reach the signed client; the public surface is the re-exports below.
+pub(crate) mod binance;
 mod binance_futures;
 mod bybit;
 mod orders;

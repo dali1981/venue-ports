@@ -16,3 +16,8 @@ pub mod evm;
 pub mod liquidity;
 pub mod solana;
 pub mod testkit;
+
+// The production test tier (`specs/V7-production-validation.md`): test builds
+// only, because the signed clients are `pub(crate)`.
+#[cfg(test)]
+mod production;

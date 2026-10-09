@@ -131,6 +131,10 @@ pub(crate) struct BinanceClient {
     time_path: &'static str,
     clock: Arc<ServerClock>,
     timings: CexTimings,
+    /// The production harness's seam (`src/production`): asked before each
+    /// call, told each reply. Test builds only; unset, the client is as it is.
+    #[cfg(test)]
+    wire: Option<Arc<dyn crate::production::wire::Wire>>,
 }
 
 impl BinanceClient {
@@ -157,6 +161,8 @@ impl BinanceClient {
             time_path,
             clock: Arc::new(ServerClock::new(timings.recv_window, timings.clock_refresh)),
             timings,
+            #[cfg(test)]
+            wire: None,
         }
     }
 
@@ -173,6 +179,7 @@ impl BinanceClient {
             time_path: self.time_path,
             clock: Arc::clone(&self.clock),
             timings,
+            wire: self.wire.clone(),
         }
     }
 
@@ -195,6 +202,8 @@ impl BinanceClient {
         path: &str,
         params: &[(&str, String)],
     ) -> Result<T, ApiError> {
+        #[cfg(test)]
+        self.gate(&Method::GET, path, params)?;
         let query = sign::encode_query(params);
         self.send(Method::GET, path, &query, false, Instant::now())
             .await
@@ -203,6 +212,8 @@ impl BinanceClient {
     /// Reads the venue's clock now, refusing a round trip that does not fit
     /// inside `recvWindow`. Returns the round trip.
     pub(crate) async fn sync_clock(&self) -> anyhow::Result<Duration> {
+        #[cfg(test)]
+        self.gate(&Method::GET, self.time_path, &[])?;
         let sent_local_ms = local_now_ms();
         let started = Instant::now();
         let time: ServerTime = self
@@ -231,6 +242,8 @@ impl BinanceClient {
         path: &str,
         params: &[(&str, String)],
     ) -> Result<T, ApiError> {
+        #[cfg(test)]
+        self.gate(&method, path, params)?;
         let mut resynced = false;
         loop {
             let (timestamp, signed_at) = self.timestamp().await.map_err(ApiError::NotSent)?;
@@ -312,6 +325,10 @@ impl BinanceClient {
 
         let status = response.status();
         let body = response.text().await;
+        #[cfg(test)]
+        if let Ok(text) = &body {
+            self.observe(method.as_str(), path, status.as_u16(), text);
+        }
         let lost = |cause: anyhow::Error| ApiError::Lost {
             signed_at,
             cause: cause.context(format!("{method} {path} answered HTTP {status}")),
@@ -350,6 +367,9 @@ impl BinanceClient {
         Err(lost(anyhow!("unexpected HTTP status")))
     }
 }
+
+#[cfg(test)]
+mod hooks;
 
 #[cfg(test)]
 mod tests {
