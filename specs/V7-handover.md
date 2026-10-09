@@ -2,7 +2,8 @@
 
 For a fresh remote session (or a person) picking up `specs/V7-production-validation.md` on branch
 `v7-production-validation`. Read this file, then the spec, then `specs/V7-review-of-V6.md`. Written after step 4
-(commit `122f61f`); the branch is pushed and is the only copy of the work.
+(commit `122f61f`) and updated after step 6 (commit `033f8e1`, see §9, which is the part to read first); the branch is
+pushed and is the only copy of the work.
 
 ## 1. Where things stand
 
@@ -12,14 +13,15 @@ For a fresh remote session (or a person) picking up `specs/V7-production-validat
 | 2. Recorded bodies | **Not started.** The testnet recording is not in the repo (see §4) | — |
 | 3. `VenueRefusal`, `refusal_of` | **Done** | `5f9979d` |
 | 4. The new reads, receipt position | **Done** | `740323f` (EVM), `122f61f` (Binance) |
-| 5. The harness | **To do** | — |
-| 6. LV1 cases | **To do** | — |
+| 5. The harness | **Done** | `924e693` |
+| 6. LV1 cases | **Done** (mutation-checked for the harness only, see §9.4) | `033f8e1` |
 | 7. LV2a | **To do** | — |
 | 8. LV2b | **To do** | — |
 | 9. Docs | **To do** (nothing of step 9 is written yet, see §6) | — |
 
 Baseline to confirm before touching anything: `cargo fmt --check`, `cargo clippy --all-targets` clean, and
-`cargo test --lib` gives **359 passed, 0 failed, 1 ignored** (`binance_spot_testnet`). The first build takes about
+`cargo test --lib` gave **359 passed, 0 failed, 1 ignored** (`binance_spot_testnet`) before step 5; it now gives
+**496 passed, 0 failed, 3 ignored** (the other two are `production_lv1_binance` and `production_lv1_base`). The first build takes about
 two minutes, then the suite takes about five seconds.
 
 Not yet in the repo: `src/production/`, `fixtures/`, `docs/responses/`, `specs/V7-questions.md`. Six `TODO(R2)`
@@ -204,3 +206,81 @@ every case has a passing and a failing self-test; `cargo test --lib production -
 `production_lv1_binance`, `production_lv1_base`, `production_lv2a_exchange` and `production_lv2b_chain`; a dry run of
 each prints its calls and sends none; `catalogue_matches_fixtures` passes; the six `TODO(R2)` markers are gone (see
 open decision 1).
+
+## 9. Update after step 6 (read this first)
+
+Commit after every step; this session was told to stop at step 6 because its context was tight. Steps 7, 8 and 9
+remain, and step 2 waits on the owner (§4.1).
+
+### 9.1 What exists now (`src/production/`, all `#[cfg(test)]`)
+
+| File | What |
+|---|---|
+| `mod.rs` | `Run`: `start(env, venue, host, echo)`, `binance_rest(env, allowed_host, prefix, timings)`, `authorise_order(qty, price) -> OrderPermit`, `permit_rpc(method, params)` (the gate for a call that is not Binance REST), `call` / `call_with(spec, make, references, check)`, `note` / `note_at` (a line for a case that made no call), `hide_urls`, `finish()` (Err unless no fail, halted or unmapped). `CallSpec::new(case, Expected).record_as(stem).request(..).host(..)` |
+| `gate.rs`, `wire.rs` | the seam into `BinanceClient` (halt file, dry run, "no order without the ledger's say-so", record mode) |
+| `ledger.rs` | caps and loss in `Decimal`: `authorise(notional)`, `record_fill(&Fill)`, `record_loss`, `stop` |
+| `record.rs`, `results.rs`, `env.rs`, `guard.rs`, `sizing.rs` | recording and `uid` redaction; the results schema, `judge`, `Outcome::of_error`; `Env`/`MapEnv`/`ProcessEnv`; host and node guards; lot-step arithmetic |
+| `lv1_binance.rs`, `lv1_base.rs` | the LV1 cases and their self-tests; the two ignored tests |
+| `testing.rs` | `Setup` (a run in a scratch dir), `fast()`, `MockNode` (a JSON-RPC mock: `result`, `error`, `error_when`, `sequence`, `eth_call` by selector, `asked()`) |
+| `cex/binance/client/hooks.rs` | the three request hooks, `with_wire`, `gate`, `observe` |
+
+Reuse these for steps 7 and 8; the patterns to copy are `lv1_binance.rs` (a `MiniVenue` wiremock `Respond` that checks
+what the venue checks, `play(case)`, one test per case plus a failing variant) and `lv1_base.rs` (`Lab`, `base_node()`).
+
+### 9.2 Decisions made in steps 5 and 6 that the owner has not seen (flag them)
+
+1. **Ledger rule.** An order is refused when the loss so far is **at** the spend cap, and when *loss + this order's whole
+   notional* would pass it (the spec's "refuses the order that would pass the cap"). A cap below one order plus the run's
+   losses stops the run early. Reads are never refused. An unvalued commission asset (BNB) or non-USD quote stops the run.
+2. **B5 sends an order *test*** (`POST /order/test`) with the read-only key, not an order, so a key that can trade by
+   mistake places nothing. B6's lot-step order is *k steps + half a step* sized to the order's notional, not half a step on
+   its own (that would also fail `minQty`). B6's notional order is 0.8 of the symbol's `minNotional`, and is skipped unless
+   the venue says the minimum applies to market orders.
+3. **Second host.** With `VP_EXPECT_NOT_WHITELISTED=1` only B4 runs; without it B4 is skipped.
+4. **A dry run makes no read**, so a case sized from a read (every order) is skipped with that reason; the reads and the
+   requests that need none are printed. `VP_DRY_RUN=1` is the variable (the spec's "Done when" writes `DRY_RUN=1`: a typo).
+5. **Base.** Beyond C1 to C6 there is a `GUARD` case (`web3_clientVersion`: not anvil; `-32601` counts as not anvil; any
+   other refusal stops the run, since the node could not be read) and an `EXIT` case (the throwaway address's native and
+   quote balances read before and after, equal to the unit). C4 reads the latest block as its own step (`37-latest-block`).
+   A line names a provider by its host only; `Run::hide_urls` scrubs the URL, its path and query from every line.
+6. **Recording names.** Binance: `00-exchange-info`, `01-account`, `02-account-commission`, `03-order-test-buy`,
+   `06-order-notional`, `06-order-lot-size-off-step`, `07-empty-account`, `07-order-insufficient-balance`,
+   `08-no-signature` … `17-account-after` (the first seven keep the numbers of the consumer's testnet recording). Base:
+   `p<provider index>-3x-…` and `p<n>-4x-…`. A call that makes several requests saves `<stem>.json`, `<stem>-2.json`, …;
+   the venue's clock replies are not saved.
+7. `cex::binance` became `pub(crate)` (was private) so the tier can reach `client`/`clock`. The public surface is unchanged.
+
+### 9.3 What remains
+
+- **Step 7, LV2a** (`production_lv2a_exchange`, spec "LV2a"): ten round trips; E1 to E6 exact, references recorded. Use
+  `BinanceLive::execute` + `order_state`, `rest.order_book(symbol, 5)` before each send, `recent_trades(symbol, 1000)`,
+  `account_commission`, `SpotBalanceReader` before and after. **Book every fill in the ledger** (`ledger.record_fill`)
+  and call `run.authorise_order` before each order. `call_with`'s `references` closure builds the `references` object,
+  `check` the exact checks; `null` where a reference does not exist, never zero. Needs a stateful mini venue (a fill
+  changes balances); extend `MiniVenue` or write a sibling in `testing.rs`.
+- **Step 8, LV2b** (`production_lv2b_chain`): sixty swaps; X1 to X6 against an independent decoding of the raw receipt JSON;
+  `VP_SIGNER_KEY_HEX` via `Env::take` (already removes it from the process). The Aerodrome calldata goes in one small
+  function (`sol!`), and **`specs/V7-questions.md` must be created** with the router-ABI question (no explorer here). Use
+  `unique_test_signer()`-style distinct keys per test. `MockNode` serves a receipt built in the test; one mutation per check.
+- **Step 9, docs**: as §6 above, plus the catalogue (`docs/responses/*.md`, `catalogue_matches_fixtures`). The two
+  documented-vs-synthetic notes of §5 still apply. Record in the catalogue: the mini venue's refusal bodies are the
+  documented codes and messages (`errors.md`), and the **HTTP status of each (`401` for `-2015` and `-2014`, `400` for the
+  rest) is assumed, not documented**.
+- **`specs/V7-questions.md`** (does not exist yet) should hold: the Aerodrome router ABI; the pool and factory ABIs C6 uses
+  (`factory()`, `stable()`, `getReserves()`, `PoolFactory.getFee(address,bool)`; the selectors are pinned by a test but the
+  ABI is from memory, not read from a verified contract); decisions 1 and 2 above; the `DRY_RUN` typo.
+
+### 9.4 What was not done, and traps
+
+- **No mutation check of the LV1 case code.** The harness was broken 27 ways and each was caught (§3.6 habit); the cases of
+  step 6 were not. Do it before trusting them: e.g. B3's `- 10_000`, B6's `* 0.8`, B6's `+ lot_step / 2`, `book_accepted`,
+  the exit comparison, C1's `connected` flag, C2's nonce check, C3's chain id, C4's gate on the block number. A script that
+  applies one textual mutation, runs `cargo test --lib <filter>` and restores the file is in the history of this branch's
+  session only; it is twenty lines. **Use the right filter**: the hooks' tests are under `cex::binance::client::hooks`, not
+  `production`.
+- **A text patch after `cargo fmt` can silently not apply** (fmt reflows the line you are matching). This happened three
+  times in step 6 and each looked like a code bug. After a scripted edit, `grep` that it landed.
+- **Do not wait with `pgrep -f <name>` in a loop**: the loop's own command line matches. Do not background a command twice
+  (`run_in_background` and `&`).
+- Nothing in steps 5 and 6 was run against a venue; the status line stays *written, offline-tested, not run against a
+  production venue*.
