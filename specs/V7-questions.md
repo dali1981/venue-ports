@@ -63,3 +63,31 @@ pass `VP_SPEND_CAP_USD`, so a cap below one swap plus the run's losses stops the
 value (native at `VP_NATIVE_USD`, the input token at a dollar a unit, the output token at what the router would give
 for all of it) read before the run and after each swap, booked with `record_loss`. `VP_TOKEN_IN` must be USD-pegged.
 `amount_out_vs_quote_bps` is `(amount_out − quote) / quote` in basis points, not "of the mid".
+
+## Q8. DEFECT, reported and not fixed: `inclusion_block` of a swap that never landed
+
+`chain_checks::swap_references` writes `"inclusion_block": realised.map(|r| r.at)`. For a swap that ended
+`TimedOut`, `EvmLive` sets `Realised.at` to `rpc.block_number().unwrap_or(0)`: the latest block when it gave up
+waiting, **not** a block the swap was included in, and `0` when that read failed. So a swap that was never mined
+carries a block number (or zero) as its inclusion block, where the spec says a reference that does not exist is
+`null`, never zero (`specs/V7-production-validation.md`, "What this does not do").
+
+Found while writing the mock-chain test of a swap that is accepted and never mined
+(`a_swap_that_is_never_mined_is_a_timeout_with_null_references`), which asserts every other landing reference is
+`null` and leaves this one out for this reason. A consumer reading `inclusion_block` to find the landing block
+would read the block at which the run stopped waiting.
+
+Seen, not only read: on the mock chain, with the swap accepted and never mined, the line's `references` has
+`"inclusion_block": 1001`, which is the block of the swap's approval, the latest when the run gave up.
+
+Proposed fix, **not made**: `inclusion_block` is `Some(at)` only when the outcome is `Success` or `Reverted`;
+a test that fails first (a timed-out swap's `inclusion_block` is `null`), in its own commit. Waiting for the
+owner, as the working agreement says.
+
+## Q9. A dry run of LV2b prints one call
+
+`VP_DRY_RUN=1` stops LV2b at its first read (`web3_clientVersion`): a dry run makes no read, and a swap is sized
+from reads, so none of the run's other calls (the pool's views, the quote, the approval, the swap) is printed.
+LV2a prints the three reads that start its run and then skips each order for the same reason. The spec's "Done
+when" says a dry run "prints its calls and sends none"; for LV2a and LV2b this holds for the reads that need no
+other read, and no more. Nothing was changed to print a swap that was not sized.

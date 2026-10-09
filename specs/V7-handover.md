@@ -391,3 +391,77 @@ none; record mode names `NNN-quote`, `NNN-swap` and so on; the key is in no line
 - `Decimal` division and subtraction keep trailing zeros (`"0.0"`): `.normalize()` before `to_string()` in a reference.
 - A `clippy::type_complexity` on an array of `(&str, fn(&mut T))`: give it a `type` alias.
 - Do not run an `--ignored` test: there is no key, no money and no route to the venues here.
+
+## 11. Update after the LV2b self-tests, the docs and the mutation passes (read this first)
+
+Written by the session that finished steps 8 and 9. `git fetch` and `git log origin/v7-production-validation` first:
+this session also began on a stale checkout (the branch was 16 commits ahead of it), and fast-forwarded.
+
+### 11.1 State
+
+| Step | State |
+|---|---|
+| 1 to 8 | **Done.** LV2b's mock-chain self-tests are written (`src/production/mini_chain.rs`, tests in `lv2b_chain.rs`) |
+| 2. Recorded bodies | **Partly**, as §10.2: the catalogue and its honesty test are in; the testnet recording is still not in the repo (Q1, Q2) |
+| 9. Docs | **Done**: `SPEC.md` §5 (a landing's position), §6 (the typed refusal), new §6d (the six reads), §7 (the production tier), §8; `README.md` row; `IMPLEMENTATION_PLAN.md` Phase 17; `docs/responses/*.md` rows for the reads, B1 to B10, C1 to C6, LV2a and LV2b |
+| LV1 mutation check (§9.4) | **Done**: 11 of 11 caught for `lv1_binance.rs`; 5 of 6 for `lv1_base.rs`, the sixth equivalent (see 11.3) |
+
+Baseline: `cargo fmt --check` clean, `cargo clippy --all-targets` clean, `cargo test` **603 passed, 0 failed, 5 ignored**
+(574 before this session, plus 29). `cargo test --lib production -- --ignored --list` lists the four tests.
+Status of the whole of V7: **written, offline-tested, not run against a production venue.**
+
+### 11.2 What `MiniChain` is, and what it is not
+
+A stateful JSON-RPC `wiremock` `Respond` for Base: it decodes the raw transactions it is sent, mines one block for each,
+keeps the signer's native and token balances **at every block**, an allowance, and a pool and router with a fee, and writes
+a swap's `Transfer` logs among others that are not its own. Its `Knobs` are one way each for the chain to disagree with
+the adapter: `evidence_tweak` (a receipt that reads differently after the sender's poll), `poll_tweak` (the reverse),
+`native_extra_charge`, `token_leak`, `nonce_skip`, `empty_blocks_before`, `never_mines_swap`, `estimate_reverts`,
+`quote_reverts`, `stable_reverts`, `forced_revert`, `slip_bps`, `refund_in`, neighbours in the block, and a seal lag. A
+block is reported by `eth_blockNumber` only after a receipt from it has been served and `seal_lag_polls` polls have
+passed, so `sealed_ns` is never before `first_seen_ns`.
+
+It proves the **case code**: that X1 to X6, the stops, the ledger, the halt file, the dry run, record mode and the
+redaction do what they say, and fail when the chain differs. It says nothing about what Base answers: the Aerodrome ABI
+is from memory (Q3), and every number is the mock's.
+
+### 11.3 What the mutation passes found
+
+`python3 -I scripts/mutate-check.py FILE MUTATIONS.json production::lv2b_chain` broke the flow 29 ways. 26 were caught at
+once. Two were not, and were real gaps, now closed:
+
+- **X3's result dropped.** A failing X3 also fails X4 (both read the receipt's fee fields), so X4 stopped the run and the
+  test could not tell. Fixed with `poll_tweak`: a receipt that differs from the chain's own record only as the sender's poll
+  reads it, which fails X3 alone.
+- **A quote that cannot be read returned `Go`, not `Stop`.** With one swap the loop ends either way. Fixed by a test
+  with `quote_reverts` that runs three swaps and counts the quote reads.
+
+Three mutants are **equivalent** and were left: the swap's own `permit_rpc` (`call_graded` already looks at the halt file
+before it makes the call, and a dry run never reaches a swap); C3's `Ok(()) => Err(…)` arm (the case expects `not_sent`,
+so `judge` fails an accepted connect before the check is asked); and LV2a's sort key (§10.3). A mutation list is a JSON
+list of `{name, old, new}` with `old` occurring once; the lists used are not in the repo (they are twenty lines each to
+rewrite from the names above).
+
+### 11.4 Defect reported, not fixed
+
+`specs/V7-questions.md` Q8: a swap that timed out has `inclusion_block` set to the latest block when it gave up, or `0`;
+the spec says a reference that does not exist is `null`, never zero. Per §3.1 it waits for the owner, then a test that
+fails first, in its own commit. Q9 is a note: a dry run of LV2b prints one call.
+
+### 11.5 What is left, all for a person
+
+- Supply the testnet recording, or say it is not wanted (§4.1; Q1, Q2).
+- Check the Aerodrome router's verified ABI (Q3) and read Q4 and Q5 before the first LV2a run.
+- Decide Q6 (`DRY_RUN` is `VP_DRY_RUN`) and Q7, and the lists of §9.2 and §10.5, which the owner has not seen.
+- Run the four ignored tests as §7 says, `VP_DRY_RUN=1` first; copy each `VP_RECORD_DIR` to
+  `fixtures/<venue>/production/<date>/` after reading it, and turn the rows of `docs/responses/` to `production`.
+
+### 11.6 Traps met in this session
+
+- `Run::start` must come **before** `Settings::from_env` in LV2b: it reads `VP_SIGNER_KEY_HEX` to know what to scrub, and
+  `from_env` removes it.
+- A regex that replaces "all occurrences" will hit a second site that looks the same: `.err().expect("refused")` exists
+  where `Signer` is not `Debug` (clippy's `expect_err` does not apply there). Check the count before replacing.
+- A check closure behind a `Called` is only asked when the verdict is already `pass`: an arm of it that repeats what
+  `judge` decided is dead, and a mutation of it is equivalent.
+- A tweak that changes a field two checks read breaks both. To isolate a check, change the side only it reads.

@@ -1523,7 +1523,10 @@ knob for each way it can disagree with the case; LV2b's is a stateful chain (`Mi
 transactions it is sent, mines a block for each, keeps the signer's balances at every block and writes the
 swap's `Transfer` logs among others that are not its own) with a knob for each of X1 to X6 and for a swap that
 is late, reverted or never mined. The case code was broken on purpose, one change at a time
-(`scripts/mutate-check.py`), and each break was caught by a test.
+(`scripts/mutate-check.py`, about eighty changes across the four tests), and a test caught each, once two
+tests were added for what the first pass missed (a check masked by another that reads the same receipt
+field; a quote that could not be read letting the run go on), except three changes that alter nothing a run
+can tell: a sort key, a check made twice, and a message a second check had already made moot.
 
 **What the self-tests do and do not say.** They prove that the case code reads a reply as it should and
 fails when the reply differs. They do not say what Binance or a Base node answers: every body a mock serves
