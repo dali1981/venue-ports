@@ -23,6 +23,7 @@ turns an action the consumer has already decided on into an outcome, which is al
 | [V4](V4-cex-account-reads.md) | `CexAccount`, a read-only port for a perp position, margin and funding as the venue reports them | V2's REST client | futures testnet keys | 1.5 |
 | [V5](V5-venues-and-solana.md) | One contract per port for every venue (commands, events, capabilities); `Prepared` as an enum; `Network`; per-family cost; the Solana family; Jupiter and Orca Whirlpool | V3 | Surfpool (Simulated) | — |
 | [V6](V6-balances-and-resolution.md) | `EvmBalanceReader` and `SpotBalanceReader`; `EvmLive::resolve` and `Resolution`; `CexOrders::order_state`; a signing sender on anvil is `Simulated` | V0, V1 | anvil (gated tests) | 3 |
+| [V7](V7-production-validation.md) | Recorded testnet bodies, Binance account and market reads, a typed refusal, a guarded production tier, and the production validation cases for Binance spot and router swaps | V6 | a throwaway key and an empty sub-account (ignored tests) | ≈ 15 |
 | **Total (V0–V4)** | | | | **13** |
 
 ## Order
