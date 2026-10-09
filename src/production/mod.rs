@@ -29,11 +29,13 @@
 //! expects, and writes the line.
 
 pub(crate) mod env;
+pub(crate) mod exchange_checks;
 pub(crate) mod gate;
 pub(crate) mod guard;
 pub(crate) mod ledger;
 pub(crate) mod lv1_base;
 pub(crate) mod lv1_binance;
+pub(crate) mod lv2a_exchange;
 pub(crate) mod record;
 pub(crate) mod results;
 pub(crate) mod sizing;
@@ -124,6 +126,26 @@ impl<'a> CallSpec<'a> {
     pub(crate) fn request(mut self, request: RequestRecord) -> Self {
         self.request = Some(request);
         self
+    }
+}
+
+/// What a case makes of a call that answered, beyond its kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Grade {
+    Pass,
+    /// The answer is wrong. A `fail`.
+    Fail(String),
+    /// The answer cannot be judged, and the case says why (a trade that has left
+    /// the window it is checked against). A `skipped`, never a pass.
+    Skip(String),
+}
+
+impl From<std::result::Result<(), String>> for Grade {
+    fn from(checked: std::result::Result<(), String>) -> Self {
+        match checked {
+            Ok(()) => Grade::Pass,
+            Err(why) => Grade::Fail(why),
+        }
     }
 }
 
@@ -326,6 +348,22 @@ impl Run {
     where
         Fut: Future<Output = Result<T>>,
     {
+        self.call_graded(spec, make, references, |result| check(result).into())
+            .await
+    }
+
+    /// As [`Run::call_with`], with a [`Grade`] for a check that can also say it
+    /// cannot judge the answer: the line is then `skipped`, with its reason.
+    pub(crate) async fn call_graded<T, Fut>(
+        &self,
+        spec: CallSpec<'_>,
+        make: impl FnOnce() -> Fut,
+        references: impl FnOnce(&Result<T>) -> Option<serde_json::Value>,
+        grade: impl FnOnce(&Result<T>) -> Grade,
+    ) -> Result<Called<T>>
+    where
+        Fut: Future<Output = Result<T>>,
+    {
         self.gate.begin_call();
         let started_ms = now_ms();
         let started = Instant::now();
@@ -353,9 +391,16 @@ impl Run {
         let held = halted_before.or_else(|| self.gate.take_held());
         let (mut verdict, mut reason) = judge(&spec.expected, &outcome, held.as_ref());
         if verdict == Verdict::Pass {
-            if let Err(why) = check(&result) {
-                verdict = Verdict::Fail;
-                reason = why;
+            match grade(&result) {
+                Grade::Pass => {}
+                Grade::Fail(why) => {
+                    verdict = Verdict::Fail;
+                    reason = why;
+                }
+                Grade::Skip(why) => {
+                    verdict = Verdict::Skipped;
+                    reason = why;
+                }
             }
         }
         let accepted_a_refusal_case = spec.expected.kind == Kind::Refused
@@ -436,6 +481,40 @@ impl Run {
             body_file: None,
             latency_ms: 0,
             references: None,
+        };
+        self.results
+            .write(&line.scrubbed(&|text| self.scrub(text)))
+            .with_context(|| format!("writing the line for {case}"))
+    }
+
+    /// Writes a line for a check the case made by reading what it already has:
+    /// no request, the venue's answer taken as read. `references` is an object
+    /// where the check is of a call that traded and `None` otherwise.
+    pub(crate) fn computed(
+        &self,
+        case: &str,
+        verdict: Verdict,
+        reason: &str,
+        references: Option<serde_json::Value>,
+    ) -> Result<()> {
+        let line = ResultLine {
+            run_id: self.id.clone(),
+            case: case.to_string(),
+            venue: self.venue.clone(),
+            host: self.host.clone(),
+            started_ms: now_ms(),
+            request: RequestRecord {
+                method: String::new(),
+                path: String::new(),
+                params: Params(Vec::new()),
+            },
+            outcome: Outcome::ok(),
+            expected: Expected::ok(),
+            verdict,
+            reason: reason.to_string(),
+            body_file: None,
+            latency_ms: 0,
+            references,
         };
         self.results
             .write(&line.scrubbed(&|text| self.scrub(text)))

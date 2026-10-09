@@ -48,6 +48,13 @@ impl BinanceClient {
         }
     }
 
+    /// Tells the wire a request is about to leave, signed and built.
+    pub(super) fn sending(&self, method: &str, path: &str) {
+        if let Some(wire) = &self.wire {
+            wire.sending(method, path);
+        }
+    }
+
     /// Tells the wire what the venue answered, byte for byte.
     pub(super) fn observe(&self, method: &str, path: &str, status: u16, body: &str) {
         if let Some(wire) = &self.wire {

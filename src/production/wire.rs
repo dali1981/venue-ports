@@ -85,6 +85,10 @@ pub(crate) trait Wire: Send + Sync {
     /// Called before a call is signed or sent. `Err` means it is not sent.
     fn permit(&self, call: &Call) -> Result<(), Held>;
 
+    /// Called when a request is built and about to leave: the nearest this seam
+    /// gets to the moment it is sent. A request that is held back never gets here.
+    fn sending(&self, _method: &str, _path: &str) {}
+
     /// Called with each HTTP reply, before it is parsed: the status and the
     /// body exactly as the venue sent them.
     fn observed(&self, method: &str, path: &str, status: u16, body: &str);

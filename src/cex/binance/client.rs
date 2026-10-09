@@ -306,6 +306,8 @@ impl BinanceClient {
             request = request.header("X-MBX-APIKEY", &self.api_key);
         }
 
+        #[cfg(test)]
+        self.sending(method.as_str(), path);
         let response = match request.send().await {
             Ok(response) => response,
             // Failing to open the connection, or to build the request at

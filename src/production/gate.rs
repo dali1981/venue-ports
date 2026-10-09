@@ -11,6 +11,7 @@ use crate::production::wire::{Call, Held, Wire};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Where the dry run's lines go.
 pub(crate) enum Echo {
@@ -30,12 +31,39 @@ pub(crate) struct Gate {
     state: Mutex<State>,
 }
 
+/// One request the client sent, as the gate saw it leave and come back. Kept
+/// in memory for the case that made the call; never written to a line as it is
+/// (the body can hold an account's `uid`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Exchange {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    /// The local clock, in ns since the epoch, when the request was about to
+    /// leave: signed, built, and not yet handed to the connection.
+    pub(crate) sent_ns: u128,
+    /// The local clock when the reply's body had been read. `None` for a
+    /// request that got no readable reply.
+    pub(crate) returned_ns: Option<u128>,
+    pub(crate) status: Option<u16>,
+    /// The reply's body exactly as the venue sent it.
+    pub(crate) body: Option<String>,
+}
+
+/// The local clock in ns since the epoch.
+pub(crate) fn now_ns() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos())
+}
+
 #[derive(Default)]
 struct State {
     /// What a dry run printed.
     printed: Vec<String>,
     /// The calls asked for since the last [`Gate::begin_call`], in order.
     calls: Vec<Call>,
+    /// The requests sent since the last [`Gate::begin_call`], in order.
+    exchanges: Vec<Exchange>,
     /// Why the last call that was held back was.
     held: Option<Held>,
 }
@@ -88,7 +116,15 @@ impl Gate {
     pub(crate) fn begin_call(&self) {
         let mut state = self.state.lock().unwrap();
         state.calls.clear();
+        state.exchanges.clear();
         state.held = None;
+    }
+
+    /// The requests sent since [`Gate::begin_call`], with when each left and
+    /// came back and what the venue answered. A call that is retried (a `-1021`
+    /// read again) appears once for each request.
+    pub(crate) fn exchanges(&self) -> Vec<Exchange> {
+        self.state.lock().unwrap().exchanges.clone()
     }
 
     /// The calls asked for since [`Gate::begin_call`], held back or not.
@@ -165,7 +201,32 @@ impl Wire for Gate {
         decision
     }
 
-    fn observed(&self, _method: &str, path: &str, status: u16, body: &str) {
+    fn sending(&self, method: &str, path: &str) {
+        self.state.lock().unwrap().exchanges.push(Exchange {
+            method: method.to_string(),
+            path: path.to_string(),
+            sent_ns: now_ns(),
+            returned_ns: None,
+            status: None,
+            body: None,
+        });
+    }
+
+    fn observed(&self, method: &str, path: &str, status: u16, body: &str) {
+        let returned_ns = now_ns();
+        if let Some(open) = self
+            .state
+            .lock()
+            .unwrap()
+            .exchanges
+            .iter_mut()
+            .rev()
+            .find(|e| e.returned_ns.is_none() && e.method == method && e.path == path)
+        {
+            open.returned_ns = Some(returned_ns);
+            open.status = Some(status);
+            open.body = Some(body.to_string());
+        }
         if let Some(recorder) = &self.recorder {
             recorder.observe(path, status, body);
         }
@@ -297,6 +358,58 @@ mod tests {
         assert!(matches!(gate.permit(&order()), Err(Held::Halted(_))));
         assert!(gate.printed().is_empty());
         std::fs::remove_file(&file).unwrap();
+    }
+
+    #[test]
+    fn a_request_is_stamped_as_it_leaves_and_as_its_reply_is_read() {
+        let gate = gate(false);
+        let before = now_ns();
+        gate.sending("POST", "/api/v3/order");
+        gate.observed("POST", "/api/v3/order", 200, "{\"orderId\":1}");
+        let after = now_ns();
+
+        let exchanges = gate.exchanges();
+        assert_eq!(exchanges.len(), 1);
+        let sent = &exchanges[0];
+        assert_eq!(
+            (sent.status, sent.body.as_deref()),
+            (Some(200), Some("{\"orderId\":1}"))
+        );
+        let (left, back) = (sent.sent_ns, sent.returned_ns.unwrap());
+        assert!(
+            before <= left && left <= back && back <= after,
+            "{before} {left} {back} {after}"
+        );
+    }
+
+    /// A reply belongs to the request of its own path that has none yet, the
+    /// latest first: a retried request is two exchanges.
+    #[test]
+    fn a_reply_is_matched_to_its_own_request_and_a_retry_is_two_exchanges() {
+        let gate = gate(false);
+        gate.sending("GET", "/api/v3/time");
+        gate.observed("GET", "/api/v3/time", 200, "{}");
+        gate.sending("POST", "/api/v3/order");
+        gate.observed("POST", "/api/v3/order", 400, "{\"code\":-1021}");
+        gate.sending("POST", "/api/v3/order");
+        gate.observed("POST", "/api/v3/order", 200, "{\"orderId\":2}");
+
+        let exchanges = gate.exchanges();
+        let statuses: Vec<_> = exchanges.iter().map(|e| e.status).collect();
+        assert_eq!(statuses, [Some(200), Some(400), Some(200)]);
+        assert_eq!(exchanges[2].body.as_deref(), Some("{\"orderId\":2}"));
+    }
+
+    /// A request with no readable reply has a departure and no return.
+    #[test]
+    fn a_request_with_no_reply_has_no_return_and_a_new_call_forgets_it() {
+        let gate = gate(false);
+        gate.sending("POST", "/api/v3/order");
+        let exchanges = gate.exchanges();
+        assert_eq!(exchanges[0].returned_ns, None);
+        assert_eq!(exchanges[0].body, None);
+        gate.begin_call();
+        assert!(gate.exchanges().is_empty());
     }
 
     #[test]
