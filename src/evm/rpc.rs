@@ -126,6 +126,10 @@ pub struct Receipt {
     /// `effectiveGasPrice`, and a rollup's `l1Fee`. A field the node leaves
     /// out is `None`.
     pub cost: EvmCost,
+    /// The transaction's index in its block (`transactionIndex`), `None` when
+    /// the node leaves it out. With [`EvmRpc::block_transaction_count`] it says
+    /// how far down its block the transaction landed.
+    pub transaction_index: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -242,6 +246,28 @@ impl EvmRpc {
 
     pub async fn block_number(&self) -> Result<u64> {
         self.call_u64("eth_blockNumber", json!([])).await
+    }
+
+    /// How many transactions the block `block` names holds
+    /// (`eth_getBlockTransactionCountByNumber`). A transaction's index in its
+    /// block is [`Receipt::transaction_index`]; this is how long the block is.
+    /// `pending` is the node's pending block (on Base, the preconfirmed one),
+    /// and its count can still grow. A node that has no such block answers
+    /// `null`, which is an error naming the block: a count of zero is a block
+    /// the node holds with nothing in it.
+    pub async fn block_transaction_count(&self, block: BlockTag) -> Result<u64> {
+        let result = self
+            .call(
+                "eth_getBlockTransactionCountByNumber",
+                json!([block.param()]),
+            )
+            .await?;
+        if result.is_null() {
+            bail!("the node has no {block:?} block, so it has no transaction count for it");
+        }
+        parse_hex_u64(result.as_str().ok_or_else(|| {
+            anyhow!("eth_getBlockTransactionCountByNumber result was not a hex string: {result}")
+        })?)
     }
 
     /// The number of the block `block` names: a number is itself, `latest` is
@@ -425,11 +451,24 @@ impl EvmRpc {
             effective_gas_price_wei: quantity("effectiveGasPrice"),
             l1_fee_wei: quantity("l1Fee"),
         };
+        // Where the transaction sits in its block. Left out is `None`; a value
+        // that is there and is not a hex quantity is an error, not a guess.
+        let transaction_index = receipt
+            .get("transactionIndex")
+            .filter(|index| !index.is_null())
+            .map(|index| {
+                parse_hex_u64(index.as_str().ok_or_else(|| {
+                    anyhow!("receipt for {tx_hash} has a transactionIndex that is not a string")
+                })?)
+                .with_context(|| format!("receipt for {tx_hash}: transactionIndex"))
+            })
+            .transpose()?;
         Ok(Some(Receipt {
             success,
             block,
             logs,
             cost,
+            transaction_index,
         }))
     }
 
@@ -733,5 +772,168 @@ pub(crate) mod tests {
         let nested =
             json!({ "code": -32000, "message": "execution reverted", "data": { "data": "0x" } });
         assert_eq!(decode_revert_reason(&nested), "execution reverted");
+    }
+
+    fn ok(result: Value) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200)
+            .set_body_json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+    }
+
+    async fn node_answering(
+        rpc_method: &str,
+        response: wiremock::ResponseTemplate,
+    ) -> (wiremock::MockServer, EvmRpc) {
+        use wiremock::matchers::{body_partial_json, method};
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST"))
+            .and(body_partial_json(json!({ "method": rpc_method })))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        let rpc = EvmRpc::new(server.uri());
+        (server, rpc)
+    }
+
+    /// A receipt as a node returns it, with or without `transactionIndex`.
+    fn receipt_json(transaction_index: Option<Value>) -> Value {
+        let mut receipt = json!({
+            "status": "0x1", "blockNumber": "0x2b", "logs": [],
+            "gasUsed": "0x249f0", "effectiveGasPrice": "0x77359400", "l1Fee": "0x7",
+        });
+        if let Some(index) = transaction_index {
+            receipt["transactionIndex"] = index;
+        }
+        receipt
+    }
+
+    #[tokio::test]
+    async fn a_receipt_carries_where_its_transaction_sits_in_the_block() {
+        let (_server, rpc) = node_answering(
+            "eth_getTransactionReceipt",
+            ok(receipt_json(Some(json!("0x1f")))),
+        )
+        .await;
+
+        let receipt = rpc.transaction_receipt(B256::ZERO).await.unwrap().unwrap();
+
+        assert_eq!(receipt.transaction_index, Some(31));
+        // Nothing else about the receipt moved.
+        assert_eq!(receipt.block, 0x2b);
+        assert_eq!(receipt.cost.gas_used, Some(150_000));
+        assert_eq!(receipt.cost.l1_fee_wei, Some(7));
+    }
+
+    /// The index is the first transaction's: zero is a place, and a node that
+    /// leaves the field out has not said one.
+    #[tokio::test]
+    async fn a_receipt_without_an_index_has_none_and_the_first_transaction_is_zero() {
+        let (_server, rpc) =
+            node_answering("eth_getTransactionReceipt", ok(receipt_json(None))).await;
+        let receipt = rpc.transaction_receipt(B256::ZERO).await.unwrap().unwrap();
+        assert_eq!(receipt.transaction_index, None);
+
+        let (_server, rpc) = node_answering(
+            "eth_getTransactionReceipt",
+            ok(receipt_json(Some(Value::Null))),
+        )
+        .await;
+        let receipt = rpc.transaction_receipt(B256::ZERO).await.unwrap().unwrap();
+        assert_eq!(receipt.transaction_index, None);
+
+        let (_server, rpc) = node_answering(
+            "eth_getTransactionReceipt",
+            ok(receipt_json(Some(json!("0x0")))),
+        )
+        .await;
+        let receipt = rpc.transaction_receipt(B256::ZERO).await.unwrap().unwrap();
+        assert_eq!(receipt.transaction_index, Some(0));
+    }
+
+    /// An index that is there and cannot be read is an error, never a guess.
+    #[tokio::test]
+    async fn an_index_that_is_not_a_hex_quantity_is_an_error() {
+        for bad in [json!("0xzz"), json!(7)] {
+            let (_server, rpc) = node_answering(
+                "eth_getTransactionReceipt",
+                ok(receipt_json(Some(bad.clone()))),
+            )
+            .await;
+            let err = rpc.transaction_receipt(B256::ZERO).await.unwrap_err();
+            assert!(
+                format!("{err:#}").contains("transactionIndex"),
+                "{bad}: {err:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_blocks_transaction_count_is_read_at_the_block_named() {
+        use wiremock::matchers::{body_partial_json, method};
+        let server = wiremock::MockServer::start().await;
+        for (block, count) in [("0x64", "0x7b"), ("latest", "0x3"), ("pending", "0x0")] {
+            wiremock::Mock::given(method("POST"))
+                .and(body_partial_json(json!({
+                    "method": "eth_getBlockTransactionCountByNumber", "params": [block]
+                })))
+                .respond_with(ok(json!(count)))
+                .mount(&server)
+                .await;
+        }
+        let rpc = EvmRpc::new(server.uri());
+
+        assert_eq!(
+            rpc.block_transaction_count(BlockTag::Number(100))
+                .await
+                .unwrap(),
+            123
+        );
+        assert_eq!(
+            rpc.block_transaction_count(BlockTag::Latest).await.unwrap(),
+            3
+        );
+        // A block with nothing in it is a count of zero, not an error.
+        assert_eq!(
+            rpc.block_transaction_count(BlockTag::Pending)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    /// A node with no such block answers `null`: that is not an empty block.
+    #[tokio::test]
+    async fn a_block_the_node_does_not_have_has_no_count() {
+        let (_server, rpc) =
+            node_answering("eth_getBlockTransactionCountByNumber", ok(Value::Null)).await;
+
+        let err = rpc
+            .block_transaction_count(BlockTag::Number(5))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("no Number(5) block"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_count_the_node_refuses_or_garbles_is_an_error() {
+        let refusing = wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "error": { "code": -32005, "message": "rate limit exceeded" },
+        }));
+        let (_server, rpc) = node_answering("eth_getBlockTransactionCountByNumber", refusing).await;
+        let err = rpc
+            .block_transaction_count(BlockTag::Latest)
+            .await
+            .unwrap_err();
+        assert!(err.downcast_ref::<RpcError>().is_some(), "{err:#}");
+
+        for bad in [json!("0xzz"), json!(3)] {
+            let (_server, rpc) =
+                node_answering("eth_getBlockTransactionCountByNumber", ok(bad.clone())).await;
+            assert!(
+                rpc.block_transaction_count(BlockTag::Latest).await.is_err(),
+                "{bad}"
+            );
+        }
     }
 }
