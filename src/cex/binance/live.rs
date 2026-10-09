@@ -88,8 +88,10 @@ impl BinanceLive {
     }
 
     /// The REST client this adapter trades through, which the account reads
-    /// share.
-    pub(crate) fn rest(&self) -> &BinanceRest {
+    /// share, and the reads of [`BinanceRest`] (commission, key restrictions,
+    /// the book, a symbol's rules) are made through, with its keys, connections
+    /// and clock.
+    pub fn rest(&self) -> &BinanceRest {
         &self.rest
     }
 

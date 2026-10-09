@@ -22,8 +22,9 @@ mod stub;
 pub use account::{CexAccount, FundingPayment, MarginMode, MarginState, PerpPosition};
 pub use account_stub::{AccountCall, AccountRead, CexAccountStub};
 pub use binance::{
-    BinanceConfig, BinanceLive, BinanceRest, CommissionDiscount, CommissionRates, MakerTaker,
-    OrderCheck,
+    ApiRestrictions, BinanceConfig, BinanceLive, BinanceRest, BookTicker, Commission,
+    CommissionDiscount, CommissionRates, MakerTaker, OrderBookSnapshot, OrderCheck, PublicTrade,
+    SymbolCommission, SymbolRules,
 };
 pub use binance_futures::{
     BinanceFuturesAccount, BinanceFuturesConfig, BinanceFuturesLive, BinanceFuturesRest,

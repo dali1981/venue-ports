@@ -14,10 +14,15 @@ pub(crate) mod client;
 pub(crate) mod clock;
 mod live;
 pub(crate) mod order;
+mod reads;
 mod rest;
 pub(crate) mod sign;
 
 pub use live::BinanceLive;
+pub use reads::{
+    ApiRestrictions, BookTicker, Commission, OrderBookSnapshot, PublicTrade, SymbolCommission,
+    SymbolRules,
+};
 pub use rest::{
     BinanceConfig, BinanceRest, CommissionDiscount, CommissionRates, MakerTaker, OrderCheck,
 };
