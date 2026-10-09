@@ -264,10 +264,11 @@ impl BinanceLive {
             .test_market_order(&req.symbol, side, quantity, &client_order_id)
             .await
             .map_err(|err| {
-                anyhow!(
+                let message = format!(
                     "the test of {side} {quantity} {} ({client_order_id}) failed: {err}",
                     req.symbol
-                )
+                );
+                err.because(message)
             })?;
         Ok(OrderCheck {
             quantity,
@@ -320,7 +321,7 @@ impl CexOrders for BinanceLive {
                     }
                 }
             }
-            Err(err) => Err(anyhow::Error::new(err)
+            Err(err) => Err(anyhow::Error::from(err)
                 .context(format!("reading order {client_order_id} on {symbol}"))),
         }
     }
@@ -548,6 +549,166 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("-2010"), "{message}");
         assert!(message.contains("insufficient balance"), "{message}");
+    }
+
+    /// A caller acts on `-2010` and `-2015` by reading the code, not by
+    /// searching the text for it; the text is what it always was.
+    #[tokio::test]
+    async fn a_refused_order_is_a_venue_refusal_with_the_text_it_always_had() {
+        use crate::cex::{provenance_of, refusal_of, VenueRefusal};
+
+        let server = venue().await;
+        mount_placing(
+            &server,
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "code": -2010, "msg": "Account has insufficient balance for requested action."
+            })),
+        )
+        .await;
+
+        let err = live(&server, decimal("0.01"))
+            .execute(&request())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            refusal_of(&err),
+            Some(&VenueRefusal {
+                status: 400,
+                code: Some(-2010),
+                msg: "Account has insufficient balance for requested action.".to_string(),
+            })
+        );
+        let message = err.to_string();
+        assert!(message.starts_with("BUY 10.03 SOLUSDT (vp-"), "{message}");
+        assert!(
+            message.ends_with(
+                ") was not placed, nothing filled: refused (HTTP 400, code -2010): \
+                 Account has insufficient balance for requested action."
+            ),
+            "{message}"
+        );
+        assert_eq!(provenance_of(&err), Some(Provenance::Landed));
+        assert!(err.downcast_ref::<OrderStateUnknown>().is_none());
+    }
+
+    /// A refusal the venue gives with no body of its own (a gateway's) has no
+    /// code, never a made-up one.
+    #[tokio::test]
+    async fn a_refusal_with_no_venue_code_has_none() {
+        use crate::cex::{refusal_of, VenueRefusal};
+
+        let server = venue().await;
+        mount_placing(
+            &server,
+            ResponseTemplate::new(403).set_body_string("forbidden"),
+        )
+        .await;
+
+        let err = live(&server, decimal("0.01"))
+            .execute(&request())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            refusal_of(&err),
+            Some(&VenueRefusal {
+                status: 403,
+                code: None,
+                msg: "forbidden".to_string(),
+            })
+        );
+        assert!(
+            err.to_string()
+                .ends_with("nothing filled: refused (HTTP 403): forbidden"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_order_test_is_a_venue_refusal_with_the_text_it_always_had() {
+        use crate::cex::refusal_of;
+
+        let server = venue().await;
+        mount_order_test(
+            &server,
+            ResponseTemplate::new(400).set_body_json(
+                serde_json::json!({"code": -1013, "msg": "Filter failure: NOTIONAL"}),
+            ),
+        )
+        .await;
+
+        let err = live(&server, decimal("0.01"))
+            .test_order(&request())
+            .await
+            .unwrap_err();
+
+        let refusal = refusal_of(&err).expect("the venue refused the test");
+        assert_eq!((refusal.status, refusal.code), (400, Some(-1013)));
+        let message = err.to_string();
+        assert!(
+            message.starts_with("the test of BUY 10.03 SOLUSDT (vp-"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(") failed: refused (HTTP 400, code -1013): Filter failure: NOTIONAL"),
+            "{message}"
+        );
+    }
+
+    /// A status query the venue refuses is an `Err` the caller reads the code
+    /// from: `-2015` says the key or its address is wrong, not that the order
+    /// is missing.
+    #[tokio::test]
+    async fn a_refused_status_query_is_a_venue_refusal() {
+        use crate::cex::refusal_of;
+
+        let server = venue().await;
+        mount_status(
+            &server,
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "code": -2015, "msg": "Invalid API-key, IP, or permissions for action."
+            })),
+        )
+        .await;
+
+        let err = live(&server, decimal("0.01"))
+            .order_state("SOLUSDT", "vp-1")
+            .await
+            .unwrap_err();
+
+        assert_eq!(refusal_of(&err).unwrap().code, Some(-2015));
+        assert_eq!(err.to_string(), "reading order vp-1 on SOLUSDT");
+    }
+
+    /// An order the venue may have filled is not a refusal, whatever the status
+    /// query is answered with: the venue did act on, or may have acted on, the
+    /// request, and `OrderStateUnknown` is what says so.
+    #[tokio::test]
+    async fn an_order_left_unknown_is_not_a_refusal() {
+        use crate::cex::refusal_of;
+
+        let server = venue().await;
+        mount_placing(
+            &server,
+            ResponseTemplate::new(503).set_body_string("Unknown error"),
+        )
+        .await;
+        mount_status(
+            &server,
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "code": -2015, "msg": "Invalid API-key, IP, or permissions for action."
+            })),
+        )
+        .await;
+
+        let err = live(&server, decimal("0.01"))
+            .execute(&request())
+            .await
+            .unwrap_err();
+
+        assert!(err.downcast_ref::<OrderStateUnknown>().is_some(), "{err:#}");
+        assert!(refusal_of(&err).is_none(), "{err:#}");
     }
 
     #[tokio::test]

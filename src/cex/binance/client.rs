@@ -12,7 +12,8 @@
 //!   not be read before signing. Nothing reached the venue.
 //! - **Refused**: a 4xx answer. The venue read the request and turned it
 //!   down (`-2022` reduce-only rejected, `-4164` notional, `-2019` margin,
-//!   `-2013` no such order, a rate limit, …). It did not act on it.
+//!   `-2013` no such order, a rate limit, …). It did not act on it. It
+//!   reaches a caller as a [`VenueRefusal`], whose `code` is read by type.
 //! - **Lost**: sent, but no readable answer came back — a timeout, a
 //!   dropped connection, an HTTP 5xx (Binance documents these as "execution
 //!   status unknown"), a 408, or a success whose body cannot be read. The
@@ -24,7 +25,7 @@
 
 use crate::cex::binance::clock::{local_now_ms, ServerClock};
 use crate::cex::binance::sign;
-use crate::cex::CexTimings;
+use crate::cex::{CexTimings, VenueRefusal};
 use anyhow::{anyhow, Context};
 use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
@@ -44,12 +45,7 @@ pub(crate) enum ApiError {
     /// Nothing reached the venue.
     NotSent(anyhow::Error),
     /// The venue answered with a refusal and did not act on the request.
-    Refused {
-        status: u16,
-        /// The venue's error code, when the body carried one.
-        code: Option<i64>,
-        msg: String,
-    },
+    Refused(VenueRefusal),
     /// The request may have reached the venue, but no readable answer came
     /// back.
     Lost {
@@ -64,8 +60,22 @@ impl ApiError {
     /// The venue's error code, if it refused the request with one.
     pub(crate) fn code(&self) -> Option<i64> {
         match self {
-            ApiError::Refused { code, .. } => *code,
+            ApiError::Refused(refusal) => refusal.code,
             _ => None,
+        }
+    }
+
+    /// This failure as an error whose text is `message`, which says what was
+    /// being done and ends with this failure's own text. A refusal stays a
+    /// [`VenueRefusal`] under it, so `to_string()` is `message` and a caller
+    /// still reads the code by type; `{:#}` says the refusal's text once more.
+    /// So does a refusal that is the cause of a request never sent (a refused
+    /// clock read).
+    pub(crate) fn because(self, message: String) -> anyhow::Error {
+        match self {
+            ApiError::Refused(refusal) => anyhow::Error::new(refusal).context(message),
+            ApiError::NotSent(cause) => cause.context(message),
+            ApiError::Lost { .. } => anyhow::Error::msg(message),
         }
     }
 }
@@ -74,22 +84,31 @@ impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ApiError::NotSent(cause) => write!(f, "not sent: {cause:#}"),
-            ApiError::Refused {
-                status,
-                code: Some(code),
-                msg,
-            } => write!(f, "refused (HTTP {status}, code {code}): {msg}"),
-            ApiError::Refused {
-                status,
-                code: None,
-                msg,
-            } => write!(f, "refused (HTTP {status}): {msg}"),
+            ApiError::Refused(refusal) => write!(f, "{refusal}"),
             ApiError::Lost { cause, .. } => write!(f, "no readable answer: {cause:#}"),
         }
     }
 }
 
-impl std::error::Error for ApiError {}
+/// How a failed call becomes the `anyhow::Error` a port returns: a refusal is
+/// a [`VenueRefusal`], which a caller reads by type, and the other two say what
+/// they always said.
+///
+/// `ApiError` is deliberately not a `std::error::Error`. Every `?`, `.into()`
+/// and `anyhow::Error::from` on one goes through this, so a refusal cannot
+/// reach a caller as anything but a `VenueRefusal`, and a new call that forgets
+/// to convert does not compile.
+impl From<ApiError> for anyhow::Error {
+    fn from(err: ApiError) -> Self {
+        match err {
+            ApiError::Refused(refusal) => anyhow::Error::new(refusal),
+            other => {
+                let message = other.to_string();
+                other.because(message)
+            }
+        }
+    }
+}
 
 #[derive(Deserialize)]
 struct ErrorBody {
@@ -189,6 +208,7 @@ impl BinanceClient {
         let time: ServerTime = self
             .send(Method::GET, self.time_path, "", false, started)
             .await
+            .map_err(anyhow::Error::from)
             .with_context(|| format!("reading the venue's clock at {}", self.time_path))?;
         let rtt = started.elapsed();
         self.clock.record(time.server_time, sent_local_ms, rtt)?;
@@ -224,10 +244,10 @@ impl BinanceClient {
                 .send(method.clone(), path, &query, true, signed_at)
                 .await
             {
-                Err(ApiError::Refused {
+                Err(ApiError::Refused(VenueRefusal {
                     code: Some(TIMESTAMP_OUTSIDE_RECV_WINDOW),
                     ..
-                }) if !resynced => {
+                })) if !resynced => {
                     self.clock.invalidate();
                     resynced = true;
                 }
@@ -310,18 +330,20 @@ impl BinanceClient {
         }
         if status.is_client_error() {
             let body = body.unwrap_or_default();
-            return Err(match serde_json::from_str::<ErrorBody>(&body) {
-                Ok(error) => ApiError::Refused {
-                    status: status.as_u16(),
-                    code: Some(error.code),
-                    msg: error.msg,
+            return Err(ApiError::Refused(
+                match serde_json::from_str::<ErrorBody>(&body) {
+                    Ok(error) => VenueRefusal {
+                        status: status.as_u16(),
+                        code: Some(error.code),
+                        msg: error.msg,
+                    },
+                    Err(_) => VenueRefusal {
+                        status: status.as_u16(),
+                        code: None,
+                        msg: body,
+                    },
                 },
-                Err(_) => ApiError::Refused {
-                    status: status.as_u16(),
-                    code: None,
-                    msg: body,
-                },
-            });
+            ));
         }
         // 1xx or 3xx: nothing this client asked for, and nothing that says
         // the venue did not act.
@@ -498,7 +520,10 @@ mod tests {
             .signed::<serde_json::Value>(Method::POST, "/refused", &[])
             .await
             .unwrap_err();
-        assert!(matches!(err, ApiError::Refused { status: 400, .. }));
+        assert!(matches!(
+            err,
+            ApiError::Refused(VenueRefusal { status: 400, .. })
+        ));
         assert_eq!(err.code(), Some(-2022));
         assert!(err.to_string().contains("ReduceOnly Order is rejected."));
 
@@ -508,12 +533,121 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            ApiError::Refused {
+            ApiError::Refused(VenueRefusal {
                 status: 403,
                 code: None,
                 ..
-            }
+            })
         ));
+    }
+
+    /// A refusal reaches a caller as a `VenueRefusal`, saying what a refused
+    /// call always said. The other two failures say what they always said and
+    /// are not refusals: the venue may have acted on the first, and the second
+    /// never heard of the request.
+    #[tokio::test]
+    async fn a_refusal_becomes_a_venue_refusal_and_the_other_failures_do_not() {
+        use crate::cex::refusal_of;
+
+        let server = MockServer::start().await;
+        mount_time(&server, local_now_ms()).await;
+        for (route, response) in [
+            (
+                "/refused",
+                ResponseTemplate::new(400).set_body_json(
+                    serde_json::json!({"code": -2022, "msg": "ReduceOnly Order is rejected."}),
+                ),
+            ),
+            (
+                "/5xx",
+                ResponseTemplate::new(503).set_body_string("Unknown error"),
+            ),
+        ] {
+            Mock::given(path(route))
+                .respond_with(response)
+                .mount(&server)
+                .await;
+        }
+        let client = client(&server);
+
+        let refused: anyhow::Error = client
+            .signed::<serde_json::Value>(Method::POST, "/refused", &[])
+            .await
+            .unwrap_err()
+            .into();
+        assert_eq!(
+            refusal_of(&refused),
+            Some(&VenueRefusal {
+                status: 400,
+                code: Some(-2022),
+                msg: "ReduceOnly Order is rejected.".to_string(),
+            })
+        );
+        assert_eq!(
+            refused.to_string(),
+            "refused (HTTP 400, code -2022): ReduceOnly Order is rejected."
+        );
+
+        let lost: anyhow::Error = client
+            .signed::<serde_json::Value>(Method::POST, "/5xx", &[])
+            .await
+            .unwrap_err()
+            .into();
+        assert!(refusal_of(&lost).is_none(), "{lost:#}");
+        assert!(
+            lost.to_string().starts_with("no readable answer: "),
+            "{lost}"
+        );
+
+        // Nothing listens on port 9 (discard) on a test machine.
+        let unsent: anyhow::Error = BinanceClient::new(
+            "http://127.0.0.1:9".to_string(),
+            "key".to_string(),
+            "secret".to_string(),
+            "/time",
+            timings(),
+        )
+        .signed::<serde_json::Value>(Method::POST, "/order", &[])
+        .await
+        .unwrap_err()
+        .into();
+        assert!(refusal_of(&unsent).is_none(), "{unsent:#}");
+        assert!(unsent.to_string().starts_with("not sent: "), "{unsent}");
+    }
+
+    /// A clock read the venue refuses (a rate limit on `/time`, a ban) is a
+    /// refusal, on its own and as the reason a signed request was never sent,
+    /// whose text is what it was.
+    #[tokio::test]
+    async fn a_refused_clock_read_is_a_venue_refusal_even_when_it_stops_a_request() {
+        use crate::cex::refusal_of;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/time"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({"code": -1003, "msg": "Too many requests."})),
+            )
+            .mount(&server)
+            .await;
+        let client = client(&server);
+
+        let clock = client.sync_clock().await.unwrap_err();
+        assert_eq!(clock.to_string(), "reading the venue's clock at /time");
+        assert_eq!(refusal_of(&clock).unwrap().code, Some(-1003));
+
+        let unsent: anyhow::Error = client
+            .signed::<serde_json::Value>(Method::POST, "/order", &[])
+            .await
+            .unwrap_err()
+            .into();
+        assert_eq!(
+            unsent.to_string(),
+            "not sent: reading the venue's clock at /time: refused (HTTP 400, code -1003): \
+             Too many requests."
+        );
+        assert_eq!(refusal_of(&unsent).unwrap().code, Some(-1003));
     }
 
     #[tokio::test]

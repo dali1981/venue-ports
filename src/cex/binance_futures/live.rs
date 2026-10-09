@@ -120,6 +120,7 @@ impl BinanceFuturesLive {
             .client()
             .public_get(EXCHANGE_INFO_PATH, &[])
             .await
+            .map_err(anyhow::Error::from)
             .context("reading exchangeInfo")?;
         let filters = symbol_filters(&info, symbols)
             .with_context(|| format!("refusing to trade at {}", rest.base_url()))?;
@@ -708,6 +709,85 @@ pub(super) mod tests {
         assert_eq!(fill.filled_qty, d("0.004"));
         assert_eq!(fill.filled_price, d("60010"));
         assert_eq!(fill.order_ref, Some(1001));
+    }
+
+    /// The futures client shares the spot client's error rule, so a refusal
+    /// there is read by type too, with the text it had.
+    #[tokio::test]
+    async fn a_refused_futures_order_is_a_venue_refusal_with_the_text_it_always_had() {
+        use crate::cex::{provenance_of, refusal_of, VenueRefusal};
+        use crate::Provenance;
+
+        let server = venue().await;
+        on(
+            &server,
+            "POST",
+            ORDER_PATH,
+            venue_error(-2022, "ReduceOnly Order is rejected."),
+        )
+        .await;
+
+        let err = connect(&server)
+            .await
+            .execute(&OrderRequest {
+                side: OrderSide::Sell,
+                reduce_only: true,
+                ..buy("0.006")
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            refusal_of(&err),
+            Some(&VenueRefusal {
+                status: 400,
+                code: Some(-2022),
+                msg: "ReduceOnly Order is rejected.".to_string(),
+            })
+        );
+        assert!(
+            err.to_string().ends_with(
+                "nothing filled: refused (HTTP 400, code -2022): ReduceOnly Order is rejected."
+            ),
+            "{err}"
+        );
+        assert_eq!(provenance_of(&err), Some(Provenance::Landed));
+        assert!(err.downcast_ref::<OrderStateUnknown>().is_none());
+    }
+
+    /// A check of the account made at connect that the venue refuses names the
+    /// refusal, under the explanation `connect` gives.
+    #[tokio::test]
+    async fn a_refused_account_check_at_connect_is_a_venue_refusal() {
+        use crate::cex::refusal_of;
+
+        let server = MockServer::start().await;
+        get(
+            &server,
+            "/fapi/v1/time",
+            serde_json::json!({ "serverTime": local_now_ms() }),
+        )
+        .await;
+        on(
+            &server,
+            "GET",
+            "/fapi/v1/positionSide/dual",
+            venue_error(-2015, "Invalid API-key, IP, or permissions for action."),
+        )
+        .await;
+
+        let err = match BinanceFuturesLive::connect_with(rest(&server, fast()), &["BTCUSDT"]).await
+        {
+            Ok(_) => panic!("connect accepted an account whose mode it could not read"),
+            Err(err) => err,
+        };
+
+        assert_eq!(refusal_of(&err).unwrap().code, Some(-2015));
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("reading the account's position mode") && text.contains("-2015"),
+            "{text}"
+        );
     }
 
     #[tokio::test]

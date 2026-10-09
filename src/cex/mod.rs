@@ -165,6 +165,73 @@ pub fn provenance_of(err: &anyhow::Error) -> Option<Provenance> {
         .map(|tag| tag.provenance)
 }
 
+/// The venue read the request and refused it: it did not act on it. A caller
+/// that must act differently on `-2010` (no balance), `-2015` (key, IP or
+/// permission) and `-1021` (clock) reads `code`, instead of searching the
+/// error's text for it.
+///
+/// It is a layer of the error's chain, found with [`refusal_of`] (or
+/// `downcast_ref`), added wherever a Binance refusal becomes an
+/// `anyhow::Error`: the order path, `test_order`, `order_state`, the account
+/// read, the clock read and the futures client, which shares the spot client.
+/// The error's `Display` is as it was: `to_string()` is the same with or
+/// without it, and whatever else is in the chain (`OrderStateUnknown` included)
+/// is still found by `downcast_ref`. A call whose answer was lost, or that was
+/// never sent, is not a refusal: the venue may have acted on the first, and
+/// says nothing of the second.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VenueRefusal {
+    /// The HTTP status of the answer.
+    pub status: u16,
+    /// The venue's own code, when the body carried one (Binance: `-1013`,
+    /// `-2010`, `-2015`, `-1021`, …).
+    pub code: Option<i64>,
+    /// The venue's own message, or its body when it was not JSON.
+    pub msg: String,
+}
+
+impl std::fmt::Display for VenueRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.code {
+            Some(code) => write!(
+                f,
+                "refused (HTTP {}, code {code}): {}",
+                self.status, self.msg
+            ),
+            None => write!(f, "refused (HTTP {}): {}", self.status, self.msg),
+        }
+    }
+}
+
+impl std::error::Error for VenueRefusal {}
+
+impl VenueRefusal {
+    /// This refusal as the error an order path returns, with `why` as its
+    /// message and `provenance` attached, as [`OrderStateUnknown::because`] does
+    /// for an unknown order: `to_string()` is `why`, and [`refusal_of`] finds
+    /// the refusal under it. `why` names the order and says what the refusal
+    /// meant, and ends with the refusal's own text, so `{:#}` of the result
+    /// says that text once more.
+    pub(crate) fn because(
+        self,
+        provenance: Provenance,
+        why: impl std::fmt::Display,
+    ) -> anyhow::Error {
+        let message = format!("{why:#}");
+        anyhow::Error::new(self).context(ErrorProvenance {
+            provenance,
+            message,
+        })
+    }
+}
+
+/// The venue's refusal in `err`'s chain, if the error is one: the request was
+/// read and turned down, and the venue did not act on it. `None` for every
+/// other error, a lost answer and an unsent request included.
+pub fn refusal_of(err: &anyhow::Error) -> Option<&VenueRefusal> {
+    err.downcast_ref::<VenueRefusal>()
+}
+
 #[derive(Debug, Clone)]
 pub struct CexFill {
     pub filled_qty: Decimal,
@@ -350,6 +417,75 @@ mod tests {
             client_order_id: "vp-1".to_string(),
             order_ref: Some(7),
         }
+    }
+
+    fn refusal(code: Option<i64>) -> VenueRefusal {
+        VenueRefusal {
+            status: 400,
+            code,
+            msg: "Account has insufficient balance for requested action.".to_string(),
+        }
+    }
+
+    /// The text `ApiError::Refused` printed before the refusal was a type.
+    #[test]
+    fn a_refusal_says_what_a_refused_call_always_said() {
+        assert_eq!(
+            refusal(Some(-2010)).to_string(),
+            "refused (HTTP 400, code -2010): Account has insufficient balance for requested action."
+        );
+        assert_eq!(
+            VenueRefusal {
+                status: 403,
+                code: None,
+                msg: "forbidden".to_string(),
+            }
+            .to_string(),
+            "refused (HTTP 403): forbidden"
+        );
+    }
+
+    #[test]
+    fn a_refusal_is_found_by_type_under_whatever_was_added_to_the_error() {
+        let bare: anyhow::Error = refusal(Some(-2015)).into();
+        assert_eq!(refusal_of(&bare), Some(&refusal(Some(-2015))));
+
+        let explained = bare.context("reading GET /api/v3/account");
+        assert_eq!(explained.to_string(), "reading GET /api/v3/account");
+        assert_eq!(refusal_of(&explained).unwrap().code, Some(-2015));
+
+        let tagged = with_provenance(explained, Provenance::Landed);
+        assert_eq!(refusal_of(&tagged).unwrap().code, Some(-2015));
+        assert_eq!(provenance_of(&tagged), Some(Provenance::Landed));
+    }
+
+    /// Only a refusal is one: not a plain error, and not an order whose state is
+    /// unknown, which a venue may have acted on.
+    #[test]
+    fn nothing_but_a_refusal_is_a_refusal() {
+        assert!(refusal_of(&anyhow::anyhow!("refused (HTTP 400, code -2010): no")).is_none());
+        let unknown_state = unknown().because(Provenance::Landed, "the status query failed");
+        assert!(refusal_of(&unknown_state).is_none());
+    }
+
+    /// An order path says why in its own words, the provenance rides on that
+    /// layer, and the refusal is under both.
+    #[test]
+    fn a_refused_order_keeps_its_message_its_provenance_and_the_refusal() {
+        let why = format!(
+            "BUY 1 SOLUSDT (vp-1) was not placed, nothing filled: {}",
+            refusal(Some(-2010))
+        );
+        let err = refusal(Some(-2010)).because(Provenance::Landed, &why);
+
+        assert_eq!(err.to_string(), why);
+        assert_eq!(provenance_of(&err), Some(Provenance::Landed));
+        assert_eq!(refusal_of(&err).unwrap().code, Some(-2010));
+        assert!(err.downcast_ref::<OrderStateUnknown>().is_none());
+        // With provenance already on it, `with_provenance` leaves it as it is.
+        let again = with_provenance(err, Provenance::Simulated);
+        assert_eq!(provenance_of(&again), Some(Provenance::Landed));
+        assert_eq!(again.to_string(), why);
     }
 
     #[test]

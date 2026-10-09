@@ -59,7 +59,7 @@ impl SpotBalanceReader for BinanceRest {
             .client()
             .signed(Method::GET, ACCOUNT_PATH, &params)
             .await
-            .map_err(anyhow::Error::new)
+            .map_err(anyhow::Error::from)
             .with_context(|| format!("reading GET {ACCOUNT_PATH}"))?;
         Ok(account.into())
     }
@@ -282,6 +282,57 @@ mod tests {
         let message = format!("{err:#}");
         assert!(message.contains("-1121"), "{message}");
         assert!(message.contains(ACCOUNT_PATH), "{message}");
+    }
+
+    /// The code is read by type, so a caller can tell a key that may not read
+    /// the account (`-2015`) from a clock that is wrong (`-1021`).
+    #[tokio::test]
+    async fn a_refused_read_is_a_venue_refusal() {
+        use crate::cex::{refusal_of, VenueRefusal};
+
+        let server = venue().await;
+        mount_account(
+            &server,
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "code": -2015, "msg": "Invalid API-key, IP, or permissions for action."
+            })),
+        )
+        .await;
+
+        let err = rest(&server).balances().await.unwrap_err();
+
+        assert_eq!(
+            refusal_of(&err),
+            Some(&VenueRefusal {
+                status: 400,
+                code: Some(-2015),
+                msg: "Invalid API-key, IP, or permissions for action.".to_string(),
+            })
+        );
+        assert_eq!(err.to_string(), format!("reading GET {ACCOUNT_PATH}"));
+        assert_eq!(
+            format!("{err:#}"),
+            format!(
+                "reading GET {ACCOUNT_PATH}: refused (HTTP 400, code -2015): \
+                 Invalid API-key, IP, or permissions for action."
+            )
+        );
+    }
+
+    /// A read with no readable answer is not a refusal: the venue neither
+    /// turned the request down nor answered it.
+    #[tokio::test]
+    async fn a_read_with_no_readable_answer_is_not_a_refusal() {
+        let server = venue().await;
+        mount_account(
+            &server,
+            ResponseTemplate::new(503).set_body_string("Unknown error"),
+        )
+        .await;
+
+        let err = rest(&server).balances().await.unwrap_err();
+
+        assert!(crate::cex::refusal_of(&err).is_none(), "{err:#}");
     }
 
     #[tokio::test]

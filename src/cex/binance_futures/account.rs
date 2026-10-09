@@ -158,6 +158,7 @@ impl BinanceFuturesAccount {
                 &[("symbol", symbol.to_string())],
             )
             .await
+            .map_err(anyhow::Error::from)
             .with_context(|| format!("reading {symbol}'s margin type and leverage"))?;
         let row = rows
             .into_iter()
@@ -208,6 +209,7 @@ impl BinanceFuturesAccount {
             .client()
             .public_get("/fapi/v1/premiumIndex", &[("symbol", symbol.to_string())])
             .await
+            .map_err(anyhow::Error::from)
             .with_context(|| format!("reading {symbol}'s mark price"))?;
         Ok(PerpPosition {
             symbol: symbol.to_string(),
@@ -254,6 +256,7 @@ impl BinanceFuturesAccount {
                         ],
                     )
                     .await
+                    .map_err(anyhow::Error::from)
                     .with_context(|| {
                         format!("reading {symbol}'s funding from {start} to {window_end}")
                     })?;
@@ -318,6 +321,7 @@ impl CexAccount for BinanceFuturesAccount {
                 &[("symbol", symbol.to_string())],
             )
             .await
+            .map_err(anyhow::Error::from)
             .with_context(|| format!("reading {symbol}'s position"))?;
         let mut rows: Vec<PositionRow> = rows.into_iter().filter(|r| r.symbol == symbol).collect();
         match rows.len() {
@@ -335,6 +339,7 @@ impl CexAccount for BinanceFuturesAccount {
         let account: Account = client
             .signed(Method::GET, "/fapi/v3/account", &[])
             .await
+            .map_err(anyhow::Error::from)
             .context("reading the account's margin")?;
         Ok(MarginState {
             asset: "USDT".to_string(),
@@ -446,6 +451,27 @@ mod tests {
             },
         ));
         BinanceFuturesAccount::connect(rest).await.unwrap()
+    }
+
+    /// A read the venue refuses is a refusal a caller reads the code from, under
+    /// what was being read.
+    #[tokio::test]
+    async fn a_refused_read_is_a_venue_refusal() {
+        use crate::cex::refusal_of;
+
+        let server = venue().await;
+        Mock::given(method("GET"))
+            .and(path("/fapi/v3/account"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "code": -2015, "msg": "Invalid API-key, IP, or permissions for action."
+            })))
+            .mount(&server)
+            .await;
+
+        let err = account(&server).await.margin().await.unwrap_err();
+
+        assert_eq!(refusal_of(&err).unwrap().code, Some(-2015));
+        assert_eq!(err.to_string(), "reading the account's margin");
     }
 
     /// A `positionRisk` v3 row: no marginType, no leverage.

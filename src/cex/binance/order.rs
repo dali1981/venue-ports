@@ -117,11 +117,11 @@ async fn track<T: VenueOrder>(
                 if window_ends.is_some() && asked_after_window {
                     return Tracked::NeverAccepted;
                 }
-                problem = anyhow::Error::new(err)
+                problem = anyhow::Error::from(err)
                     .context("the venue had no such order yet, and recvWindow had not passed");
             }
             Err(err) => {
-                problem = anyhow::Error::new(err).context("the order-status query failed");
+                problem = anyhow::Error::from(err).context("the order-status query failed");
             }
         }
         if Instant::now() >= deadline && asked_after_window {
@@ -202,7 +202,7 @@ pub(crate) async fn trade_lines(
                     "{trades_path} listed {listed} of the {executed_qty} order {order_id} filled"
                 )
             }
-            Err(err) => anyhow::Error::new(err).context(format!("reading {trades_path}")),
+            Err(err) => anyhow::Error::from(err).context(format!("reading {trades_path}")),
         };
         if Instant::now() >= deadline {
             return Err(problem.context(format!(
@@ -251,8 +251,10 @@ pub(crate) fn single_commission(lines: &[TradeLine]) -> anyhow::Result<(Decimal,
 ///   id until it settles;
 /// - answer lost: tracked by client order id, with "no such order"
 ///   conclusive only once `recvWindow` has passed ([`track`]);
-/// - refused, or never sent: a plain error carrying the venue's code and
-///   message. Nothing filled.
+/// - refused: an error carrying the venue's code and message, and a
+///   [`VenueRefusal`](crate::cex::VenueRefusal) a caller reads them from by
+///   type. Nothing filled;
+/// - never sent: a plain error. Nothing filled.
 ///
 /// Anything that cannot be read once the venue accepted the order, or may
 /// have, is an `OrderStateUnknown` whose context says why. `what` names the
@@ -290,6 +292,10 @@ pub(crate) async fn settled<T: VenueOrder>(
             )
             .await;
             (tracked, Some(cause))
+        }
+        Err(ApiError::Refused(refusal)) => {
+            let why = format!("{what} was not placed, nothing filled: {refusal}");
+            return Err(refusal.because(Provenance::Landed, why));
         }
         Err(err) => bail!("{what} was not placed, nothing filled: {err}"),
     };
