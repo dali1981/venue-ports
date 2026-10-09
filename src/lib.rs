@@ -21,3 +21,6 @@ pub mod testkit;
 // only, because the signed clients are `pub(crate)`.
 #[cfg(test)]
 mod production;
+
+#[cfg(test)]
+mod catalogue;

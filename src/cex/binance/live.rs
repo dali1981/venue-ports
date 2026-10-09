@@ -1370,115 +1370,21 @@ mod tests {
         assert_ne!(bought.client_order_id, sold.client_order_id);
     }
 
-    // TODO(R2): replace with the recorded body. Copied verbatim from the Spot API
-    // documentation, "Query order (USER_DATA)", Response (a LIMIT order that is
-    // still working; its `//` annotation is the documentation's):
-    // https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#query-order-user_data
-    const DOCUMENTED_ORDER_NEW: &str = r#"{
-    "symbol": "LTCBTC",
-    "orderId": 1,
-    "orderListId": -1, // This field will always have a value of -1 if not an order list.
-    "clientOrderId": "myOrder1",
-    "price": "0.1",
-    "origQty": "1.0",
-    "executedQty": "0.0",
-    "cummulativeQuoteQty": "0.0",
-    "status": "NEW",
-    "timeInForce": "GTC",
-    "type": "LIMIT",
-    "side": "BUY",
-    "stopPrice": "0.0",
-    "icebergQty": "0.0",
-    "time": 1499827319559,
-    "updateTime": 1499827319559,
-    "isWorking": true,
-    "workingTime": 1499827319559,
-    "origQuoteOrderQty": "0.000000",
-    "selfTradePreventionMode": "NONE"
-}"#;
+    // The Spot API documentation's "Query order (USER_DATA)" response, a LIMIT order still working. Origin `documented`: the catalogue (`docs/responses/binance-spot.md`)
+    // keeps the gap in view until the testnet recording replaces the body.
+    const DOCUMENTED_ORDER_NEW: &str =
+        include_str!("../../../fixtures/binance-spot/documented/query-order-working.jsonc");
 
-    // TODO(R2): replace with the recorded body. Copied verbatim from the Spot API
-    // documentation, "New order (TRADE)", Response - FULL (a MARKET order that filled
-    // in five trades; its `//` annotation is the documentation's). The documentation
-    // shows no status-query body for a filled order, and this is the same order
-    // object: the status query answers it without `fills` and `transactTime`.
-    // https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#new-order-trade
-    const DOCUMENTED_ORDER_FULL: &str = r#"{
-    "symbol": "BTCUSDT",
-    "orderId": 28,
-    "orderListId": -1, // Unless it's part of an order list, value will be -1
-    "clientOrderId": "6gCrw2kRUAF9CvJDGP16IP",
-    "transactTime": 1507725176595,
-    "price": "0.00000000",
-    "origQty": "10.00000000",
-    "executedQty": "10.00000000",
-    "origQuoteOrderQty": "0.000000",
-    "cummulativeQuoteQty": "10.00000000",
-    "status": "FILLED",
-    "timeInForce": "GTC",
-    "type": "MARKET",
-    "side": "SELL",
-    "workingTime": 1507725176595,
-    "selfTradePreventionMode": "NONE",
-    "fills": [
-        {
-            "price": "4000.00000000",
-            "qty": "1.00000000",
-            "commission": "4.00000000",
-            "commissionAsset": "USDT",
-            "tradeId": 56
-        },
-        {
-            "price": "3999.00000000",
-            "qty": "5.00000000",
-            "commission": "19.99500000",
-            "commissionAsset": "USDT",
-            "tradeId": 57
-        },
-        {
-            "price": "3998.00000000",
-            "qty": "2.00000000",
-            "commission": "7.99600000",
-            "commissionAsset": "USDT",
-            "tradeId": 58
-        },
-        {
-            "price": "3997.00000000",
-            "qty": "1.00000000",
-            "commission": "3.99700000",
-            "commissionAsset": "USDT",
-            "tradeId": 59
-        },
-        {
-            "price": "3995.00000000",
-            "qty": "1.00000000",
-            "commission": "3.99500000",
-            "commissionAsset": "USDT",
-            "tradeId": 60
-        }
-    ]
-}"#;
+    // The documentation's "New order (TRADE)" response, FULL: a MARKET order that filled in five trades. Origin `documented`: the catalogue (`docs/responses/binance-spot.md`)
+    // keeps the gap in view until the testnet recording replaces the body.
+    const DOCUMENTED_ORDER_FULL: &str = include_str!(
+        "../../../fixtures/binance-spot/documented/new-order-full-market-filled.jsonc"
+    );
 
-    // TODO(R2): replace with the recorded body. Copied verbatim from the Spot API
-    // documentation, "Account trade list (USER_DATA)", Response:
-    // https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#account-trade-list-user_data
-    const DOCUMENTED_MY_TRADES: &str = r#"[
-    {
-        "symbol": "BNBBTC",
-        "id": 28457,
-        "orderId": 100234,
-        "orderListId": -1,
-        "price": "4.00000100",
-        "qty": "12.00000000",
-        "quoteQty": "48.000012",
-        "commission": "10.10000000",
-        "commissionAsset": "BNB",
-        "time": 1499865549590,
-        "isBuyer": true,
-        "isMaker": false,
-        "isBestMatch": true
-    }
-]"#;
+    // The documentation's "Account trade list (USER_DATA)" response. Origin `documented`: the catalogue (`docs/responses/binance-spot.md`)
+    // keeps the gap in view until the testnet recording replaces the body.
+    const DOCUMENTED_MY_TRADES: &str =
+        include_str!("../../../fixtures/binance-spot/documented/account-trade-list.json");
 
     /// The documentation's example bodies carry `//` annotations, which JSON
     /// does not: they are cut, and nothing else is.
@@ -1506,15 +1412,13 @@ mod tests {
             .await;
     }
 
-    // TODO(R2): the body is the documented error payload's shape (errors.md, "Error
-    // codes for Binance") with the message the documentation gives -2013
-    // ("-2013 NO_SUCH_ORDER: Order does not exist."); no recorded one exists yet.
+    // The documented `-2013 NO_SUCH_ORDER` payload (errors.md, "Error codes for
+    // Binance"). Origin `documented`: see `docs/responses/binance-spot.md`.
     fn no_such_order() -> ResponseTemplate {
         ResponseTemplate::new(400).set_body_raw(
-            r#"{
-    "code": -2013,
-    "msg": "Order does not exist."
-}"#,
+            include_str!(
+                "../../../fixtures/binance-spot/documented/error-minus-2013-no-such-order.json"
+            ),
             "application/json",
         )
     }

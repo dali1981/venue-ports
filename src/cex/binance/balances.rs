@@ -86,44 +86,12 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    // TODO(R2): replace with the recorded body. Copied verbatim from the Spot API
-    // documentation, "Account information (USER_DATA)", Response:
-    // https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#account-information-user_data
-    // The documentation's body has no `//` comments; nothing in it is edited.
-    const DOCUMENTED_ACCOUNT: &str = r#"{
-    "makerCommission": 15,
-    "takerCommission": 15,
-    "buyerCommission": 0,
-    "sellerCommission": 0,
-    "commissionRates": {
-        "maker": "0.00150000",
-        "taker": "0.00150000",
-        "buyer": "0.00000000",
-        "seller": "0.00000000"
-    },
-    "canTrade": true,
-    "canWithdraw": true,
-    "canDeposit": true,
-    "brokered": false,
-    "requireSelfTradePrevention": false,
-    "preventSor": false,
-    "updateTime": 123456789,
-    "accountType": "SPOT",
-    "balances": [
-        {
-            "asset": "BTC",
-            "free": "4723846.89208129",
-            "locked": "0.00000000"
-        },
-        {
-            "asset": "LTC",
-            "free": "4763368.68006011",
-            "locked": "0.00000000"
-        }
-    ],
-    "permissions": ["SPOT"],
-    "uid": 354937868
-}"#;
+    // The Spot API documentation's "Account information (USER_DATA)" response, with
+    // nothing edited. Origin `documented`: the catalogue
+    // (`docs/responses/binance-spot.md`) keeps the gap in view until the testnet
+    // recording replaces the body.
+    const DOCUMENTED_ACCOUNT: &str =
+        include_str!("../../../fixtures/binance-spot/documented/account-information.json");
 
     fn decimal(s: &str) -> Decimal {
         Decimal::from_str(s).unwrap()
@@ -260,18 +228,17 @@ mod tests {
     }
 
     /// A refusal is an `Err` carrying the venue's code, never an empty account.
-    // TODO(R2): the body is the documented example of an error payload
-    // (errors.md, "Error codes for Binance"); only its shape matters here.
+    // The body is the documented example of an error payload (errors.md, "Error
+    // codes for Binance"); only its shape matters here. Origin `documented`.
     #[tokio::test]
     async fn a_refused_read_is_an_error_carrying_the_venues_code() {
         let server = venue().await;
         mount_account(
             &server,
             ResponseTemplate::new(400).set_body_raw(
-                r#"{
-    "code": -1121,
-    "msg": "Invalid symbol."
-}"#,
+                include_str!(
+                    "../../../fixtures/binance-spot/documented/error-minus-1121-invalid-symbol.json"
+                ),
                 "application/json",
             ),
         )
