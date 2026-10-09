@@ -83,6 +83,14 @@ Narrowing to `-32601` (method not found) and treating other error objects as an 
 already is, would close it, at the price of a connect failure on a provider that answers some other code for an
 unsupported method. Needs your call; V7's `production_lv1_base` C4 would show what real providers answer.
 
+**Status: done**, on the owner's word, in its own commit. `connect` now reads `Landed` from an error object only
+when its code is `-32601`; any other error object is an `Err` naming `web3_clientVersion`, with the registry slot
+left free. Test first: `a_node_that_answers_the_version_with_another_error_refuses_the_connect` (a `-32005` rate
+limit) failed before the change. `SPEC.md` §5 and the doc comments say so. This changes V6's stated rule ("an
+error object is not anvil") for every code but `-32601`; `a_node_that_has_no_client_version_method_is_not_anvil`
+(`-32601`) is unchanged and passes. A provider that answers some other code for an unsupported method will now
+refuse the connect: V7's `production_lv1_base` C4 records what real providers answer.
+
 ### O2 — `label()` of `EvmLive` and `EvmLiquidity` follows the sender's provenance
 
 A signing sender on anvil is now `Simulated`, so `EvmLive::label()` is `"evm-live-fork"` and

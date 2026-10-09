@@ -590,8 +590,10 @@ Rules:
 - **A fork never reads as a landing.** `connect` reads `web3_clientVersion` once and keeps the answer. A
   node whose version starts with `anvil` makes the sender `Simulated`, so every outcome an adapter reports
   through it says so, and a fork run signed with a real key cannot be read as a mainnet trade. A node that
-  answers with an error object (it has no such method) is not anvil; a node that cannot be asked at all is an
-  error. A signing sender still never writes a balance (`ensure_balance`), anvil included.
+  answers that it has no such method (`-32601`) is not anvil, which has it. Any other answer that is not a
+  version (another error object, a rate limit or a gateway's refusal included, or no answer at all) is an
+  error, because the sender could not say what it sends to: it does not guess `Landed`. A signing sender
+  still never writes a balance (`ensure_balance`), anvil included.
 - **The sender prices a transaction by its `FeePolicy` alone.** It takes no priority bid: `EvmLive` refuses
   `PriorityBid::AbovePolicyPerGas` above zero, by name, over a signing sender and a fork sender alike.
 - **No convenience constructor builds a sender inside an adapter.** It would make a second sender for

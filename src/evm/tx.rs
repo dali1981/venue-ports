@@ -29,7 +29,9 @@
 //! **A fork never reads as a landing.** [`EvmSender::connect`] reads the node's
 //! `web3_clientVersion` once: a node that reports `anvil` makes the sender
 //! `Simulated`, whatever key signs, so a rehearsal signed with a real key on a
-//! fork cannot be read as a mainnet trade.
+//! fork cannot be read as a mainnet trade. Only "no such method" (`-32601`)
+//! says the node is not anvil; any other answer that is not a version is an
+//! error, never a guess that it is a mainnet.
 //!
 //! **Two backends, one send path** (`SPEC.md` §5b). A signing sender signs
 //! with its own key and is `Landed`, unless its node is anvil. A fork sender ([`EvmSender::fork`])
@@ -92,6 +94,10 @@ impl std::fmt::Display for TxReplacedOrDropped {
 }
 
 impl std::error::Error for TxReplacedOrDropped {}
+
+/// The JSON-RPC code for a method the node does not have: the only error object
+/// that says a node is not anvil, which has `web3_clientVersion`.
+const METHOD_NOT_FOUND: i64 = -32601;
 
 /// Whether a `web3_clientVersion` is anvil's (`anvil/v1.3.0`).
 fn is_anvil(client_version: &str) -> bool {
@@ -261,9 +267,11 @@ fn registry() -> &'static Mutex<HashSet<(Address, u64)>> {
 impl EvmSender {
     /// Checks `eth_chainId` against `chain_id`, and reads `web3_clientVersion`
     /// once: a node that reports `anvil` makes this sender `Simulated`, so
-    /// nothing it sends reads as a landing. A node that answers with an error
-    /// object (it has no such method) is not anvil; one that cannot be asked
-    /// at all is an error, since the sender could not say what it sends to.
+    /// nothing it sends reads as a landing. A node that answers that it has no
+    /// such method (`-32601`) is not anvil, which has it; any other answer that
+    /// is not a version (another error object, a rate limit or a gateway's
+    /// refusal included, or no answer at all) is an error, since the sender
+    /// could not say what it sends to.
     /// Returns an error if this process already holds an `EvmSender` for the
     /// same (address, chain_id).
     pub async fn connect(
@@ -285,7 +293,13 @@ impl EvmSender {
         let provenance = match rpc.client_version().await {
             Ok(version) if is_anvil(&version) => Provenance::Simulated,
             Ok(_) => Provenance::Landed,
-            Err(err) if err.downcast_ref::<RpcError>().is_some() => Provenance::Landed,
+            Err(err)
+                if err
+                    .downcast_ref::<RpcError>()
+                    .is_some_and(|node| node.code == Some(METHOD_NOT_FOUND)) =>
+            {
+                Provenance::Landed
+            }
             Err(err) => {
                 return Err(err.context(format!(
                     "reading the node's web3_clientVersion at {}: without it the sender cannot \
@@ -1195,6 +1209,54 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
         assert_eq!(connect(&server).await.provenance(), Provenance::Landed);
+    }
+
+    /// Only "no such method" says the node is not anvil. A node that answers the
+    /// version with any other error object (a rate limit, a gateway's refusal)
+    /// has not said what it is, so the sender does not connect on a guess that
+    /// it sends to a mainnet: a fork behind such a gateway would read as a
+    /// landing. Its registry slot stays free.
+    #[tokio::test]
+    async fn a_node_that_answers_the_version_with_another_error_refuses_the_connect() {
+        let server = MockServer::start().await;
+        mount_send_plumbing(&server).await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "web3_clientVersion"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1,
+                "error": { "code": -32005, "message": "rate limit exceeded" },
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let signer = || Signer::from_private_key_hex(&hex::encode([0x44u8; 32])).unwrap();
+
+        let err = EvmSender::connect(
+            EvmRpc::new(server.uri()),
+            signer(),
+            SEPOLIA,
+            FeePolicy::default(),
+        )
+        .await
+        .err()
+        .expect("a node that answered the version with a rate limit");
+        assert!(format!("{err:#}").contains("web3_clientVersion"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("rate limit exceeded"),
+            "{err:#}"
+        );
+
+        // Nothing was registered: the same wallet connects once the node answers.
+        let healthy = MockServer::start().await;
+        mount_send_plumbing(&healthy).await;
+        EvmSender::connect(
+            EvmRpc::new(healthy.uri()),
+            signer(),
+            SEPOLIA,
+            FeePolicy::default(),
+        )
+        .await
+        .unwrap();
     }
 
     /// A node that cannot be asked at all leaves the sender unable to say what
