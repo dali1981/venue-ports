@@ -326,7 +326,7 @@ not placed. Harness additions it needed: `Wire::sending` and `Gate::exchanges` (
 reply), `Run::call_graded` with `Grade::{Pass, Fail, Skip}` (a check may skip), `Run::computed` (a check line with no request).
 Self-tests: a stateful mock exchange (`MiniExchange` in the test module) with a knob for each way it can disagree; the case code
 was broken 16 ways and `exchange_checks` 24 ways with `scripts/mutate-check.py`, and every mutation was caught but one that is
-equivalent (a sort key). `SPEC` rows for it are in §9 below.
+equivalent (a sort key). No `SPEC.md` text for it is written yet (step 9).
 
 ### 10.4 LV2b (`src/production/lv2b_chain.rs`, `chain_checks.rs`) — what is left
 
