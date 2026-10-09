@@ -31,6 +31,9 @@ pub(crate) enum Kind {
     Refused,
     Lost,
     NotSent,
+    /// Only ever expected: the venue answered, with a value or a refusal, and
+    /// the answer is recorded and not judged (C4, what a provider serves).
+    Answer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -43,7 +46,9 @@ pub(crate) enum Outcome {
     },
     /// The venue read the request and refused it.
     Refused {
-        http_status: u16,
+        /// The HTTP status of a REST refusal; `None` for a JSON-RPC error
+        /// object, whose status the client does not keep.
+        http_status: Option<u16>,
         code: Option<i64>,
         msg: String,
     },
@@ -67,14 +72,28 @@ impl Outcome {
         }
     }
 
+    /// Whether the venue read the request and answered it, with a value or a
+    /// refusal.
+    pub(crate) fn is_an_answer(&self) -> bool {
+        matches!(self, Outcome::Ok { .. } | Outcome::Refused { .. })
+    }
+
     /// The outcome of a call that ended in `err`, read from the error's chain
     /// by type and by the text every failed call has always begun with.
     pub(crate) fn of_error(err: &anyhow::Error) -> Self {
         if let Some(refusal) = crate::cex::refusal_of(err) {
             return Outcome::Refused {
-                http_status: refusal.status,
+                http_status: Some(refusal.status),
                 code: refusal.code,
                 msg: refusal.msg.clone(),
+            };
+        }
+        // A node's error object is its refusal: it read the request and said no.
+        if let Some(node) = err.downcast_ref::<crate::evm::RpcError>() {
+            return Outcome::Refused {
+                http_status: None,
+                code: node.code,
+                msg: node.message.clone(),
             };
         }
         let said = format!("{err:#}");
@@ -114,6 +133,21 @@ impl Expected {
             codes: codes.to_vec(),
         }
     }
+
+    pub(crate) fn not_sent() -> Self {
+        Self {
+            kind: Kind::NotSent,
+            codes: Vec::new(),
+        }
+    }
+
+    /// Any answer: a value or a refusal. For a reply that is recorded and not judged.
+    pub(crate) fn answer() -> Self {
+        Self {
+            kind: Kind::Answer,
+            codes: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -147,6 +181,18 @@ pub(crate) fn judge(
         None => {}
     }
     match (expected.kind, outcome) {
+        (Kind::Answer, answered) if answered.is_an_answer() => (Verdict::Pass, String::new()),
+        (Kind::Answer, other) => (
+            Verdict::Unmapped,
+            format!(
+                "expected an answer, got a call that was {:?}, which is in no row for this case",
+                other.kind()
+            ),
+        ),
+        (Kind::NotSent, Outcome::Ok { .. }) => (
+            Verdict::Fail,
+            "the call went through when the case expects it to be turned away locally".to_string(),
+        ),
         (Kind::Ok, Outcome::Ok { .. }) => (Verdict::Pass, String::new()),
         (Kind::Refused, Outcome::Ok { .. }) => (
             Verdict::Fail,
@@ -161,7 +207,7 @@ pub(crate) fn judge(
             if expected.codes.is_empty() {
                 (
                     Verdict::Pass,
-                    format!("refused (HTTP {http_status}, code {code:?}); the code is recorded"),
+                    format!("refused (HTTP {http_status:?}, code {code:?}); the code is recorded"),
                 )
             } else if code.is_some_and(|code| expected.codes.contains(&code)) {
                 (Verdict::Pass, String::new())
@@ -169,7 +215,7 @@ pub(crate) fn judge(
                 (
                     Verdict::Unmapped,
                     format!(
-                        "refused with code {code:?} (HTTP {http_status}), which is in no row for \
+                        "refused with code {code:?} (HTTP {http_status:?}), which is in no row for \
                          this case (rows: {:?})",
                         expected.codes
                     ),
@@ -192,7 +238,9 @@ pub(crate) fn judge(
             },
         ) => (
             Verdict::Fail,
-            format!("expected an answer, got a refusal (HTTP {http_status}, code {code:?}): {msg}"),
+            format!(
+                "expected an answer, got a refusal (HTTP {http_status:?}, code {code:?}): {msg}"
+            ),
         ),
         (Kind::Ok, other) => (
             Verdict::Fail,
@@ -246,6 +294,56 @@ pub(crate) struct ResultLine {
     pub(crate) latency_ms: u64,
     /// An object on a call that trades; `null` on every other.
     pub(crate) references: Option<serde_json::Value>,
+}
+
+impl ResultLine {
+    /// This line with `scrub` applied to every piece of free text in it: the
+    /// reason, an outcome's message, the request's path and parameters, and
+    /// every string of the references.
+    pub(crate) fn scrubbed(mut self, scrub: &dyn Fn(&str) -> String) -> Self {
+        self.reason = scrub(&self.reason);
+        self.outcome = match self.outcome {
+            Outcome::Ok { note } => Outcome::Ok {
+                note: note.map(|note| scrub(&note)),
+            },
+            Outcome::Refused {
+                http_status,
+                code,
+                msg,
+            } => Outcome::Refused {
+                http_status,
+                code,
+                msg: scrub(&msg),
+            },
+            Outcome::Lost { msg } => Outcome::Lost { msg: scrub(&msg) },
+            Outcome::NotSent { msg } => Outcome::NotSent { msg: scrub(&msg) },
+        };
+        self.request.path = scrub(&self.request.path);
+        for (_, value) in &mut self.request.params.0 {
+            *value = scrub(value);
+        }
+        self.references = self.references.map(|value| scrub_json(value, scrub));
+        self
+    }
+}
+
+fn scrub_json(value: serde_json::Value, scrub: &dyn Fn(&str) -> String) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => Value::String(scrub(&text)),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| scrub_json(item, scrub))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, item)| (key, scrub_json(item, scrub)))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 /// How many calls ended each way.
@@ -371,7 +469,7 @@ mod tests {
                 ]),
             },
             outcome: Outcome::Refused {
-                http_status: 400,
+                http_status: Some(400),
                 code: Some(-2010),
                 msg: "Account has insufficient balance for requested action.".to_string(),
             },
@@ -443,7 +541,7 @@ mod tests {
         assert_eq!(
             Outcome::of_error(&refused.context("placing it")),
             Outcome::Refused {
-                http_status: 400,
+                http_status: Some(400),
                 code: Some(-1013),
                 msg: "Filter failure: NOTIONAL".to_string()
             }
@@ -472,7 +570,7 @@ mod tests {
 
     fn refused(code: Option<i64>) -> Outcome {
         Outcome::Refused {
-            http_status: 400,
+            http_status: Some(400),
             code,
             msg: "no".to_string(),
         }
@@ -512,6 +610,93 @@ mod tests {
         );
         assert_eq!(verdict, Verdict::Unmapped);
         assert!(why.contains("Lost"), "{why}");
+    }
+
+    /// C4 records what a provider serves and judges none of it.
+    #[test]
+    fn an_answer_expected_is_met_by_a_value_or_a_refusal_and_by_nothing_else() {
+        let expected = Expected::answer();
+        assert_eq!(judge(&expected, &Outcome::ok(), None).0, Verdict::Pass);
+        assert_eq!(
+            judge(&expected, &refused(Some(-32602)), None).0,
+            Verdict::Pass
+        );
+        assert_eq!(judge(&expected, &refused(None), None).0, Verdict::Pass);
+        for no_answer in [
+            Outcome::Lost { msg: "x".into() },
+            Outcome::NotSent { msg: "x".into() },
+        ] {
+            assert_eq!(judge(&expected, &no_answer, None).0, Verdict::Unmapped);
+        }
+        assert_eq!(
+            serde_json::to_value(&expected).unwrap(),
+            json!({"kind": "answer"})
+        );
+    }
+
+    /// A node that answers with an error object has read the request and said no:
+    /// that is a refusal, with no HTTP status to report.
+    #[test]
+    fn a_nodes_error_object_is_a_refusal_with_no_http_status() {
+        let err: anyhow::Error = crate::evm::RpcError {
+            code: Some(-32000),
+            message: "insufficient funds for gas * price + value".to_string(),
+            reason: "insufficient funds for gas * price + value".to_string(),
+            revert_data: false,
+        }
+        .into();
+        let outcome = Outcome::of_error(&err.context("broadcasting transaction 0x01"));
+        assert_eq!(
+            outcome,
+            Outcome::Refused {
+                http_status: None,
+                code: Some(-32000),
+                msg: "insufficient funds for gas * price + value".to_string()
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&outcome).unwrap(),
+            json!({"kind": "refused", "http_status": null, "code": -32000,
+                   "msg": "insufficient funds for gas * price + value"})
+        );
+        assert_eq!(
+            judge(&Expected::refused(&[]), &outcome, None).0,
+            Verdict::Pass
+        );
+    }
+
+    #[test]
+    fn a_call_that_was_to_be_turned_away_locally_and_went_through_fails() {
+        assert_eq!(
+            judge(&Expected::not_sent(), &Outcome::ok(), None).0,
+            Verdict::Fail
+        );
+        let not_sent = Outcome::NotSent { msg: "x".into() };
+        assert_eq!(
+            judge(&Expected::not_sent(), &not_sent, None).0,
+            Verdict::Pass
+        );
+    }
+
+    /// A provider's URL carries its key in the path; an error that names the
+    /// URL must not carry it into a line.
+    #[test]
+    fn free_text_is_scrubbed_everywhere_in_a_line() {
+        let mut dirty = line("C1");
+        dirty.reason = "see https://node.example/v2/KEY123".to_string();
+        dirty.outcome = Outcome::NotSent {
+            msg: "error sending request for url (https://node.example/v2/KEY123)".to_string(),
+        };
+        dirty.request.path = "https://node.example/v2/KEY123".to_string();
+        dirty.request.params = Params(vec![("url".to_string(), "/v2/KEY123".to_string())]);
+        dirty.references = Some(json!({"a": ["x /v2/KEY123"], "n": 1}));
+
+        let clean = dirty.scrubbed(&|text| text.replace("KEY123", "[hidden]"));
+
+        let text = serde_json::to_string(&clean).unwrap();
+        assert!(!text.contains("KEY123"), "{text}");
+        assert_eq!(text.matches("[hidden]").count(), 5, "{text}");
+        assert_eq!(clean.references.unwrap()["n"], 1);
     }
 
     #[test]

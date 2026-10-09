@@ -32,8 +32,13 @@ pub(crate) mod env;
 pub(crate) mod gate;
 pub(crate) mod guard;
 pub(crate) mod ledger;
+pub(crate) mod lv1_base;
+pub(crate) mod lv1_binance;
 pub(crate) mod record;
 pub(crate) mod results;
+pub(crate) mod sizing;
+#[cfg(test)]
+pub(crate) mod testing;
 pub(crate) mod wire;
 
 use crate::cex::binance::{BinanceConfig, BinanceRest};
@@ -43,14 +48,14 @@ use crate::production::gate::{Echo, Gate, OrderPermit};
 use crate::production::ledger::{Ledger, Stop};
 use crate::production::record::Recorder;
 use crate::production::results::{
-    judge, Expected, Outcome, Params, RequestRecord, ResultLine, Results, Tally, Verdict,
+    judge, Expected, Kind, Outcome, Params, RequestRecord, ResultLine, Results, Tally, Verdict,
 };
 use crate::production::wire::{Call, Held, Wire};
 use anyhow::{bail, Context, Result};
 use rust_decimal::Decimal;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// The default for `VP_ORDER_CAP_USD`.
@@ -76,6 +81,9 @@ pub(crate) struct Run {
     gate: Arc<Gate>,
     ledger: Arc<Ledger>,
     results: Results,
+    /// Text that must not reach a line as it is: a node URL carries its key in
+    /// its path or query, and an error that names the URL repeats it.
+    hidden: Mutex<Vec<String>>,
 }
 
 /// What a case says about a call it is about to make.
@@ -87,6 +95,9 @@ pub(crate) struct CallSpec<'a> {
     pub(crate) request: Option<RequestRecord>,
     /// Record mode: the call's replies are saved as `<step>-<name>`.
     pub(crate) record_as: Option<&'a str>,
+    /// The host the line names, when it is not the run's (one run asks several
+    /// providers).
+    pub(crate) host: Option<String>,
 }
 
 impl<'a> CallSpec<'a> {
@@ -96,7 +107,13 @@ impl<'a> CallSpec<'a> {
             expected,
             request: None,
             record_as: None,
+            host: None,
         }
+    }
+
+    pub(crate) fn host(mut self, host: &str) -> Self {
+        self.host = Some(host.to_string());
+        self
     }
 
     pub(crate) fn record_as(mut self, stem: &'a str) -> Self {
@@ -116,12 +133,15 @@ pub(crate) struct Called<T> {
     pub(crate) outcome: Outcome,
     pub(crate) verdict: Verdict,
     pub(crate) reason: String,
+    /// The venue accepted a request the case expected it to refuse.
+    accepted_a_refusal_case: bool,
 }
 
 impl<T> Called<T> {
-    /// Whether the run must go no further: it was halted, or the harness failed.
+    /// Whether the run must go no further: it was halted, or the venue accepted
+    /// a request it must refuse (which may have spent money).
     pub(crate) fn stops_the_run(&self) -> bool {
-        matches!(self.verdict, Verdict::Halted)
+        matches!(self.verdict, Verdict::Halted) || self.accepted_a_refusal_case
     }
 }
 
@@ -169,6 +189,7 @@ impl Run {
             gate: Arc::new(Gate::new(halt_file, dry_run, echo, recorder)),
             ledger: Arc::new(Ledger::new(spend_cap, order_cap)),
             results,
+            hidden: Mutex::new(Vec::new()),
         })
     }
 
@@ -178,6 +199,32 @@ impl Run {
 
     pub(crate) fn ledger(&self) -> &Arc<Ledger> {
         &self.ledger
+    }
+
+    /// Keeps `urls` (and the path and query of each, where its key is) out of
+    /// every line: wherever the text appears it is replaced by `[provider]`.
+    pub(crate) fn hide_urls(&self, urls: &[String]) {
+        let mut hidden = self.hidden.lock().unwrap();
+        for url in urls {
+            hidden.push(url.clone());
+            if let Ok(parsed) = reqwest::Url::parse(url) {
+                for piece in [parsed.path(), parsed.query().unwrap_or_default()] {
+                    if piece.trim_matches('/').len() >= 6 {
+                        hidden.push(piece.to_string());
+                    }
+                }
+            }
+        }
+        // The longest first, so a URL is replaced whole before its parts.
+        hidden.sort_by_key(|text| std::cmp::Reverse(text.len()));
+        hidden.dedup();
+    }
+
+    fn scrub(&self, text: &str) -> String {
+        let hidden = self.hidden.lock().unwrap();
+        hidden.iter().fold(text.to_string(), |text, secret| {
+            text.replace(secret.as_str(), "[provider]")
+        })
     }
 
     /// The wire a client is given, so that its calls go through the gate.
@@ -255,13 +302,16 @@ impl Run {
     where
         Fut: Future<Output = Result<T>>,
     {
-        self.call_with(spec, make, |_| None).await
+        self.call_with(spec, make, |_| None, |_| Ok(())).await
     }
 
     /// Makes a call, reads its outcome, judges it against `spec.expected` and
     /// writes its line. `references` is made from the call's result, after it:
     /// an object for a call that trades, `None` (written as `null`) for every
-    /// other.
+    /// other. `check` is what the case asserts of the result beyond its kind
+    /// (a key that must not withdraw, a refusal that must not be a revert): a
+    /// call whose outcome passed and whose check says no is a `fail`, with the
+    /// check's reason.
     ///
     /// An `Err` is the harness failing (a line it may not write, a reply it
     /// could not record): the run stops. A call that failed is an `Ok` with a
@@ -271,6 +321,7 @@ impl Run {
         spec: CallSpec<'_>,
         make: impl FnOnce() -> Fut,
         references: impl FnOnce(&Result<T>) -> Option<serde_json::Value>,
+        check: impl FnOnce(&Result<T>) -> std::result::Result<(), String>,
     ) -> Result<Called<T>>
     where
         Fut: Future<Output = Result<T>>,
@@ -300,7 +351,16 @@ impl Run {
             Err(err) => Outcome::of_error(err),
         };
         let held = halted_before.or_else(|| self.gate.take_held());
-        let (verdict, reason) = judge(&spec.expected, &outcome, held.as_ref());
+        let (mut verdict, mut reason) = judge(&spec.expected, &outcome, held.as_ref());
+        if verdict == Verdict::Pass {
+            if let Err(why) = check(&result) {
+                verdict = Verdict::Fail;
+                reason = why;
+            }
+        }
+        let accepted_a_refusal_case = spec.expected.kind == Kind::Refused
+            && matches!(outcome, Outcome::Ok { .. })
+            && held.is_none();
         let request = spec
             .request
             .or_else(|| self.first_request())
@@ -313,7 +373,7 @@ impl Run {
             run_id: self.id.clone(),
             case: spec.case.to_string(),
             venue: self.venue.clone(),
-            host: self.host.clone(),
+            host: spec.host.clone().unwrap_or_else(|| self.host.clone()),
             started_ms,
             request,
             outcome: outcome.clone(),
@@ -324,12 +384,14 @@ impl Run {
             latency_ms,
             references: references(&result),
         };
-        self.results.write(&line)?;
+        self.results
+            .write(&line.scrubbed(&|text| self.scrub(text)))?;
         Ok(Called {
             result,
             outcome,
             verdict,
             reason,
+            accepted_a_refusal_case,
         })
     }
 
@@ -342,28 +404,41 @@ impl Run {
         verdict: Verdict,
         reason: &str,
     ) -> Result<()> {
+        self.note_at(None, case, expected, verdict, reason)
+    }
+
+    /// As [`Run::note`], for a case run against `host` rather than the run's.
+    pub(crate) fn note_at(
+        &self,
+        host: Option<&str>,
+        case: &str,
+        expected: Expected,
+        verdict: Verdict,
+        reason: &str,
+    ) -> Result<()> {
+        let line = ResultLine {
+            run_id: self.id.clone(),
+            case: case.to_string(),
+            venue: self.venue.clone(),
+            host: host.map_or_else(|| self.host.clone(), str::to_string),
+            started_ms: now_ms(),
+            request: RequestRecord {
+                method: String::new(),
+                path: String::new(),
+                params: Params(Vec::new()),
+            },
+            outcome: Outcome::NotSent {
+                msg: reason.to_string(),
+            },
+            expected,
+            verdict,
+            reason: reason.to_string(),
+            body_file: None,
+            latency_ms: 0,
+            references: None,
+        };
         self.results
-            .write(&ResultLine {
-                run_id: self.id.clone(),
-                case: case.to_string(),
-                venue: self.venue.clone(),
-                host: self.host.clone(),
-                started_ms: now_ms(),
-                request: RequestRecord {
-                    method: String::new(),
-                    path: String::new(),
-                    params: Params(Vec::new()),
-                },
-                outcome: Outcome::NotSent {
-                    msg: reason.to_string(),
-                },
-                expected,
-                verdict,
-                reason: reason.to_string(),
-                body_file: None,
-                latency_ms: 0,
-                references: None,
-            })
+            .write(&line.scrubbed(&|text| self.scrub(text)))
             .with_context(|| format!("writing the line for {case}"))
     }
 
@@ -411,106 +486,15 @@ mod tests {
     use crate::balance::SpotBalanceReader;
     use crate::cex::binance::BinanceLive;
     use crate::cex::{CexExecutor, OrderRequest, OrderSide};
-    use crate::production::env::MapEnv;
-    use crate::production::results::Kind;
+    use crate::production::testing::{fast, Setup};
     use serde_json::json;
     use std::collections::HashMap;
     use std::str::FromStr;
-    use std::time::Duration;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn d(text: &str) -> Decimal {
         Decimal::from_str(text).unwrap()
-    }
-
-    fn scratch(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "venue-ports-run-{name}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
-    }
-
-    fn fast() -> CexTimings {
-        CexTimings {
-            request_timeout: Duration::from_millis(500),
-            recv_window: Duration::from_millis(1_000),
-            clock_refresh: Duration::from_secs(600),
-            poll_interval: Duration::from_millis(10),
-            poll_timeout: Duration::from_millis(300),
-            trades_timeout: Duration::from_millis(200),
-        }
-    }
-
-    /// The settings of a run against `server`, in a scratch directory.
-    struct Setup {
-        vars: Vec<(String, String)>,
-        out: PathBuf,
-        halt: PathBuf,
-        record: PathBuf,
-    }
-
-    impl Setup {
-        fn new(name: &str, server: &MockServer) -> Self {
-            let root = scratch(name);
-            let (out, halt, record) = (root.join("out"), root.join("HALT"), root.join("recording"));
-            let vars = [
-                ("VP_SPEND_CAP_USD", "30".to_string()),
-                ("VP_HALT_FILE", halt.display().to_string()),
-                ("VP_OUT", out.display().to_string()),
-                ("BINANCE_BASE_URL", server.uri()),
-                ("BINANCE_API_KEY", "AKEY-1234-ABCD".to_string()),
-                ("BINANCE_API_SECRET", "SECRET-9876-WXYZ".to_string()),
-            ]
-            .map(|(key, value)| (key.to_string(), value))
-            .to_vec();
-            Self {
-                vars,
-                out,
-                halt,
-                record,
-            }
-        }
-
-        fn with(mut self, key: &str, value: &str) -> Self {
-            self.vars.retain(|(name, _)| name != key);
-            self.vars.push((key.to_string(), value.to_string()));
-            self
-        }
-
-        fn without(mut self, key: &str) -> Self {
-            self.vars.retain(|(name, _)| name != key);
-            self
-        }
-
-        fn env(&self) -> MapEnv {
-            let vars: Vec<(&str, &str)> = self
-                .vars
-                .iter()
-                .map(|(key, value)| (key.as_str(), value.as_str()))
-                .collect();
-            MapEnv::new(&vars)
-        }
-
-        fn run(&self, server: &MockServer) -> Result<Run> {
-            Run::start(&self.env(), "binance-spot", &server.uri(), Echo::Quiet)
-        }
-
-        fn lines(&self) -> Vec<serde_json::Value> {
-            std::fs::read_to_string(self.out.join("results.jsonl"))
-                .unwrap()
-                .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect()
-        }
-
-        fn clean_up(&self) {
-            let _ = std::fs::remove_dir_all(self.out.parent().unwrap());
-        }
     }
 
     /// A venue with a clock, an account, a book and an order that fills.
@@ -1002,6 +986,65 @@ mod tests {
         setup.clean_up();
     }
 
+    /// A case asserts more than a kind: a key that must not withdraw, a refusal
+    /// that must not be a revert. A call that answered and fails the assertion
+    /// fails, with the assertion's own words.
+    #[tokio::test]
+    async fn a_check_that_says_no_turns_a_pass_into_a_fail_with_its_reason() {
+        let server = venue().await;
+        let setup = Setup::new("check", &server);
+        let run = setup.run(&server).unwrap();
+        let rest = run
+            .binance_rest(&setup.env(), &server.uri(), "BINANCE", fast())
+            .unwrap();
+
+        let called = run
+            .call_with(
+                CallSpec::new("B10", Expected::ok()),
+                || async { rest.book_ticker("AEROUSDT").await },
+                |_| None,
+                |result| match result {
+                    Ok(ticker) if ticker.bid_price > d("5") => Ok(()),
+                    _ => Err("the bid is not above 5".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(called.verdict, Verdict::Fail);
+        assert_eq!(called.reason, "the bid is not above 5");
+        assert!(
+            !called.stops_the_run(),
+            "a failed assertion does not stop a read-only run"
+        );
+        assert_eq!(setup.lines()[0]["verdict"], "fail");
+        assert!(run.finish().is_err());
+        setup.clean_up();
+    }
+
+    /// "A refused case that is accepted is a fail and the run stops at once."
+    #[tokio::test]
+    async fn a_request_the_venue_was_to_refuse_and_accepted_stops_the_run() {
+        let server = venue().await;
+        let setup = Setup::new("accepted", &server);
+        let run = setup.run(&server).unwrap();
+        let rest = run
+            .binance_rest(&setup.env(), &server.uri(), "BINANCE", fast())
+            .unwrap();
+
+        let called = run
+            .call(CallSpec::new("B8", Expected::refused(&[-1121])), || async {
+                rest.book_ticker("AEROUSDT").await
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(called.verdict, Verdict::Fail);
+        assert!(called.reason.contains("accepted"), "{}", called.reason);
+        assert!(called.stops_the_run());
+        setup.clean_up();
+    }
+
     // --- results ---
 
     #[tokio::test]
@@ -1053,6 +1096,7 @@ mod tests {
                     .ok()
                     .map(|ticker| json!({"touch_at_send": {"bid": ticker.bid_price.to_string()}}))
             },
+            |_| Ok(()),
         )
         .await
         .unwrap();
