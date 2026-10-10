@@ -6,7 +6,8 @@ has a row, every row's body exists, and every row names a test that exists and r
 
 **Origin** says how the body came to be:
 
-- `production` — recorded from `https://api.binance.com` by the production tier (`VP_RECORD_DIR`).
+- `production` — recorded from `https://api.binance.com` by the production tier (`VP_RECORD_DIR`). Not
+  while this repository is public: a production recording holds the account's balances and rates (`SPEC.md` §7).
 - `testnet` — recorded from `https://testnet.binance.vision`.
 - `documented` — copied from Binance's documentation; nothing in the crate has seen the venue say it.
 - `synthetic` — written for a test, to reach a case the venue's documentation does not show.

@@ -17,7 +17,8 @@ it is run against; until it has been run, the bodies below are the ones the test
 
 As in `docs/responses/binance-spot.md`: **no body here is a file**; each is built in the test that names it,
 and none was said by a node to this crate. The production tier records each provider's wording when a person
-runs it (`VP_RECORD_DIR`); these rows become `production` then.
+runs it (`VP_RECORD_DIR`); these rows become `production` only when a recording may enter this repository
+(`SPEC.md` §7: not while it is public).
 
 | Call | Variant | Body | Origin | Test | Typed result |
 | --- | --- | --- | --- | --- | --- |

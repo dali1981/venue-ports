@@ -9,4 +9,8 @@ A recording is a venue's reply with **one** edit: the account's `uid` is replace
 Every other byte is as the venue sent it. A body copied from documentation keeps the documentation's `//`
 annotations (`.jsonc`); the test that reads it cuts them.
 
+A **production** recording does not belong here while the repository is public: it holds the account's balances,
+permissions, commission rates, order ids and addresses, and the `uid` is the only thing redacted (`SPEC.md` §7).
+It is kept in the consumer's private repository.
+
 Nothing here is recorded yet: see `specs/V7-questions.md`, Q1.

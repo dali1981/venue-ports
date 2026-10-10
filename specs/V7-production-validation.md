@@ -316,8 +316,12 @@ present in a swap's `references` object, and `null`, not absent or zero, where t
 **Recorded bodies** live at `fixtures/<venue>/<origin>/<yyyy-mm-dd>/`. This spec's first step copies the
 consumer's recording of Binance's spot testnet (7 October 2026, 34 files, 164 KB, the account's `uid`
 already replaced by `REDACTED-UID`) to `fixtures/binance-spot/testnet/2026-10-07/`, with its README. A
-production run's `VP_RECORD_DIR` is copied to `fixtures/binance-spot/production/<date>/` by hand, after
-reading it.
+production run's `VP_RECORD_DIR` does **not** enter this repository while it is public: it holds the account's
+balances, permissions, commission rates, order ids and addresses (record mode redacts the `uid` and nothing
+else), and LV2b's also the signed transactions. The person who ran it reads it first and keeps it in the
+consumer's private repository. Its bodies come to `fixtures/binance-spot/production/<date>/`, and their
+catalogue rows become `production`, only once the owner has made this repository private or widened the
+redaction, with a test, so that nothing account-specific remains; until then no row is `production`.
 
 **The catalogue** is `docs/responses/binance-spot.md` and `docs/responses/evm.md`: one row for each
 **call × response variant**, columns: the call · the variant · the body (a path under `fixtures/`) · its

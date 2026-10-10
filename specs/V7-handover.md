@@ -196,7 +196,8 @@ not being an `Error`), a new §6d gets the six reads, §7's table gets the produ
   `BINANCE_API_SECRET`, optionally `BINANCE_RO_*` and `BINANCE_EMPTY_*`, `VP_SYMBOL`, `VP_SPEND_CAP_USD`,
   `VP_ORDER_CAP_USD`, `VP_HALT_FILE`, `VP_OUT`, `VP_RECORD_DIR`, `VP_BASE_RPC_URL(S)`, `VP_SIGNER_KEY_HEX`,
   `VP_ROUTER`, `VP_POOL`, `VP_TOKEN_IN`, `VP_TOKEN_OUT`, `VP_TOKEN_QUOTE`, `VP_NATIVE_USD` (the spec lists them).
-- Read a `VP_RECORD_DIR` before copying it to `fixtures/binance-spot/production/<date>/`, and commit it.
+- Read a `VP_RECORD_DIR` before it goes anywhere. It does not go to `fixtures/` while this repository is public
+  (`SPEC.md` §7, the production-recordings rule); it is kept in the consumer's private repository.
 - Check the Aerodrome router's verified ABI against `specs/V7-questions.md`.
 
 ## 8. Done when (from the spec, with the current state)
@@ -453,8 +454,9 @@ fails first, in its own commit. Q9 is a note: a dry run of LV2b prints one call.
 - Supply the testnet recording, or say it is not wanted (§4.1; Q1, Q2).
 - Check the Aerodrome router's verified ABI (Q3) and read Q4 and Q5 before the first LV2a run.
 - Decide Q6 (`DRY_RUN` is `VP_DRY_RUN`) and Q7, and the lists of §9.2 and §10.5, which the owner has not seen.
-- Run the four ignored tests as §7 says, `VP_DRY_RUN=1` first; copy each `VP_RECORD_DIR` to
-  `fixtures/<venue>/production/<date>/` after reading it, and turn the rows of `docs/responses/` to `production`.
+- Run the four ignored tests as §7 says, `VP_DRY_RUN=1` first; read each `VP_RECORD_DIR` and keep it in the
+  consumer's private repository (`SPEC.md` §7: a production recording does not enter this public repository, so no
+  row of `docs/responses/` becomes `production` yet).
 
 ### 11.6 Traps met in this session
 

@@ -1537,8 +1537,12 @@ refusal is assumed, and the Aerodrome router's ABI is from memory (`specs/V7-que
 **catalogue** has one row for each call and response variant, with the body (`fixtures/`), its origin
 (`production`, `testnet`, `documented`, `synthetic`, `not provokable`), the test that parses it and the typed
 result; `catalogue_matches_fixtures` fails if a file has no row, a row has no file or a row's test does not
-read its body. A production run's `VP_RECORD_DIR` is copied to `fixtures/<venue>/production/<date>/` by a
-person who has read it, and its rows become `production`.
+read its body. A production run's `VP_RECORD_DIR` does **not** enter this
+repository while it is public: it holds the account's balances, permissions, commission rates, order ids and
+addresses (record mode redacts the `uid` and nothing else), and LV2b's also the signed transactions. The
+person who ran it reads it first and keeps it in the consumer's private repository. Its bodies come to
+`fixtures/<venue>/production/<date>/`, and their rows become `production`, only once the owner has made this
+repository private or widened the redaction, with a test, so that nothing account-specific remains.
 
 **Status: written, offline-tested, not run against a production venue.**
 
