@@ -144,12 +144,18 @@ pub struct EvmRpc {
 }
 
 /// What happened on the wire that a test taps: a signed transaction is about
-/// to be broadcast, or a receipt poll was answered.
+/// to be broadcast, the node answered the send, or a receipt poll was answered.
 #[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RpcEvent {
-    /// `eth_sendRawTransaction` is about to be asked.
-    Broadcast,
+    /// `eth_sendRawTransaction` is about to be asked, with the signed
+    /// transaction as hex: given before the request leaves, so that it is known
+    /// even if the node never answers.
+    Broadcast { signed: String },
+    /// The node's reply to `eth_sendRawTransaction`, result or error, with every
+    /// field it sent (parsed and written again: the order of keys and the spacing
+    /// are not the node's). Not given when no reply came back.
+    SendReply { response: String },
     /// A receipt was asked for `hash`, and the node did (or did not) have it.
     Receipt { hash: B256, found: bool },
 }
@@ -222,6 +228,15 @@ impl EvmRpc {
             .json()
             .await
             .with_context(|| format!("decoding JSON-RPC response body for {method}"))?;
+
+        #[cfg(test)]
+        if method == "eth_sendRawTransaction" {
+            if let Some(tap) = &self.tap {
+                (tap.0)(RpcEvent::SendReply {
+                    response: response.to_string(),
+                });
+            }
+        }
 
         if let Some(error) = response.get("error") {
             return Err(RpcError {
@@ -429,12 +444,14 @@ impl EvmRpc {
     }
 
     pub async fn send_raw_transaction(&self, raw: &[u8]) -> Result<()> {
+        let signed = hex_data(raw);
         #[cfg(test)]
         if let Some(tap) = &self.tap {
-            (tap.0)(RpcEvent::Broadcast);
+            (tap.0)(RpcEvent::Broadcast {
+                signed: signed.clone(),
+            });
         }
-        self.call("eth_sendRawTransaction", json!([hex_data(raw)]))
-            .await?;
+        self.call("eth_sendRawTransaction", json!([signed])).await?;
         Ok(())
     }
 

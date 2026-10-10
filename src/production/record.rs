@@ -12,9 +12,16 @@
 //! as `<name>-2.json`, `<name>-3.json`. The venue's clock replies are not
 //! saved: they would take the name of the call they come before. A reply no
 //! case named is saved as `unnamed-<n>-<path>.json`.
+//!
+//! A transaction a call sends is kept beside those, since the node's replies
+//! never hold it ([`Recorder::keep`]): the signed bytes as
+//! `<step>-<name>-signed.hex` (written before the send, so a swap that never
+//! lands has them) and the node's whole reply to the send as
+//! `<step>-<name>-send-reply.json`. They are not replies of a venue: no
+//! `.status`, and they never become a line's `body_file`.
 
 use anyhow::{bail, Context, Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -93,9 +100,21 @@ struct State {
     written: BTreeSet<String>,
     /// The first file the current call wrote.
     first_file: Option<String>,
+    /// How many of each kind of thing the current call sent has been kept.
+    kept: BTreeMap<&'static str, u32>,
     /// The first thing that went wrong. A run that could not record what it was
     /// asked to record stops.
     failure: Option<String>,
+}
+
+/// What a call sends, or what the node answers to the send, kept beside the
+/// call's replies: a transaction is ours before it is anyone's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kept {
+    /// The signed transaction, as the hex `eth_sendRawTransaction` was given.
+    Signed,
+    /// The node's whole JSON-RPC reply to that send.
+    SendReply,
 }
 
 pub(crate) struct Recorder {
@@ -140,11 +159,14 @@ impl Recorder {
         }
         state.current = Some((stem.to_string(), 0));
         state.first_file = None;
+        state.kept.clear();
     }
 
     /// The current call is over: later replies are no one's.
     pub(crate) fn end_call(&self) {
-        self.state.lock().unwrap().current = None;
+        let mut state = self.state.lock().unwrap();
+        state.current = None;
+        state.kept.clear();
     }
 
     /// The file the current (or last) named call's first reply went to.
@@ -155,6 +177,44 @@ impl Recorder {
     /// What went wrong, if anything did.
     pub(crate) fn failure(&self) -> Option<String> {
         self.state.lock().unwrap().failure.clone()
+    }
+
+    /// Keeps what the current call sent, or the node's reply to the send, as
+    /// `<stem>-signed.hex` and `<stem>-send-reply.json` (`-2`, `-3` for a call that
+    /// sends more than once). They are not replies of the venue: no `.status`, and
+    /// not the call's `first_file`. A send no case named is
+    /// `unnamed-<n>-signed.hex`, numbered with the replies nobody named.
+    pub(crate) fn keep(&self, what: Kept, contents: &str) {
+        let (kind, extension) = match what {
+            Kept::Signed => ("signed", "hex"),
+            Kept::SendReply => ("send-reply", "json"),
+        };
+        let mut state = self.state.lock().unwrap();
+        let stem = match state.current.as_ref() {
+            Some((stem, _)) => stem.clone(),
+            None => {
+                state.unnamed += 1;
+                format!("unnamed-{}", state.unnamed)
+            }
+        };
+        let count = state.kept.entry(kind).or_insert(0);
+        *count += 1;
+        let file = if *count == 1 {
+            format!("{stem}-{kind}.{extension}")
+        } else {
+            format!("{stem}-{kind}-{count}.{extension}")
+        };
+        if !state.written.insert(file.clone()) {
+            state
+                .failure
+                .get_or_insert(format!("{file} was recorded twice"));
+            return;
+        }
+        if let Err(err) = std::fs::write(self.dir.join(&file), contents) {
+            state
+                .failure
+                .get_or_insert(format!("writing {file}: {err}"));
+        }
     }
 
     /// Saves a reply. The venue's clock replies are skipped.
@@ -332,6 +392,60 @@ mod tests {
                 "unnamed-1-api-v3-account.json",
                 "unnamed-1-api-v3-account.status",
             ]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn what_a_call_sent_is_kept_beside_its_replies_numbered_like_them() {
+        let dir = scratch("kept");
+        let recorder = Recorder::create(&dir).unwrap();
+
+        recorder.name_next("001-swap");
+        recorder.keep(Kept::Signed, "0xaa");
+        recorder.keep(
+            Kept::SendReply,
+            r#"{"id":1,"jsonrpc":"2.0","result":"0x11"}"#,
+        );
+        // A second send in the call is a second pair.
+        recorder.keep(Kept::Signed, "0xbb");
+        recorder.keep(Kept::SendReply, r#"{"error":{"code":-32000}}"#);
+        recorder.end_call();
+        // A send no case named is kept too, under the same counter as a reply.
+        recorder.keep(Kept::Signed, "0xcc");
+
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+        assert_eq!(read("001-swap-signed.hex"), "0xaa");
+        assert_eq!(read("001-swap-signed-2.hex"), "0xbb");
+        assert_eq!(
+            read("001-swap-send-reply.json"),
+            r#"{"id":1,"jsonrpc":"2.0","result":"0x11"}"#
+        );
+        assert_eq!(
+            read("001-swap-send-reply-2.json"),
+            r#"{"error":{"code":-32000}}"#
+        );
+        assert_eq!(read("unnamed-1-signed.hex"), "0xcc");
+        // They are not replies: no status file, and none of them is `first_file`.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 5);
+        assert_eq!(recorder.first_file(), None);
+        assert_eq!(recorder.failure(), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_kept_file_is_never_overwritten() {
+        let dir = scratch("kept-twice");
+        let recorder = Recorder::create(&dir).unwrap();
+        recorder.name_next("001-swap");
+        recorder.keep(Kept::Signed, "0xaa");
+        recorder.end_call();
+        recorder.name_next("001-swap");
+        recorder.keep(Kept::Signed, "0xbb");
+        assert!(recorder.failure().unwrap().contains("recorded twice"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("001-swap-signed.hex")).unwrap(),
+            "0xaa"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -6,7 +6,7 @@
 //! remembers why ([`Gate::take_held`]) so that the run can write the right
 //! verdict: `skipped` for a dry run, `halted` for the halt file.
 
-use crate::production::record::Recorder;
+use crate::production::record::{Kept, Recorder};
 use crate::production::wire::{Call, Held, Wire};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -146,6 +146,13 @@ impl Gate {
     pub(crate) fn record_as(&self, stem: &str) {
         if let Some(recorder) = &self.recorder {
             recorder.name_next(stem);
+        }
+    }
+
+    /// Keeps what the call sent, or the node's reply to the send (record mode).
+    pub(crate) fn keep(&self, what: Kept, contents: &str) {
+        if let Some(recorder) = &self.recorder {
+            recorder.keep(what, contents);
         }
     }
 

@@ -50,9 +50,10 @@ use crate::production::chain_checks::{
     x6_landing, Quote, SwapFacts,
 };
 use crate::production::env::{positive_count, positive_decimal, required, Env};
-use crate::production::gate::now_ns;
+use crate::production::gate::{now_ns, Gate};
 use crate::production::guard;
 use crate::production::lv1_base::{host_of, rpc_request, BASE_CHAIN_ID};
+use crate::production::record::Kept;
 use crate::production::results::{Expected, Tally, Verdict};
 use crate::production::wire::Wire;
 use crate::production::{CallSpec, Grade, Run};
@@ -352,8 +353,10 @@ impl Sampler {
 }
 
 /// What the tap on the node's client saw.
-#[derive(Default)]
 struct Taps {
+    /// Where the signed transactions and the node's replies to their sends are
+    /// kept, when the run records.
+    gate: Arc<Gate>,
     /// When a transaction was about to be broadcast, in order.
     broadcasts: Mutex<Vec<u128>>,
     /// The first time a receipt poll found each transaction.
@@ -361,10 +364,24 @@ struct Taps {
 }
 
 impl Taps {
+    fn new(gate: Arc<Gate>) -> Self {
+        Self {
+            gate,
+            broadcasts: Mutex::default(),
+            first_seen: Mutex::default(),
+        }
+    }
+
     fn tap(self: &Arc<Self>) -> RpcTap {
         let taps = Arc::clone(self);
         RpcTap::new(move |event| match event {
-            RpcEvent::Broadcast => taps.broadcasts.lock().unwrap().push(now_ns()),
+            RpcEvent::Broadcast { signed } => {
+                // Kept before the send, so that a swap that never lands has its
+                // bytes; its time is taken after, so that the write is not in it.
+                taps.gate.keep(Kept::Signed, &signed);
+                taps.broadcasts.lock().unwrap().push(now_ns());
+            }
+            RpcEvent::SendReply { response } => taps.gate.keep(Kept::SendReply, &response),
             RpcEvent::Receipt { hash, found: true } => {
                 taps.first_seen
                     .lock()
@@ -551,7 +568,7 @@ impl<'a> Lv2bChain<'a> {
     /// The node is not an anvil, the sender connects on Base, and the token and
     /// pool facts are read. `None` ends the run, with the line that says why.
     async fn setup(&self, url: &str, host: &str, signer: Signer) -> Result<Option<Ctx>> {
-        let taps = Arc::new(Taps::default());
+        let taps = Arc::new(Taps::new(Arc::clone(self.run.gate())));
         let rpc = EvmRpc::with_request_timeout(url.to_string(), self.request_timeout)
             .with_tap(taps.tap());
         // The node is not an anvil. A node with no `web3_clientVersion` is not one.
@@ -2564,6 +2581,94 @@ mod tests {
             let body = std::fs::read_to_string(entry.unwrap().path()).unwrap();
             assert!(!body.contains(lab.key.key_hex()) && !body.contains(KEY_IN_PATH));
         }
+        lab.setup.clean_up();
+    }
+
+    /// The signed bytes are ours before they are the node's, and a swap that
+    /// never lands is the one whose bytes matter most: they are kept beside each
+    /// approval and swap, with the node's whole reply to the send.
+    #[tokio::test]
+    async fn record_mode_keeps_each_signed_transaction_and_the_nodes_reply_to_its_send() {
+        let lab = Lab::new("signed", Knobs::default()).await;
+        let record = lab.setup.record.display().to_string();
+        let lab = lab.with("VP_RECORD_DIR", &record);
+        let played = play(&lab, 1).await;
+        assert!(played.clean);
+
+        let sent: Vec<String> = lab
+            .chain
+            .asked()
+            .into_iter()
+            .filter(|(method, _)| method == "eth_sendRawTransaction")
+            .map(|(_, params)| params[0].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(sent.len(), 2, "the approval, then the swap");
+        let dir = &lab.setup.record;
+        let read = |name: String| std::fs::read_to_string(dir.join(name)).unwrap();
+        for (stem, raw) in [("001-approve", &sent[0]), ("001-swap", &sent[1])] {
+            assert_eq!(&read(format!("{stem}-signed.hex")), raw, "{stem}");
+            let reply: Value =
+                serde_json::from_str(&read(format!("{stem}-send-reply.json"))).unwrap();
+            assert!(
+                reply["result"]
+                    .as_str()
+                    .is_some_and(|hash| hash.starts_with("0x")),
+                "{stem}: {reply}"
+            );
+        }
+        // The swap's reply names the hash its line names.
+        let reply: Value =
+            serde_json::from_str(&read("001-swap-send-reply.json".to_string())).unwrap();
+        assert_eq!(reply["result"], played.swaps()[0]["references"]["tx_hash"]);
+        // The swap's line still points at the receipt, its reply's first file.
+        assert_eq!(played.swaps()[0]["body_file"], "001-swap.json");
+        // The key signs; it is in none of the bytes.
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let body = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            assert!(!body.contains(lab.key.key_hex()));
+        }
+        lab.setup.clean_up();
+    }
+
+    /// The case the bytes are kept for: a swap the node accepted and never mined
+    /// has a hash and no receipt, and its raw transaction is nowhere else.
+    #[tokio::test]
+    async fn a_swap_that_never_lands_still_has_its_signed_bytes_and_the_nodes_reply() {
+        let lab = Lab::new(
+            "lost",
+            Knobs {
+                never_mines_swap: true,
+                ..Knobs::default()
+            },
+        )
+        .await;
+        let record = lab.setup.record.display().to_string();
+        let lab = lab.with("VP_RECORD_DIR", &record);
+        let played = play_tuned(&lab, 1, |chain| {
+            chain.confirm_timeout = Duration::from_millis(150);
+        })
+        .await;
+        assert!(!played.clean);
+
+        let sent: Vec<String> = lab
+            .chain
+            .asked()
+            .into_iter()
+            .filter(|(method, _)| method == "eth_sendRawTransaction")
+            .map(|(_, params)| params[0].as_str().unwrap().to_string())
+            .collect();
+        let dir = &lab.setup.record;
+        assert_eq!(
+            std::fs::read_to_string(dir.join("001-swap-signed.hex")).unwrap(),
+            sent[1]
+        );
+        let reply: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("001-swap-send-reply.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reply["result"], played.swaps()[0]["references"]["tx_hash"]);
+        // No receipt was ever served, so the swap has no body of its own.
+        assert!(!dir.join("001-swap.json").exists());
         lab.setup.clean_up();
     }
 

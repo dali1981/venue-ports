@@ -1507,7 +1507,9 @@ once the loss so far, valued at the fills' own prices, plus the order's whole no
 value the ledger cannot compute (a commission paid in BNB, a quote asset that is not USD) stops the run and is
 never counted as zero. `VP_HALT_FILE` is checked before every call. `VP_DRY_RUN=1` prints each call (method,
 path, parameters; no key, signature or timestamp) and sends nothing. `VP_RECORD_DIR` saves each reply
-byte for byte but for the account's `uid`. `VP_OUT` receives `results.jsonl`, one line per call: the
+byte for byte but for the account's `uid`; LV2b also keeps, beside each approval and swap, the signed
+transaction (`<step>-<name>-signed.hex`, written before the send) and the node's whole reply to the send
+(`<step>-<name>-send-reply.json`), so that a swap that never lands still has its bytes. `VP_OUT` receives `results.jsonl`, one line per call: the
 request, the outcome (`ok`, `refused`, `lost`, `not_sent`), what was expected, a verdict (`pass`, `fail`,
 `skipped`, `halted`, or **`unmapped`**, a reply in no row of the catalogue, which fails the run), and, for a
 call that trades, the `references` a consumer needs to split a slippage into its terms: the touch at send,
