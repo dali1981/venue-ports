@@ -2,6 +2,17 @@
 
 Open questions for whoever owns the spec, found while building it. Each says what was done meanwhile.
 
+**Status, 10 October 2026** (what the owner has settled, and what is still open):
+
+| Question | Status |
+| --- | --- |
+| Q1, Q2 | open: the testnet recording is not in this repository; it comes in with the owner's reading of `01-account.json` (the public repository holds an account's balances) |
+| Q3 | **open**: the router's ABI is still from memory; the owner checks the verified source at `VP_ROUTER` before LV2b. The self-tests share the definitions with the mock and cannot catch it |
+| Q4 | kept as built; LV1's B9 reads the account's commission rates first and LV2a's E4 is the first test of the formula: if E4 fails with a plausible number, the formula or its rounding is the suspect |
+| Q6 | fixed: the spec's "Done when" says `VP_DRY_RUN=1` |
+| Q8 | **fixed** in `85e7e97`: `inclusion_block` is set only for a swap that succeeded or reverted; the tests failed first |
+| Q9 | accepted: the spec's "Done when" now says a dry run prints every call that does not depend on an earlier read |
+
 ## Q1. The testnet recording is not in the repository
 
 Step 2 says to copy "the consumer's recording of Binance's spot testnet (7 October 2026, 34 files,

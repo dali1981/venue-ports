@@ -365,8 +365,10 @@ Each step compiled and tested before the next. Offline tests only.
 **Done when:** `cargo fmt --check`, `cargo clippy --all-targets` and `cargo test` (offline) are clean and
 every figure that was in the suite before is unchanged; every case above has a passing and a failing
 self-test; `cargo test --lib production -- --ignored --list` lists `production_lv1_binance`,
-`production_lv1_base`, `production_lv2a_exchange` and `production_lv2b_chain`; `DRY_RUN=1` of each prints its
-calls and sends none; the catalogue test passes; the six `TODO(R2)` markers are gone.
+`production_lv1_base`, `production_lv2a_exchange` and `production_lv2b_chain`; `VP_DRY_RUN=1` of each prints
+every call that does not depend on an earlier read, and sends none (a dry run makes no read, and an order or a
+swap is sized from reads, so LV2a prints its three opening reads and LV2b its first, `web3_clientVersion`:
+`specs/V7-questions.md` Q9); the catalogue test passes; the six `TODO(R2)` markers are gone.
 
 **Status when built:** written, offline-tested, **not run against a production venue**. The README row says
 exactly that.
