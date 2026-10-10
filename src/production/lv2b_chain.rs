@@ -2297,6 +2297,7 @@ mod tests {
         for absent in [
             "first_seen_ns",
             "sealed_ns",
+            "inclusion_block",
             "transaction_index",
             "block_tx_count",
             "transfer_log_indices",

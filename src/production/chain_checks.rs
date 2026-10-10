@@ -450,6 +450,12 @@ pub(crate) fn swap_references(facts: &SwapFacts<'_>) -> Value {
         .and_then(|r| r.amount_out)
         .zip(facts.quote)
         .and_then(|(out, quote)| bps_against_quote(out, quote.amount_out));
+    // `Realised.at` of a swap that timed out is the latest block when the adapter
+    // gave up waiting (or 0), not a block the swap was in: only a mined swap,
+    // which succeeded or reverted, has an inclusion block.
+    let inclusion_block = realised
+        .filter(|r| matches!(r.outcome, Outcome::Success | Outcome::Reverted { .. }))
+        .map(|r| r.at);
     json!({
         "quote_pre_send": facts.quote.map(|quote| json!({
             "amount_out": quote.amount_out.to_string(),
@@ -465,7 +471,7 @@ pub(crate) fn swap_references(facts: &SwapFacts<'_>) -> Value {
         "tx_hash": facts.tx_hash.map(|hash| hash.to_string()),
         "first_seen_ns": facts.first_seen_ns.map_or(Value::Null, ns),
         "sealed_ns": facts.sealed_ns.map_or(Value::Null, ns),
-        "inclusion_block": realised.map(|r| r.at),
+        "inclusion_block": inclusion_block,
         "transaction_index": transaction_index,
         "block_tx_count": facts.block_tx_count,
         "transfer_log_indices": transfer_log_indices,
@@ -935,6 +941,35 @@ mod tests {
         // What the swap was is known without a landing.
         assert_eq!(references["amount_in"], "10000000");
         assert_eq!(references["calldata"], "0xabcd");
+    }
+
+    /// `Realised.at` of a swap that never reached a terminal state is the latest
+    /// block when the adapter gave up (or 0), not a block the swap was in: the
+    /// reference is `null`. A revert was mined, so it keeps its block.
+    #[test]
+    fn the_inclusion_block_exists_only_for_a_swap_that_was_mined() {
+        let quote = quote();
+        for outcome in [Outcome::TimedOut, Outcome::Expired] {
+            for at in [1001, 0] {
+                let unplaced = Realised {
+                    outcome: outcome.clone(),
+                    at,
+                    ..realised()
+                };
+                let references = swap_references(&facts(Some(&quote), Some(&unplaced), None));
+                assert!(
+                    references["inclusion_block"].is_null(),
+                    "{outcome:?} at {at}: {}",
+                    references["inclusion_block"]
+                );
+            }
+        }
+        let reverted = Realised {
+            outcome: Outcome::Reverted { reason: "x".into() },
+            ..realised()
+        };
+        let references = swap_references(&facts(Some(&quote), Some(&reverted), None));
+        assert_eq!(references["inclusion_block"], 1000);
     }
 
     #[test]
