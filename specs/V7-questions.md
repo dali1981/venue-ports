@@ -6,7 +6,7 @@ Open questions for whoever owns the spec, found while building it. Each says wha
 
 | Question | Status |
 | --- | --- |
-| Q1, Q2 | open: the testnet recording is not in this repository; it comes in with the owner's reading of `01-account.json` (the public repository holds an account's balances) |
+| Q1, Q2 | closed on 10 October 2026: the testnet recording is in `fixtures/binance-spot/testnet/2026-10-07/` (the owner judged it fit for a public repository because it is the testnet; the account is the faucet's), with a row and a test for each of its 34 files (`src/cex/binance/recorded.rs`). **Added, not substituted:** no existing test was changed, so the six `documented` bodies stay (three have no counterpart in the recording, three assert figures that the recording's would change), and the LV1 and LV2a mocks still serve documented and synthetic bodies. The parsers read every recorded body as it stood; none needed a fix |
 | Q3 | **open**: the router's ABI is still from memory; the owner checks the verified source at `VP_ROUTER` before LV2b. The self-tests share the definitions with the mock and cannot catch it |
 | Q4 | kept as built; LV1's B9 reads the account's commission rates first and LV2a's E4 is the first test of the formula: if E4 fails with a plausible number, the formula or its rounding is the suspect |
 | Q6 | fixed: the spec's "Done when" says `VP_DRY_RUN=1` |

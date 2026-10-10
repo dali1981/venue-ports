@@ -13,4 +13,5 @@ A **production** recording does not belong here while the repository is public: 
 permissions, commission rates, order ids and addresses, and the `uid` is the only thing redacted (`SPEC.md` §7).
 It is kept in the consumer's private repository.
 
-Nothing here is recorded yet: see `specs/V7-questions.md`, Q1.
+`binance-spot/testnet/2026-10-07/` is the one recording so far: the spot testnet's replies to a read-only and a two-order session
+(see its `README.md`). No production recording is here.

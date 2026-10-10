@@ -17,11 +17,11 @@ A row whose origin is `documented`, `synthetic` or `not provokable` stays in the
 visible. The consumer adds its own columns in its own repository. This table is **not** called
 `provenance`, which already means `Simulated` or `Landed`.
 
-**State of the recordings.** No testnet or production body is in this repository yet. The consumer's
-recording of the spot testnet (7 October 2026, 34 files, `REDACTED-UID`) has not been supplied
-(`specs/V7-questions.md`, Q1); the six test bodies that were marked `TODO(R2)` are the `documented`
-rows below, and each is replaced by its recorded body when the recording is copied to
-`fixtures/binance-spot/testnet/2026-10-07/`.
+**State of the recordings.** The consumer's recording of the spot testnet (7 October 2026, 34 files, `REDACTED-UID`) is in
+`fixtures/binance-spot/testnet/2026-10-07/`, with the rows of its own section below. No production body is in this repository,
+and none will be while it is public (`SPEC.md` §7). The six bodies that were marked `TODO(R2)` are the `documented` rows of the
+first table; the recording replaces none of them (see the section), because it holds no counterpart for three and the other
+three were read by tests that assert their figures.
 
 | Call | Variant | Body | Origin | Test | Typed result |
 | --- | --- | --- | --- | --- | --- |
@@ -35,6 +35,50 @@ rows below, and each is replaced by its recorded body when the recording is copi
 | any | a `429` storm | — | not provokable | — | — |
 | `POST /api/v3/order` | a repeated client order id after a fill (Binance accepts it, so proving it would trade twice) | — | not provokable | — | — |
 | `POST /api/v3/order` | a partial fill, or a market order beyond the book | — | not provokable | — | — |
+
+## The spot testnet recording of 7 October 2026
+
+Seventeen replies from `https://testnet.binance.vision`, each as a `.json` body and a `.status` (`fixtures/binance-spot/testnet/2026-10-07/`,
+its `README.md`). Every body is what the venue sent but for the account's `uid`; the account is the testnet faucet's. Each is read by a test in
+`src/cex/binance/recorded.rs`, which serves it with the status its own `.status` file holds. None of the existing tests was changed: the
+`documented` rows above keep the five-trade order, the working LIMIT order and the two refusals the recording has no counterpart for.
+
+| Call | Variant | Body | Origin | Test | Typed result |
+| --- | --- | --- | --- | --- | --- |
+| `GET /api/v3/exchangeInfo?symbol=` | AEROUSDT, with its filters | `fixtures/binance-spot/testnet/2026-10-07/00-exchange-info.json` | testnet | `cex::binance::recorded::the_recorded_exchange_info_reads_as_the_rules_of_aerousdt` | `SymbolRules` |
+| `GET /api/v3/ticker/price?symbol=` | the last price (no typed read in this crate) | `fixtures/binance-spot/testnet/2026-10-07/00-ticker-price.json` | testnet | `cex::binance::recorded::the_recorded_ticker_price_is_a_symbol_and_a_decimal_in_a_string` | — |
+| `GET /api/v3/account` | the testnet account: 517 faucet balances, a non-ASCII asset among them | `fixtures/binance-spot/testnet/2026-10-07/01-account.json` | testnet | `cex::binance::recorded::the_recorded_account_reads_as_exact_balances_whatever_the_assets_are_called` | `SpotAccountBalances` |
+| `GET /api/v3/account/commission` | rates of zero and `"discountAsset": null` | `fixtures/binance-spot/testnet/2026-10-07/02-account-commission.json` | testnet | `cex::binance::recorded::the_recorded_commission_reads_with_a_null_discount_asset` | `SymbolCommission` |
+| `POST /api/v3/order/test` | `computeCommissionRates=true`, a market buy | `fixtures/binance-spot/testnet/2026-10-07/03-order-test-buy.json` | testnet | `cex::binance::recorded::the_recorded_order_tests_read_as_the_commission_rates_of_an_order` | `CommissionRates` |
+| `POST /api/v3/order/test` | `computeCommissionRates=true`, a market sell | `fixtures/binance-spot/testnet/2026-10-07/03-order-test-sell.json` | testnet | `cex::binance::recorded::the_recorded_order_tests_read_as_the_commission_rates_of_an_order` | `CommissionRates` |
+| `POST /api/v3/order` (`newOrderRespType=FULL`) | a market buy filled in one trade | `fixtures/binance-spot/testnet/2026-10-07/04-order-market-buy.json` | testnet | `cex::binance::recorded::the_recorded_market_orders_fill_as_execute_reads_them` | `CexFill` |
+| `POST /api/v3/order` (`newOrderRespType=FULL`) | a market sell filled in one trade | `fixtures/binance-spot/testnet/2026-10-07/04-order-market-sell.json` | testnet | `cex::binance::recorded::the_recorded_market_orders_fill_as_execute_reads_them` | `CexFill` |
+| `GET /api/v3/myTrades` | the trade line of the buy | `fixtures/binance-spot/testnet/2026-10-07/05-my-trades-buy.json` | testnet | `cex::binance::recorded::the_recorded_order_queries_read_as_filled_with_their_trade_lines` | `OrderState::Filled(CexFill)` |
+| `GET /api/v3/myTrades` | the trade line of the sell | `fixtures/binance-spot/testnet/2026-10-07/05-my-trades-sell.json` | testnet | `cex::binance::recorded::the_recorded_order_queries_read_as_filled_with_their_trade_lines` | `OrderState::Filled(CexFill)` |
+| `GET /api/v3/order` | the buy, `FILLED`, no fills listed | `fixtures/binance-spot/testnet/2026-10-07/05-order-query-buy.json` | testnet | `cex::binance::recorded::the_recorded_order_queries_read_as_filled_with_their_trade_lines` | `OrderState::Filled(CexFill)` |
+| `GET /api/v3/order` | the sell, `FILLED`, no fills listed | `fixtures/binance-spot/testnet/2026-10-07/05-order-query-sell.json` | testnet | `cex::binance::recorded::the_recorded_order_queries_read_as_filled_with_their_trade_lines` | `OrderState::Filled(CexFill)` |
+| `POST /api/v3/order` | `-1013` `LOT_SIZE`, a quantity under the minimum | `fixtures/binance-spot/testnet/2026-10-07/06-order-lot-size-below-min.json` | testnet | `cex::binance::recorded::the_recorded_refusals_are_venue_refusals_carrying_the_venues_code` | `VenueRefusal{code: -1013}` |
+| `POST /api/v3/order` | `-1013` `LOT_SIZE`, a quantity off the step | `fixtures/binance-spot/testnet/2026-10-07/06-order-lot-size-off-step.json` | testnet | `cex::binance::recorded::the_recorded_refusals_are_venue_refusals_carrying_the_venues_code` | `VenueRefusal{code: -1013}` |
+| `POST /api/v3/order` | `-1013` `LOT_SIZE`, a market order's quantity | `fixtures/binance-spot/testnet/2026-10-07/06-order-market-lot-size.json` | testnet | `cex::binance::recorded::the_recorded_refusals_are_venue_refusals_carrying_the_venues_code` | `VenueRefusal{code: -1013}` |
+| `POST /api/v3/order` | `-1013` `NOTIONAL`, under the minimum notional | `fixtures/binance-spot/testnet/2026-10-07/06-order-notional.json` | testnet | `cex::binance::recorded::the_recorded_refusals_are_venue_refusals_carrying_the_venues_code` | `VenueRefusal{code: -1013}` |
+| `POST /api/v3/order` | `-2010` insufficient balance | `fixtures/binance-spot/testnet/2026-10-07/07-order-insufficient-balance.json` | testnet | `cex::binance::recorded::the_recorded_refusals_are_venue_refusals_carrying_the_venues_code` | `VenueRefusal{code: -2010}` |
+| `GET /api/v3/exchangeInfo?symbol=` | the HTTP status of that reply, `200` | `fixtures/binance-spot/testnet/2026-10-07/00-exchange-info.status` | testnet | `cex::binance::recorded::every_recorded_reply_carries_the_status_its_test_serves` | the status the other tests serve it with |
+| `GET /api/v3/ticker/price?symbol=` | the HTTP status of that reply, `200` | `fixtures/binance-spot/testnet/2026-10-07/00-ticker-price.status` | testnet | `cex::binance::recorded::every_recorded_reply_carries_the_status_its_test_serves` | the status the other tests serve it with |
+| `GET /api/v3/account` | the HTTP status of that reply, `200` | `fixtures/binance-spot/testnet/2026-10-07/01-account.status` | testnet | `cex::binance::recorded::every_recorded_reply_carries_the_status_its_test_serves` | the status the other tests serve it with |
+| `GET /api/v3/account/commission` | the HTTP status of that reply, `200` | `fixtures/binance-spot/testnet/2026-10-07/02-account-commission.status` | testnet | `cex::binance::recorded::every_recorded_reply_carries_the_status_its_test_serves` | the status the other tests serve it with |
+| `POST /api/v3/order/test` | the HTTP status of that reply, `200` | `fixtures/binance-spot/testnet/2026-10-07/03-order-test-buy.status` | testnet | `cex::binance::recorded::every_recorded_reply_carries_the_status_its_test_serves` | the status the other tests serve it with |
+| `POST /api/v3/order/test` | the HTTP status of that reply, `200` | `fixtures/binance-spot/testnet/2026-10-07/03-order-test-sell.status` | testnet | `cex::binance::recorded::every_recorded_reply_carries_the_status_its_test_serves` | the status the other tests serve it with |
+| `POST /api/v3/order` (`newOrderRespType=FULL`) | the HTTP status of that reply, `200` | `fixtures/binance-spot/testnet/2026-10-07/04-order-market-buy.status` | testnet | `cex::binance::recorded::every_recorded_reply_carries_the_status_its_test_serves` | the status the other tests serve it with |
+| `POST /api/v3/order` (`newOrderRespType=FULL`) | the HTTP status of that reply, `200` | `fixtures/binance-spot/testnet/2026-10-07/04-order-market-sell.status` | testnet | `cex::binance::recorded::every_recorded_reply_carries_the_status_its_test_serves` | the status the other tests serve it with |
+| `GET /api/v3/myTrades` | the HTTP status of that reply, `200` | `fixtures/binance-spot/testnet/2026-10-07/05-my-trades-buy.status` | testnet | `cex::binance::recorded::every_recorded_reply_carries_the_status_its_test_serves` | the status the other tests serve it with |
+| `GET /api/v3/myTrades` | the HTTP status of that reply, `200` | `fixtures/binance-spot/testnet/2026-10-07/05-my-trades-sell.status` | testnet | `cex::binance::recorded::every_recorded_reply_carries_the_status_its_test_serves` | the status the other tests serve it with |
+| `GET /api/v3/order` | the HTTP status of that reply, `200` | `fixtures/binance-spot/testnet/2026-10-07/05-order-query-buy.status` | testnet | `cex::binance::recorded::every_recorded_reply_carries_the_status_its_test_serves` | the status the other tests serve it with |
+| `GET /api/v3/order` | the HTTP status of that reply, `200` | `fixtures/binance-spot/testnet/2026-10-07/05-order-query-sell.status` | testnet | `cex::binance::recorded::every_recorded_reply_carries_the_status_its_test_serves` | the status the other tests serve it with |
+| `POST /api/v3/order` | the HTTP status of that reply, `400` | `fixtures/binance-spot/testnet/2026-10-07/06-order-lot-size-below-min.status` | testnet | `cex::binance::recorded::every_recorded_reply_carries_the_status_its_test_serves` | the status the other tests serve it with |
+| `POST /api/v3/order` | the HTTP status of that reply, `400` | `fixtures/binance-spot/testnet/2026-10-07/06-order-lot-size-off-step.status` | testnet | `cex::binance::recorded::every_recorded_reply_carries_the_status_its_test_serves` | the status the other tests serve it with |
+| `POST /api/v3/order` | the HTTP status of that reply, `400` | `fixtures/binance-spot/testnet/2026-10-07/06-order-market-lot-size.status` | testnet | `cex::binance::recorded::every_recorded_reply_carries_the_status_its_test_serves` | the status the other tests serve it with |
+| `POST /api/v3/order` | the HTTP status of that reply, `400` | `fixtures/binance-spot/testnet/2026-10-07/06-order-notional.status` | testnet | `cex::binance::recorded::every_recorded_reply_carries_the_status_its_test_serves` | the status the other tests serve it with |
+| `POST /api/v3/order` | the HTTP status of that reply, `400` | `fixtures/binance-spot/testnet/2026-10-07/07-order-insufficient-balance.status` | testnet | `cex::binance::recorded::every_recorded_reply_carries_the_status_its_test_serves` | the status the other tests serve it with |
 
 ## The reads of V7 and the cases of the production tier
 
