@@ -590,6 +590,73 @@ Order of work, each step compiled and tested before the next (V5 §11):
     over a life and the spent rent equals what the new array holds. All three Whirlpool Surfpool tests
     pass; 202 unit tests pass; clippy is clean.
 
+## Phase 16 — balance reads, resolving an unknown order, a fork is `Simulated` (V6)
+
+[V6](specs/V6-balances-and-resolution.md), requested 7 October 2026 by a consumer that runs against a fork and
+the Binance spot testnet and reconciles its books to the unit (arb-searcher's M10c, F5). Its signatures are in
+`SPEC.md` §2, §5, §6, §6c, §7 and §8. Branch `m10c-balances-resolution`, from `a914b5b` (`main` on origin).
+**Not pushed and not merged; the consumer's pin moves only on the owner's word.**
+
+Order of work, each step compiled and tested before the next:
+
+1. **The sender.** `EvmSender::connect` reads `web3_clientVersion` once and is `Simulated` on anvil;
+   `EvmSender::resolve` returns a typed `TxReplacedOrDropped` for a replaced or dropped transaction, so a failed
+   read and a drop can be told apart. No EVM number moves.
+2. **`EvmBalanceReader`**: `EvmRpc::balance_at`, `EvmBalances`, `EvmBalanceStub`, `evm_balance_reader_contract`.
+3. **`SpotBalanceReader`**: `BinanceRest` and `BinanceLive` over `GET /api/v3/account?omitZeroBalances=true`,
+   `SpotBalanceStub`, `spot_balance_reader_contract`.
+4. **`EvmLive::resolve`**: `Resolution`; the swap's context kept by hash when a send ends `TimedOut`; the
+   transfer-log decoders shared with `execute`.
+5. **`CexOrders`**: `OrderState`, `BinanceLive`'s single status read and the trade lines of a fill (the code
+   `execute` uses), `NotFound` held back until `recvWindow` and the clock bound have passed for a lost request;
+   `CexStub`; `cex_orders_contract`.
+6. **Gated tests** on `EVM_ANVIL_RPC_URL`.
+
+- Done when: the contract suites pass against the stubs, the `wiremock` cases pass, the anvil tests pass on a
+  node, `cargo test`, `cargo fmt --check` and `cargo clippy` are clean, and every figure that was in the suite
+  before is unchanged.
+- **Status: built; the stub and `wiremock` criteria are met; the anvil tests are written and gated, not yet
+  run.** The Binance bodies the readers are tested on are copied from the documentation
+  (<https://github.com/binance/binance-spot-api-docs>, `rest-api.md`: account information, query order, new
+  order `FULL`), each marked `TODO(R2)` for the recorded testnet bodies. `BinanceFuturesLive` and `BybitLive`
+  have no `CexOrders`.
+- **`PriorityBid::AbovePolicyPerGas` stays refused**: `EvmSender` takes no priority bid and `EvmLive::prepare`
+  refuses one above zero by name, so a signing sender sends at its `FeePolicy` only.
+
+## Phase 17 — a production test tier, and the reads it needs (V7)
+
+[V7](specs/V7-production-validation.md), requested by a consumer about to send its first real orders and swaps,
+that wants to know before any strategy runs what each venue answers: to a request it must refuse, to a read, and
+to one small order or swap at a time. Its signatures are in `SPEC.md` §5, §6, §6d, §7 and §8. Branch
+`v7-production-validation`, from `m10c-balances-resolution` (V6). **Pushed; no pull request; nothing merged.**
+
+Order of work, each step compiled and tested before the next:
+
+1. **A review of V6** (`specs/V7-review-of-V6.md`): one defect (an `EvmLive::resolve` of a swap that landed
+   undecodable was answered again after it was decided), fixed test first; two observations (a node that cannot
+   say whether it is anvil is not read as `Landed`; an adapter's label follows its sender's provenance).
+2. **Recorded bodies and the catalogue.** `docs/responses/` and `catalogue_matches_fixtures` are in; the six
+   `TODO(R2)` bodies are `fixtures/binance-spot/documented/` files. **The consumer's testnet recording was not
+   supplied** (`specs/V7-questions.md`, Q1), so no row is `testnet` or `production` yet.
+3. **`VenueRefusal`** and `refusal_of`, attached wherever a refusal becomes an error; `Display` unchanged.
+4. **The reads**: `account_commission`, `api_restrictions`, `book_ticker`, `symbol_rules`, `recent_trades`,
+   `order_book` on `BinanceRest`; `Receipt.transaction_index`, `EvmRpc::block_transaction_count`.
+5. **The harness**: host guard, spend ledger, halt file, dry run, record mode, results writer, request hooks.
+6. **LV1**: B1 to B10 for Binance spot, C1 to C6 for Base.
+7. **LV2a**: ten exchange round trips reconciled to the unit (E1 to E6), against a stateful mock exchange.
+8. **LV2b**: sixty router swaps reconciled to the chain's own record (X1 to X6), against a stateful mock chain.
+9. **Documents**: `SPEC.md`, this plan, the README, the catalogue.
+
+- Done when: `cargo fmt --check`, `cargo clippy --all-targets` and `cargo test` are clean, every figure that was in
+  the suite before is unchanged, every case has a passing and a failing self-test, `cargo test --lib production
+  -- --ignored --list` lists the four tests, a dry run of each prints its calls and sends none, and the catalogue
+  test passes.
+- **Status: written, offline-tested, not run against a production venue.** Running the four tests needs keys,
+  money and a route to `api.binance.com` and a Base node, which a person has. What a person must also settle:
+  the Aerodrome router's verified ABI (Q3), whether the testnet recording is wanted (Q1, Q2), how an account's
+  commission rates become a trade's commission (Q4), and what the first production recording says of the
+  assumed HTTP statuses of the refusals the mock serves.
+
 ## Tracking
 
 Each phase's "Done when" line is its exit criterion. Treat §9 of `SPEC.md` as the authoritative

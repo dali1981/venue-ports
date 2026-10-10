@@ -148,6 +148,17 @@ impl BinanceRest {
         &self.client
     }
 
+    /// This client, asking `wire` before each call and telling it each reply:
+    /// how the production harness holds a call back, or records its reply.
+    #[cfg(test)]
+    pub(crate) fn with_wire(
+        mut self,
+        wire: std::sync::Arc<dyn crate::production::wire::Wire>,
+    ) -> Self {
+        self.client = self.client.with_wire(wire);
+        self
+    }
+
     /// Places a market order under `client_order_id` and returns Binance's
     /// own answer to that call. `side` is `"BUY"` or `"SELL"`; `quantity` is
     /// the venue-ready amount — rounding to the symbol's step size is

@@ -7,7 +7,7 @@ pub mod rpc;
 pub mod tx;
 
 pub use rpc::{BlockTag, EvmRpc, Receipt, RpcError, RpcLog};
-pub use tx::{EvmSender, FeePolicy, PollSettings, Signer, TxOutcome};
+pub use tx::{EvmSender, FeePolicy, PollSettings, Signer, TxOutcome, TxReplacedOrDropped};
 
 use crate::dex::EvmCall;
 use alloy_primitives::{keccak256, B256};

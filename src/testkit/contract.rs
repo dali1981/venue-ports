@@ -5,14 +5,18 @@
 //! ships and on a recurring schedule, and against `Live` only as a
 //! deliberate, human-triggered run (`SPEC.md` §7's table).
 
-use crate::cex::{CexAccount, MarginMode};
+use crate::balance::{EvmBalanceReader, SpotBalanceReader};
+use crate::cex::{CexAccount, CexOrders, MarginMode, OrderState};
 use crate::cex::{CexExecutor, CexFill, OrderRequest, OrderStateUnknown};
 use crate::dex::{DexExecutor, Outcome, RouteQuote, SwapRequest};
+use crate::evm::BlockTag;
 use crate::liquidity::{
     Deposit, DepositGuard, DepositGuardKind, LiquidityCommand, LiquidityEvent, LiquidityExecutor,
     LiquidityReport, LiquidityRequest, PositionId, Range, TokenPair,
 };
 use crate::Provenance;
+use alloy_primitives::Address;
+use rust_decimal::Decimal;
 use std::collections::HashSet;
 
 /// Whether the executor under test sends a transaction for each command,
@@ -447,6 +451,126 @@ pub async fn cex_account_contract(account: &dyn CexAccount, fixture: CexAccountC
     );
 }
 
+/// Inputs for one run of [`cex_orders_contract`]: an order the venue holds.
+#[derive(Debug, Clone)]
+pub struct CexOrdersContractFixture {
+    pub symbol: String,
+    /// The id the adapter gave the order.
+    pub client_order_id: String,
+}
+
+/// Shape assertions every `CexOrders` must satisfy (`SPEC.md` §6): a state that
+/// carries a fill carries a fill of something, shaped as a fill is
+/// ([`assert_fill_shape`]) and naming the id it was found by when it was sent;
+/// a rejection names the status it ended in. `NotFound` and `Open` carry
+/// nothing to check.
+pub async fn cex_orders_contract(orders: &dyn CexOrders, fixture: CexOrdersContractFixture) {
+    let label = "a CexOrders";
+    let state = orders
+        .order_state(&fixture.symbol, &fixture.client_order_id)
+        .await
+        .unwrap();
+    match state {
+        OrderState::Filled(fill) | OrderState::PartlyFilled(fill) => {
+            assert_fill_shape(&fill, label);
+            assert!(
+                fill.filled_qty > Decimal::ZERO,
+                "on {label}: a fill of nothing: {fill:?}"
+            );
+            if fill.provenance == Provenance::Landed {
+                assert_eq!(
+                    fill.client_order_id.as_deref(),
+                    Some(fixture.client_order_id.as_str()),
+                    "on {label}: a fill names the id it was found by"
+                );
+            }
+        }
+        OrderState::Rejected { status, .. } => {
+            assert!(!status.is_empty(), "on {label}: a rejection with no status")
+        }
+        OrderState::NotFound | OrderState::Open => {}
+    }
+}
+
+/// Inputs for one run of [`evm_balance_reader_contract`]: the accounts to read,
+/// and a block the reader can answer for.
+#[derive(Debug, Clone)]
+pub struct EvmBalanceContractFixture {
+    pub native_of: Address,
+    pub token: Address,
+    pub holder: Address,
+    /// A block whose state the reader serves.
+    pub block: u64,
+}
+
+/// Shape assertions every `EvmBalanceReader` must satisfy (`SPEC.md` §6c): a
+/// block is history, so a read at the block the fixture names gives the same
+/// answer when it is asked again, and a read at `latest` answers.
+pub async fn evm_balance_reader_contract(
+    reader: &dyn EvmBalanceReader,
+    fixture: EvmBalanceContractFixture,
+) {
+    let label = reader.label();
+    let at = BlockTag::Number(fixture.block);
+    for _ in 0..2 {
+        let native = reader.native(fixture.native_of, at).await.unwrap();
+        let again = reader.native(fixture.native_of, at).await.unwrap();
+        assert_eq!(
+            native, again,
+            "on {label}: a native balance at a named block changed between two reads"
+        );
+        let token = reader
+            .token(fixture.token, fixture.holder, at)
+            .await
+            .unwrap();
+        let again = reader
+            .token(fixture.token, fixture.holder, at)
+            .await
+            .unwrap();
+        assert_eq!(
+            token, again,
+            "on {label}: a token balance at a named block changed between two reads"
+        );
+    }
+    reader
+        .native(fixture.native_of, BlockTag::Latest)
+        .await
+        .unwrap();
+    reader
+        .token(fixture.token, fixture.holder, BlockTag::Latest)
+        .await
+        .unwrap();
+}
+
+/// Shape assertions every `SpotBalanceReader` must satisfy (`SPEC.md` §6c):
+/// no asset empty or repeated, `free` and `locked` never negative, and only
+/// assets the account holds some of are listed.
+pub async fn spot_balance_reader_contract(reader: &dyn SpotBalanceReader) {
+    let label = "a SpotBalanceReader";
+    let account = reader.balances().await.unwrap();
+    let mut seen = HashSet::new();
+    for balance in &account.balances {
+        assert!(
+            !balance.asset.is_empty(),
+            "on {label}: an asset with no name"
+        );
+        assert!(
+            seen.insert(balance.asset.clone()),
+            "on {label}: {} is listed twice",
+            balance.asset
+        );
+        assert!(
+            balance.free >= Decimal::ZERO && balance.locked >= Decimal::ZERO,
+            "on {label}: a negative balance: {balance:?}"
+        );
+        assert!(
+            balance.free + balance.locked > Decimal::ZERO,
+            "on {label}: {} is listed though the account holds none of it: {balance:?}",
+            balance.asset
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,6 +756,96 @@ mod tests {
                 CexAccountContractFixture {
                     symbol: "BTCUSDT".to_string(),
                     since_ms: 100,
+                },
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn evm_balance_stub_satisfies_the_contract() {
+        use crate::balance::EvmBalanceStub;
+
+        let (account, token, holder) = (
+            Address::new([0xAA; 20]),
+            Address::new([0x11; 20]),
+            Address::new([0xBB; 20]),
+        );
+        let stub = EvmBalanceStub::new();
+        stub.set_native(account, 5, 1_000);
+        stub.set_native(account, 9, 900);
+        stub.set_token(token, holder, 5, 77);
+
+        evm_balance_reader_contract(
+            &stub,
+            EvmBalanceContractFixture {
+                native_of: account,
+                token,
+                holder,
+                block: 7,
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn spot_balance_stub_satisfies_the_contract() {
+        use crate::balance::{SpotAccountBalances, SpotBalance, SpotBalanceStub};
+
+        let stub = SpotBalanceStub::new();
+        stub.set_balances(SpotAccountBalances {
+            balances: vec![
+                SpotBalance {
+                    asset: "AERO".to_string(),
+                    free: Decimal::new(10_500, 3),
+                    locked: Decimal::ZERO,
+                },
+                SpotBalance {
+                    asset: "USDT".to_string(),
+                    free: Decimal::ZERO,
+                    locked: Decimal::new(5, 1),
+                },
+            ],
+            update_time_ms: Some(1),
+        });
+        spot_balance_reader_contract(&stub).await;
+    }
+
+    #[tokio::test]
+    async fn cex_stub_order_states_satisfy_the_orders_contract() {
+        use crate::cex::CexFill;
+
+        let fill = |client_order_id: Option<&str>| CexFill {
+            filled_qty: rust_decimal::Decimal::from_str("4").unwrap(),
+            filled_price: rust_decimal::Decimal::from_str("150").unwrap(),
+            commission: rust_decimal::Decimal::ZERO,
+            commission_asset: "USDT".to_string(),
+            provenance: Provenance::Simulated,
+            order_ref: None,
+            client_order_id: client_order_id.map(str::to_string),
+            venue_time_ms: None,
+            trades: Vec::new(),
+        };
+        for (id, state) in [
+            ("vp-1", OrderState::Filled(fill(None))),
+            ("vp-2", OrderState::PartlyFilled(fill(None))),
+            (
+                "vp-3",
+                OrderState::Rejected {
+                    order_ref: 3,
+                    status: "REJECTED".to_string(),
+                },
+            ),
+            ("vp-4", OrderState::NotFound),
+            ("vp-5", OrderState::Open),
+        ] {
+            let stub = CexStub::new();
+            stub.program_order_state(id, state);
+            cex_orders_contract(
+                &stub,
+                CexOrdersContractFixture {
+                    symbol: "SOLUSDT".to_string(),
+                    client_order_id: id.to_string(),
                 },
             )
             .await;

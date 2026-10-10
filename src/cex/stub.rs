@@ -12,7 +12,8 @@
 //! stub copies that once it is known.
 
 use crate::cex::{
-    with_provenance, CexExecutor, CexFill, OrderRequest, OrderSide, OrderStateUnknown,
+    with_provenance, CexExecutor, CexFill, CexOrders, OrderRequest, OrderSide, OrderState,
+    OrderStateUnknown,
 };
 use crate::Provenance;
 use anyhow::{bail, Result};
@@ -27,6 +28,19 @@ use std::sync::Mutex;
 #[derive(Debug, Clone)]
 pub struct RecordedCall {
     pub request: OrderRequest,
+}
+
+/// One `order_state()` call exactly as received by the stub.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderStateCall {
+    pub symbol: String,
+    pub client_order_id: String,
+}
+
+/// One programmed answer to `order_state()`.
+enum ProgrammedState {
+    State(OrderState),
+    Error(anyhow::Error),
 }
 
 /// One programmed outcome. `StateUnknown` is completed with the request's
@@ -44,6 +58,8 @@ pub struct CexStub {
     programmed: Mutex<VecDeque<Programmed>>,
     calls: Mutex<Vec<RecordedCall>>,
     positions: Mutex<HashMap<String, Decimal>>,
+    order_states: Mutex<HashMap<String, VecDeque<ProgrammedState>>>,
+    order_state_calls: Mutex<Vec<OrderStateCall>>,
 }
 
 impl CexStub {
@@ -101,6 +117,42 @@ impl CexStub {
                 client_order_id: client_order_id.into(),
                 order_ref: None,
             });
+    }
+
+    /// Program what `order_state` answers for `client_order_id`, in the order
+    /// programmed. The last state programmed repeats for every later call, as a
+    /// venue that has settled an order keeps saying so, so a test that wants
+    /// "still open" programs `Open` once. Pair it with
+    /// [`CexStub::program_state_unknown`], whose id it names.
+    pub fn program_order_state(&self, client_order_id: impl Into<String>, state: OrderState) {
+        self.order_states
+            .lock()
+            .unwrap()
+            .entry(client_order_id.into())
+            .or_default()
+            .push_back(ProgrammedState::State(state));
+    }
+
+    /// Program one failed `order_state` read for `client_order_id`: the next
+    /// call fails with `error`, and the call after it is answered by what was
+    /// programmed next.
+    pub fn program_order_state_error(
+        &self,
+        client_order_id: impl Into<String>,
+        error: anyhow::Error,
+    ) {
+        self.order_states
+            .lock()
+            .unwrap()
+            .entry(client_order_id.into())
+            .or_default()
+            .push_back(ProgrammedState::Error(error));
+    }
+
+    /// Every `order_state` call the stub has received so far, in the order
+    /// received.
+    pub fn order_state_calls(&self) -> Vec<OrderStateCall> {
+        self.order_state_calls.lock().unwrap().clone()
     }
 
     /// Sets the signed position (negative is short) the stub holds for
@@ -163,6 +215,39 @@ impl CexExecutor for CexStub {
 
     fn label(&self) -> &'static str {
         "cex-stub"
+    }
+}
+
+#[async_trait]
+impl CexOrders for CexStub {
+    /// Answers from what the test programmed for the id, and never invents a
+    /// state: an id nothing was programmed for is an error.
+    async fn order_state(&self, symbol: &str, client_order_id: &str) -> Result<OrderState> {
+        self.order_state_calls.lock().unwrap().push(OrderStateCall {
+            symbol: symbol.to_string(),
+            client_order_id: client_order_id.to_string(),
+        });
+        let mut states = self.order_states.lock().unwrap();
+        let queue = states.get_mut(client_order_id).ok_or_else(|| {
+            anyhow::anyhow!("no order state was programmed for {client_order_id} on this stub")
+        })?;
+        // Every state but the last is used up when it is answered, and the last
+        // one repeats; an error is used up when it is answered.
+        let next = if queue.len() > 1 || matches!(queue.front(), Some(ProgrammedState::Error(_))) {
+            queue.pop_front()
+        } else {
+            match queue.front() {
+                Some(ProgrammedState::State(state)) => Some(ProgrammedState::State(state.clone())),
+                _ => None,
+            }
+        };
+        match next {
+            Some(ProgrammedState::State(state)) => Ok(state),
+            Some(ProgrammedState::Error(error)) => Err(error),
+            None => Err(anyhow::anyhow!(
+                "every order state programmed for {client_order_id} has been used"
+            )),
+        }
     }
 }
 
@@ -410,5 +495,84 @@ mod tests {
             .unwrap();
         assert_eq!(fill.filled_qty, decimal("1"));
         assert_eq!(stub.position("SOLUSDT"), None);
+    }
+
+    fn filled_fill() -> CexFill {
+        CexFill {
+            filled_qty: decimal("4"),
+            filled_price: decimal("150"),
+            commission: Decimal::ZERO,
+            commission_asset: "USDT".to_string(),
+            provenance: Provenance::Simulated,
+            order_ref: None,
+            client_order_id: None,
+            venue_time_ms: None,
+            trades: Vec::new(),
+        }
+    }
+
+    /// A state is answered until the next is programmed behind it, and the last
+    /// one repeats: a venue that has settled an order keeps saying so.
+    #[tokio::test]
+    async fn programmed_order_states_are_answered_in_order_and_the_last_repeats() -> Result<()> {
+        let stub = CexStub::new();
+        stub.program_state_unknown("vp-1");
+        stub.program_order_state("vp-1", OrderState::Open);
+        stub.program_order_state("vp-1", OrderState::Filled(filled_fill()));
+
+        let err = stub.execute(&request()).await.unwrap_err();
+        let id = err
+            .downcast_ref::<OrderStateUnknown>()
+            .map(|unknown| unknown.client_order_id.clone())
+            .ok_or_else(|| anyhow::anyhow!("an OrderStateUnknown"))?;
+
+        assert!(matches!(
+            stub.order_state("SOLUSDT", &id).await?,
+            OrderState::Open
+        ));
+        for _ in 0..3 {
+            assert!(matches!(
+                stub.order_state("SOLUSDT", &id).await?,
+                OrderState::Filled(fill) if fill.filled_qty == decimal("4")
+            ));
+        }
+        assert_eq!(
+            stub.order_state_calls(),
+            vec![
+                OrderStateCall {
+                    symbol: "SOLUSDT".to_string(),
+                    client_order_id: "vp-1".to_string()
+                };
+                4
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_programmed_read_error_fails_one_call_and_the_state_behind_it_answers() -> Result<()>
+    {
+        let stub = CexStub::new();
+        stub.program_order_state_error("vp-1", anyhow::anyhow!("the venue is unreachable"));
+        stub.program_order_state("vp-1", OrderState::NotFound);
+
+        let err = stub.order_state("SOLUSDT", "vp-1").await.unwrap_err();
+        assert!(err.to_string().contains("unreachable"));
+        assert!(matches!(
+            stub.order_state("SOLUSDT", "vp-1").await?,
+            OrderState::NotFound
+        ));
+        Ok(())
+    }
+
+    /// The stub never invents a state: an id nothing was programmed for is an
+    /// error, not `NotFound`.
+    #[tokio::test]
+    async fn an_id_nothing_was_programmed_for_is_an_error_not_a_state() {
+        let err = CexStub::new()
+            .order_state("SOLUSDT", "vp-1")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no order state was programmed"));
     }
 }

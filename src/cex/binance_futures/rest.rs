@@ -127,6 +127,7 @@ impl BinanceFuturesRest {
             .client
             .signed(Method::GET, "/fapi/v1/positionSide/dual", &[])
             .await
+            .map_err(anyhow::Error::from)
             .context("reading the account's position mode")?;
         if mode.dual_side_position {
             bail!(
@@ -139,6 +140,7 @@ impl BinanceFuturesRest {
             .client
             .signed(Method::GET, "/fapi/v1/multiAssetsMargin", &[])
             .await
+            .map_err(anyhow::Error::from)
             .context("reading the account's margin mode")?;
         if margin.multi_assets_margin {
             bail!(
@@ -152,6 +154,7 @@ impl BinanceFuturesRest {
                 .client
                 .signed(Method::GET, "/fapi/v1/feeBurn", &[])
                 .await
+                .map_err(anyhow::Error::from)
                 .context("reading the account's BNB fee setting")?;
             if fee.fee_burn {
                 bail!(

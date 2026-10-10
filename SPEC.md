@@ -24,7 +24,7 @@ This crate does **not**:
 - decide whether a trade is worth taking, or size one;
 - track positions, balances, or capital — hold, compute, or cache them — or enforce any risk policy.
   *Reading* what a venue reports about an account, at the moment it is asked, is not tracking:
-  nothing is kept between calls and nothing is derived (§6b);
+  nothing is kept between calls and nothing is derived (§6b, §6c);
 - persist anything — every call returns a value; what the caller does with it (log it, write it to a
   database, throw it away) is entirely the caller's concern;
 - know anything about a specific trading strategy. A market-making system, a directional system, and
@@ -469,6 +469,45 @@ pub trait DexExecutor: Send + Sync {
 `Stub` is chain-family-agnostic and is not duplicated per chain. The trait does not change for a
 second family: only `Prepared`, `Outcome` and `TxCost` gained the Solana forms above.
 
+### Resolving a swap left unknown
+
+An `EvmLive` send that ends `Outcome::TimedOut` is not over. `EvmLive` keeps what it needs to read the
+swap's result by the transaction's hash, until the chain has decided it, and a caller asks again:
+
+```rust
+// src/dex/mod.rs
+/// What became of a swap whose adapter gave up waiting, as the chain says now.
+#[derive(Debug, Clone)]
+pub enum Resolution {
+    /// Not decided: the node still knows the transaction, or its nonce is unused and another node may yet
+    /// broadcast it. Ask again.
+    Pending,
+    /// It ended: mined, a revert included. A success carries `amount_in` and `amount_out` read exactly as a
+    /// sent swap's are (what the pool took is what is booked).
+    Done(Realised),
+    /// Replaced or dropped, and did not land.
+    Gone,
+}
+
+// src/dex/evm/live.rs
+impl EvmLive {
+    /// `tx_hash` is the hash an `execute` of this adapter ended `TimedOut` with (`Realised.tx_ref`).
+    pub async fn resolve(&self, tx_hash: B256) -> Result<Resolution>;
+}
+```
+
+- `Gone` is only for a transaction the node no longer knows whose nonce has been used. `EvmSender::resolve`
+  returns an `Err` for that and for a failed RPC read; the first is a `TxReplacedOrDropped` (found with
+  `downcast_ref`, with the message it always had), the second leaves the sender's latch intact and is an `Err`
+  of `EvmLive::resolve` too. A failed read is never `Gone`.
+- A hash this adapter did not time out is an `Err`. Resolve through `EvmLive`, not through the sender: the
+  sender's `resolve` clears its latch and hands the outcome to its caller, after which `EvmLive::resolve` of
+  that hash is an `Err`.
+- `Done`'s amounts come from the same transfer-log decoders `execute` uses. A swap that landed with logs they
+  cannot read is an `Err`, as from `execute`, and one answer only: it is decided, so it is forgotten, and
+  `resolve` of that hash again is an `Err` saying there is nothing to resolve.
+- A swap's context is kept in memory only: after a restart there is nothing to resolve through.
+
 ### The EVM sender — one per wallet and chain
 
 Every adapter that sends from an EVM wallet (`EvmLive`, and `EvmLiquidity` in §5b) sends through the
@@ -496,11 +535,14 @@ pub enum TxOutcome {
 pub struct FeePolicy { pub base_fee_multiplier: u32, pub fallback_priority_fee_wei: u128 }
 
 impl EvmSender {
-    /// Checks `eth_chainId` against `chain_id`. Returns an error if this
-    /// process already holds an `EvmSender` for the same (address, chain_id).
+    /// Checks `eth_chainId` against `chain_id`, and reads `web3_clientVersion` once: a node that reports
+    /// `anvil` makes this sender `Simulated`. Returns an error if this process already holds an
+    /// `EvmSender` for the same (address, chain_id).
     pub async fn connect(rpc: EvmRpc, signer: Signer, chain_id: u64, fees: FeePolicy) -> Result<Arc<Self>>;
     pub fn address(&self) -> Address;
     pub fn chain_id(&self) -> u64;
+    /// `Simulated` for a fork sender, and for a signing sender whose node is anvil; `Landed` otherwise.
+    pub fn provenance(&self) -> Provenance;
 
     /// Build, sign, broadcast and poll one transaction to a terminal
     /// outcome, holding the send lock throughout. Returns an error without
@@ -519,7 +561,8 @@ impl EvmSender {
     /// clears it. Returns `None` if it is still pending. Once the node no
     /// longer knows the hash and the account's `latest` nonce has moved past
     /// it, it was replaced or dropped: that is reported as an error naming the
-    /// hash, and the hash is cleared.
+    /// hash (a `TxReplacedOrDropped`), and the hash is cleared. A failed read is another error and
+    /// leaves the hash.
     pub async fn resolve(&self) -> Result<Option<TxOutcome>>;
 
     /// The node this sender talks to, for reads alongside its sends.
@@ -544,6 +587,22 @@ Rules:
 - **Nothing is sent over an unresolved timeout.** After a `TimedOut`, every send is refused until
   `resolve` has cleared the hash. This makes `Outcome::TimedOut`'s "resolve before anything else" rule
   impossible to skip.
+- **A fork never reads as a landing.** `connect` reads `web3_clientVersion` once and keeps the answer. A
+  node whose version starts with `anvil` makes the sender `Simulated`, so every outcome an adapter reports
+  through it says so, and a fork run signed with a real key cannot be read as a mainnet trade. A node that
+  answers that it has no such method (`-32601`) is not anvil, which has it. Any other answer that is not a
+  version (another error object, a rate limit or a gateway's refusal included, or no answer at all) is an
+  error, because the sender could not say what it sends to: it does not guess `Landed`. A signing sender
+  still never writes a balance (`ensure_balance`), anvil included.
+- **An adapter's label follows its sender's provenance.** `EvmLive` is `"evm-live"` or `"evm-live-fork"`,
+  `EvmLiquidity` `"evm-liquidity-live"` or `"evm-liquidity-fork"`: a signing sender on anvil is `Simulated`, so
+  it carries the `-fork` label, as a fork sender does. Nothing in the crate branches on a label.
+- **A landing's position is read, not inferred.** `Receipt.transaction_index` is the receipt's
+  `transactionIndex` (`None` when the node leaves it out; a value that is not a hex quantity is an error), and
+  `EvmRpc::block_transaction_count(block)` is `eth_getBlockTransactionCountByNumber` (a block the node does
+  not have is an error naming it, never a count of zero). Nothing reads them but the production tier (§7).
+- **The sender prices a transaction by its `FeePolicy` alone.** It takes no priority bid: `EvmLive` refuses
+  `PriorityBid::AbovePolicyPerGas` above zero, by name, over a signing sender and a fork sender alike.
 - **No convenience constructor builds a sender inside an adapter.** It would make a second sender for
   the same wallet the easy thing to write.
 
@@ -1040,6 +1099,32 @@ and whatever else is in the chain, `OrderStateUnknown` included, is still found 
 it attaches the provenance with `with_provenance` when it returns the error. (`{:#}` of an error tagged
 after the fact says its top-level message twice; an `OrderStateUnknown` this crate builds does not.)
 
+**A refusal is typed.** When the venue read a request and refused it, it did not act on it, and the error's
+chain holds a `VenueRefusal`:
+
+```rust
+// src/cex/mod.rs
+pub struct VenueRefusal {
+    pub status: u16,
+    /// The venue's own code, when the body carried one (Binance: -1013, -2010, -2015, -1021, …).
+    pub code: Option<i64>,
+    pub msg: String,
+}                                                                   // Display, std::error::Error
+pub fn refusal_of(err: &anyhow::Error) -> Option<&VenueRefusal>;    // found with downcast_ref
+```
+
+A caller that must act differently on `-2010` (no balance), `-2015` (key, IP or permission) and `-1021`
+(clock) reads the code instead of searching the error's text. It is a layer of the chain, as
+`ErrorProvenance` is, and **the error's `Display` is unchanged**: `refused (HTTP 400, code -1013): …`, the
+text a caller that matched on it still sees. `downcast_ref::<OrderStateUnknown>()` finds what it found.
+It is attached wherever a refusal becomes an error: the order path (`execute`), `test_order`,
+`order_state`, the account and balance reads, every read of §6d, and the futures client, which shares the
+signed client. A reply that was lost (`Lost`) and a request that was never sent (`NotSent`) are **not**
+refusals: the venue may have acted on the first and says nothing of the second. (`ApiError`, the client's
+own type, is not a `std::error::Error`: it becomes an `anyhow::Error` through one `From`, so a call that
+forgets to convert does not compile. `BybitLive` has its own client and error type and carries no
+`VenueRefusal`.)
+
 ### Required implementations (CEX)
 
 - **`CexLive`** — places a real order against a venue's trading API. Responsible for: rounding
@@ -1120,6 +1205,48 @@ after the fact says its top-level message twice; an `OrderStateUnknown` this cra
 A second venue (a different exchange, with a different wire protocol) gets its own `Live`
 implementation; the trait does not change.
 
+### Resolving an order left unknown
+
+An `OrderStateUnknown` names an order the venue may have filled. `CexOrders` asks the venue again, by the
+client order id the adapter itself gave it:
+
+```rust
+// src/cex/orders.rs
+#[derive(Debug, Clone)]
+pub enum OrderState {
+    /// Ended `FILLED`: the whole fill.
+    Filled(CexFill),
+    /// Ended with part filled and the rest not (`EXPIRED`, `CANCELED`, `EXPIRED_IN_MATCH`: a market order
+    /// that ran out of book, for example). What `execute` returns as a partial `CexFill`.
+    PartlyFilled(CexFill),
+    /// Ended with nothing filled: the venue accepted the order and it ended in `status`.
+    Rejected { order_ref: u64, status: String },
+    /// The venue has no such order, and can no longer accept the request that placed it: nothing filled.
+    NotFound,
+    /// Not settled: still working, or the venue does not know it yet and could still accept the lost
+    /// request. Ask again.
+    Open,
+}
+
+#[async_trait]
+pub trait CexOrders: Send + Sync {
+    async fn order_state(&self, symbol: &str, client_order_id: &str) -> Result<OrderState>;
+}
+```
+
+- **One read, no waiting.** The same status query `execute` follows an order with, once, and the trade lines
+  of a fill read as `execute` reads them. The caller sets the schedule.
+- **`Err` is a read that failed.** Ask again. It is never `NotFound`.
+- **`NotFound` is conclusive only after `recvWindow` and the clock's error bound have passed** since the
+  request that placed the order was signed. `BinanceLive` remembers that moment for each placing request whose
+  answer it lost, until the order's state has been read; "no such order" before then is `Open`. For an id it
+  holds no lost request for, "no such order" is `NotFound` at once.
+- No caller chooses a client order id, so a resolver cannot turn a resend into a first send; Binance refuses a
+  reused id only while the first order is open.
+- `BinanceLive` and `CexStub` implement it. `BinanceFuturesLive` and `BybitLive` do not. It has no `label()`:
+  both already have one from `CexExecutor`, and a second would make `adapter.label()` ambiguous wherever both
+  traits are in scope.
+
 ## 6b. Reading a perp account
 
 A consumer holding a perp position needs three facts only the venue knows: the position the venue
@@ -1193,6 +1320,86 @@ account was read, testnet or production, is the adapter's `label()` and base URL
   position per symbol; more than one row for a symbol is an error, never a sum.
 - **`CexAccountStub`** — programmable values and errors; records its calls.
 
+## 6c. Reading balances
+
+A consumer that keeps its own books reconciles them against what a venue holds. The `BalanceReader` port is
+one trait per kind of account: the figure the venue reports, at the moment (and, on EVM, the block) it is
+asked, exact. Nothing is cached, summed or valued (§2).
+
+```rust
+// src/balance/mod.rs
+#[async_trait]
+pub trait EvmBalanceReader: Send + Sync {
+    /// `address`'s native balance in wei at `block`.
+    async fn native(&self, address: Address, block: BlockTag) -> Result<ChainAmount>;
+    /// `holder`'s `balanceOf` of `token` at `block`.
+    async fn token(&self, token: Address, holder: Address, block: BlockTag) -> Result<ChainAmount>;
+    fn label(&self) -> &'static str;
+}
+
+pub struct SpotBalance { pub asset: String, pub free: Decimal, pub locked: Decimal }
+
+pub struct SpotAccountBalances {
+    /// Only assets the account holds some of: an asset that is absent is held at zero.
+    pub balances: Vec<SpotBalance>,
+    /// The venue's time of the account's last change (`updateTime`), in Unix ms.
+    pub update_time_ms: Option<u64>,
+}
+
+#[async_trait]
+pub trait SpotBalanceReader: Send + Sync {
+    async fn balances(&self) -> Result<SpotAccountBalances>;
+}
+```
+
+`SpotBalanceReader` has no `label()`, for the reason `CexOrders` has none: `BinanceLive` already has one.
+
+- An amount above `u128` is an error naming the token and holder, never truncated.
+- A read at a past block needs a node that serves that state (an archive node, or a fork that holds the
+  history); a node that cannot is an `Err`, never the latest value.
+- `locked` is what an open order holds: still the account's.
+- Reads carry no `Provenance`: nothing is sent.
+
+### Required implementations (balance reads)
+
+- **`EvmBalances`** — over an `EvmRpc`: `eth_getBalance` and `balanceOf` at the block named
+  (`EvmRpc::balance_at`; `balance` is `Latest`).
+- **`BinanceRest`, `BinanceLive`** (spot) — `GET /api/v3/account?omitZeroBalances=true`, through the signed
+  client, so the clock and the error rule are the order path's.
+- **`EvmBalanceStub`, `SpotBalanceStub`** — programmable values and errors; the EVM stub records its calls and
+  the spot stub counts them. The EVM
+  stub answers from a history (a value set at block `b` holds until a later block sets another); a read before
+  the first value is an error, never zero.
+
+## 6d. Binance spot: the rates, the key and the market
+
+A production run needs six answers the order path did not give: what the account pays on a symbol, what
+the key may do, the top of the book and its levels, a symbol's rules as a typed read, and the trades the
+venue lists. Each is an inherent method of `BinanceRest` (reachable from `BinanceLive` through `rest()`), as
+`test_order` is: they are Binance's own, and a second venue would motivate a trait. Nothing is sent that
+the venue would refuse after a round trip (an empty symbol, a `limit` outside what the venue accepts).
+
+| Method | Endpoint | Signed | Returns |
+|---|---|---|---|
+| `account_commission(symbol)` | `GET /api/v3/account/commission` (weight 20) | yes | `SymbolCommission { symbol, standard, special, tax: Commission, discount: CommissionDiscount }`; `Commission { maker, taker, buyer, seller }` |
+| `api_restrictions()` | `GET /sapi/v1/account/apiRestrictions` | yes; **production host only**: the testnet has no `/sapi`, and that refusal is itself a recorded case | `ApiRestrictions { ip_restrict, enable_reading, enable_withdrawals, enable_internal_transfer, enable_spot_and_margin_trading, enable_futures, enable_margin, create_time_ms: Option<u64> }` |
+| `book_ticker(symbol)` | `GET /api/v3/ticker/bookTicker` | no | `BookTicker { symbol, bid_price, bid_qty, ask_price, ask_qty }` |
+| `symbol_rules(symbol)` | `GET /api/v3/exchangeInfo?symbol=` | no | `SymbolRules { symbol, status, base_asset, quote_asset, lot_step, min_qty, min_notional: Option, apply_min_to_market: Option }`; `status == "TRADING"` is the one that trades |
+| `recent_trades(symbol, limit)` | `GET /api/v3/trades`, `limit` 1 to 1000 | no | `Vec<PublicTrade { id, price, qty, time_ms, is_buyer_maker }>` |
+| `order_book(symbol, limit)` | `GET /api/v3/depth`, `limit` 1 to 5000 | no | `OrderBookSnapshot { last_update_id, bids, asks }`, each side `(price, quantity)` best first |
+
+- **Exact.** Every price, quantity and rate is a `Decimal` parsed from the string the venue sent. A JSON
+  number where a string is documented is an error, never a float; a book side out of price order is an
+  error; `symbol_rules` is an error when the answer cannot round a quantity by (no `LOT_SIZE` filter, a
+  `stepSize` of zero) or has no row for the symbol asked.
+- **A field the venue omits** is `None`, or an error naming it, never a zero. `special` in
+  `SymbolCommission` is required, as the documentation has it; `CommissionRates`, which the order path reads
+  the same answer into, treats it as optional. If a real answer omits it, `account_commission` fails with a
+  missing-field error: `specs/V7-questions.md`.
+- **A refusal is an `Err` carrying a `VenueRefusal`** (§6). An answer that cannot be read is an `Err` that is
+  not one: the venue did not refuse it.
+- **Reads carry no `Provenance`**: nothing is sent that could trade.
+
 ## 7. Contract tests — what keeps the stub honest
 
 A stub that quietly drifts from what `Simulated`/`Live` actually do is worse than no stub: code built
@@ -1203,7 +1410,8 @@ production does.
 
 The rule that prevents it: **one shared test suite per port, written generically over "any
 `impl DexExecutor`" / "any `impl CexExecutor`" / "any `impl LiquidityExecutor`" / "any
-`impl CexAccount`"**, that every implementation must pass:
+`impl CexAccount`" / "any `impl EvmBalanceReader`" / "any `impl SpotBalanceReader`" / "any
+`impl CexOrders`"**, that every implementation must pass:
 
 ```rust
 // sketch — the real suite lives in `src/testkit/contract.rs`
@@ -1238,6 +1446,9 @@ The suites, all in `src/testkit/contract.rs`:
 | `cex_spot_rejects_reduce_only` | every spot `CexExecutor` | `reduce_only: true` is an error, and nothing reaches the venue |
 | `liquidity_executor_contract` | every `LiquidityExecutor`: `LiquidityStub`, `EvmLiquidity` on anvil, `WhirlpoolLiquidity` on Surfpool, and a consumer's paper model | the sequence below |
 | `cex_account_contract` | every `CexAccount` | `isolated_margin.is_some() == (margin_mode == Isolated)`; `qty == 0` implies no liquidation price; funding sorted by `ts_ms`, every `ts_ms >= since_ms`, no repeated `venue_ref`; `asset` never empty |
+| `evm_balance_reader_contract` | every `EvmBalanceReader` | a read at a named block twice gives the same answer; `Latest` answers |
+| `spot_balance_reader_contract` | every `SpotBalanceReader` | no asset empty or repeated; `free` and `locked` never negative |
+| `cex_orders_contract` | every `CexOrders` | a fill's shape (`assert_fill_shape`) with a positive quantity, naming the id it was found by when sent; a rejection names its status; `NotFound` and `Open` carry nothing to check |
 
 `liquidity_executor_contract` runs one sequence against every liquidity venue, and asserts the same
 things of each:
@@ -1272,6 +1483,69 @@ The middle row is what makes the top row trustworthy: if `Stub` and `Simulated` 
 contract, the schedule catches it before anything is built on top of a fake that stopped matching
 reality.
 
+### The production tier (V7)
+
+The `Live` row above is a human, a key and money. V7 writes down what that person runs, so that the first
+real order or swap is one small step with a guard, a ledger and a record around it, and what each venue
+answered is kept.
+
+Four tests under `src/production/`, in-crate and `#[cfg(test)]` because the signed client is `pub(crate)`,
+each `#[ignore]`d and run by hand (`cargo test --lib production_lv1_binance -- --ignored --nocapture`):
+
+| Test | What it does | Spends |
+|---|---|---|
+| `production_lv1_binance` | B1 to B10: requests the venue must refuse (no signature, a wrong one, a stale timestamp, a key from a host not whitelisted, a key that may not trade, an order under the minimum, off the lot step, on an empty wallet, an unknown symbol), `test_order`, and the reads of §6d that need no trade (B10), with `enable_withdrawals == false`, `ip_restrict == true` and `status == "TRADING"` asserted | nothing: refused, or `/order/test` |
+| `production_lv1_base` | C1 to C6 for each provider in `VP_BASE_RPC_URLS`, with a throwaway key that holds nothing: an unfunded signer, an estimate that reverts, a wrong chain id, what the provider serves, a dead node, a pool's views | nothing |
+| `production_lv2a_exchange` | ten market round trips (`VP_ROUND_TRIPS`: fewer for a pilot) on `VP_SYMBOL` of about `VP_ORDER_USD`; E1 to E6 reconcile each order to the unit against `order_state`, `myTrades`, the public trades, the balances and the commission rate | the spread and twice the commission, bounded by the ledger |
+| `production_lv2b_chain` | sixty router swaps (`VP_SWAPS`, even: fewer for a pilot) on Base, alternating direction at exponential intervals; X1 to X6 reconcile each against **an independent decoding of the raw receipt**, the signer's balances at the block before and at the block, and its nonce. The first measurement of a real L1 fee | the pool's fee, gas and the L1 fee, bounded by the ledger |
+
+**The harness** (`src/production/mod.rs`) is the same for all four. The Binance host must be exactly
+`https://api.binance.com` (the testnet, any other host and an unset variable are refused by name), and a
+node must not be on this machine or an anvil. `VP_SPEND_CAP_USD` has no default; each order's notional is
+checked against `VP_ORDER_CAP_USD` (default 12) **before it is signed**, and the ledger refuses the next call
+once the loss so far, valued at the fills' own prices, plus the order's whole notional could pass the cap. A
+value the ledger cannot compute (a commission paid in BNB, a quote asset that is not USD) stops the run and is
+never counted as zero. `VP_HALT_FILE` is checked before every call. `VP_DRY_RUN=1` prints each call (method,
+path, parameters; no key, signature or timestamp) and sends nothing. `VP_RECORD_DIR` saves each reply
+byte for byte but for the account's `uid`; LV2b also keeps, beside each approval and swap, the signed
+transaction (`<step>-<name>-signed.hex`, written before the send) and the node's whole reply to the send
+(`<step>-<name>-send-reply.json`), so that a swap that never lands still has its bytes. `VP_OUT` receives `results.jsonl`, one line per call: the
+request, the outcome (`ok`, `refused`, `lost`, `not_sent`), what was expected, a verdict (`pass`, `fail`,
+`skipped`, `halted`, or **`unmapped`**, a reply in no row of the catalogue, which fails the run), and, for a
+call that trades, the `references` a consumer needs to split a slippage into its terms: the touch at send,
+the clock around the request, the venue's own time, the average fill, the quote and the calldata, when the
+transaction was first seen and sealed, where in its block it landed. **A reference that does not exist is
+`null`, never zero.** A key, a secret, a signature or a `uid` is never written.
+
+**Every case has an offline self-test**: the same case code runs against a `wiremock` server standing in for
+the venue, once with the reply it expects (the verdict is `pass`) and once with a different one (`fail` or
+`unmapped`, and it says why). LV2a's stand-in is a stateful exchange (`MiniExchange`: an account, a public
+tape, a two-level book, the key, signature, timestamp, lot step, minimum notional and balance checks) with a
+knob for each way it can disagree with the case; LV2b's is a stateful chain (`MiniChain`: it decodes the raw
+transactions it is sent, mines a block for each, keeps the signer's balances at every block and writes the
+swap's `Transfer` logs among others that are not its own) with a knob for each of X1 to X6 and for a swap that
+is late, reverted or never mined. The case code was broken on purpose, one change at a time
+(`scripts/mutate-check.py`, about eighty changes across the four tests), and a test caught each, once two
+tests were added for what the first pass missed (a check masked by another that reads the same receipt
+field; a quote that could not be read letting the run go on), except three changes that alter nothing a run
+can tell: a sort key, a check made twice, and a message a second check had already made moot.
+
+**What the self-tests do and do not say.** They prove that the case code reads a reply as it should and
+fails when the reply differs. They do not say what Binance or a Base node answers: every body a mock serves
+is `documented` or `synthetic` in the catalogue (`docs/responses/`), the HTTP status a mock serves with a
+refusal is assumed, and the Aerodrome router's ABI is from memory (`specs/V7-questions.md`, Q3). The
+**catalogue** has one row for each call and response variant, with the body (`fixtures/`), its origin
+(`production`, `testnet`, `documented`, `synthetic`, `not provokable`), the test that parses it and the typed
+result; `catalogue_matches_fixtures` fails if a file has no row, a row has no file or a row's test does not
+read its body. A production run's `VP_RECORD_DIR` does **not** enter this
+repository while it is public: it holds the account's balances, permissions, commission rates, order ids and
+addresses (record mode redacts the `uid` and nothing else), and LV2b's also the signed transactions. The
+person who ran it reads it first and keeps it in the consumer's private repository. Its bodies come to
+`fixtures/<venue>/production/<date>/`, and their rows become `production`, only once the owner has made this
+repository private or widened the redaction, with a test, so that nothing account-specific remains.
+
+**Status: written, offline-tested, not run against a production venue.**
+
 ## 8. Module layout
 
 ```text
@@ -1279,12 +1553,18 @@ venue-ports/
 ├── Cargo.toml
 └── src/
     ├── lib.rs
+    ├── balance/              # §6c: EvmBalanceReader, SpotBalanceReader, EvmBalances, the two stubs
     ├── evm/                  # the EVM chain family's plumbing, shared by every EVM adapter (§5)
     │   ├── mod.rs
     │   ├── rpc.rs            # EvmRpc: JSON-RPC, eth_call (with `from` and state overrides),
     │   │                     # receipts, revert-reason replay, hex/ABI helpers
     │   ├── erc20.rs          # selectors; balance and allowance reads; storage-slot probing
     │   └── tx.rs             # Signer, EvmSender (signing and fork backends), TxOutcome, FeePolicy
+    ├── catalogue.rs          # §7: catalogue_matches_fixtures, keeping docs/responses honest
+    ├── production/           # §7, the production tier (test-only): the harness (guard, ledger, halt file,
+    │                         # dry run, record mode, results), LV1 (lv1_binance, lv1_base), LV2a
+    │                         # (lv2a_exchange, exchange_checks), LV2b (lv2b_chain, chain_checks) and the
+    │                         # stateful mocks they are tested against (MiniExchange, mini_chain)
     ├── network.rs            # Network (§4)
     ├── solana/               # the Solana family's plumbing (§5): rpc.rs (SolanaRpc),
     │                         # tx.rs (SolanaSender, SolanaTxOutcome), token.rs
@@ -1306,6 +1586,7 @@ venue-ports/
     ├── cex/
     │   ├── mod.rs            # CexExecutor, OrderRequest, OrderStateUnknown, CexFill
     │   ├── account.rs        # § 6b: CexAccount, PerpPosition, MarginState, FundingPayment
+    │   ├── orders.rs         # § 6: CexOrders, OrderState
     │   ├── stub.rs           # CexStub
     │   ├── account_stub.rs   # CexAccountStub
     │   ├── binance/          # shared by spot and futures:
@@ -1315,7 +1596,11 @@ venue-ports/
     │   │   │                 #   not sent / refused / lost
     │   │   ├── order.rs      #   finding an order by client order id, trade lines, the
     │   │   │                 #   one-commission-asset rule
+    │   │   ├── client/hooks.rs #   test-only request hooks: an explicit timestamp, no signature,
+    │   │   │                 #   a corrupted one; the production tier's seam into the client
     │   │   ├── rest.rs       # spot REST client
+    │   │   ├── reads.rs      # § 6d: account_commission, api_restrictions, book_ticker, symbol_rules,
+    │   │   │                 #   recent_trades, order_book
     │   │   └── live.rs       # BinanceLive (spot)
     │   ├── binance_futures/
     │   │   ├── rest.rs       # BinanceFuturesRest: signed fapi client, server-clock offset
@@ -1329,6 +1614,9 @@ venue-ports/
     └── testkit/
         └── contract.rs        # § 7's shared suites
 ```
+
+Beside `src/`: `fixtures/` (recorded and documented bodies), `docs/responses/` (the catalogue of §7) and
+`scripts/mutate-check.py` (breaks one line at a time and runs the tests that should notice).
 
 ## 9. Acceptance criteria
 

@@ -36,32 +36,63 @@
 //! is a reasonable follow-up, not required to place a correctly-rounded
 //! order today.
 //!
+//! **An order left unknown can be asked about again** ([`CexOrders`]): one status
+//! query by the client order id the adapter gave it, with the trade lines of a
+//! fill read as `execute` reads them. "No such order" is conclusive only after
+//! `recvWindow` and the clock's error bound have passed since the request that
+//! placed it was signed, so the adapter remembers when it signed each placing
+//! request whose answer it lost, until that order's state has been read; before
+//! then the order is `Open`.
+//!
 //! Not yet confirmed against the Spot Testnet: that Binance reports a
 //! market order that ran out of book as `EXPIRED` with its partial `fills`
 //! (README defect 4 asks for this check).
 
-use crate::cex::binance::order::{settled, single_commission, trade_lines, unreadable_fill};
+use crate::cex::binance::client::{ApiError, NO_SUCH_ORDER};
+use crate::cex::binance::order::{
+    is_terminal, read_order, settled, single_commission, trade_lines, unreadable_fill,
+};
 use crate::cex::binance::rest::{
     BinanceOrderResponse, BinanceRest, OrderCheck, MY_TRADES_PATH, ORDER_PATH,
 };
 use crate::cex::{
-    new_client_order_id, with_provenance, CexExecutor, CexFill, OrderRequest, OrderSide,
+    new_client_order_id, with_provenance, CexExecutor, CexFill, CexOrders, OrderRequest, OrderSide,
+    OrderState, OrderStateUnknown,
 };
 use crate::Provenance;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Instant;
 
 pub struct BinanceLive {
     rest: BinanceRest,
     /// Symbol (e.g. `"SOLUSDT"`) -> the venue's `LOT_SIZE` step for it.
     step_size: HashMap<String, Decimal>,
+    /// For each order that ended `OrderStateUnknown` after the answer to its
+    /// placing request was lost: when that request was signed, which is what
+    /// "no such order" can be told conclusive against. Removed once the order's
+    /// state has been read.
+    lost: Mutex<HashMap<String, Instant>>,
 }
 
 impl BinanceLive {
     pub fn new(rest: BinanceRest, step_size: HashMap<String, Decimal>) -> Self {
-        Self { rest, step_size }
+        Self {
+            rest,
+            step_size,
+            lost: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The REST client this adapter trades through, which the account reads
+    /// share, and the reads of [`BinanceRest`] (commission, key restrictions,
+    /// the book, a symbol's rules) are made through, with its keys, connections
+    /// and clock.
+    pub fn rest(&self) -> &BinanceRest {
+        &self.rest
     }
 
     fn round_to_step(&self, symbol: &str, quantity: Decimal) -> Result<Decimal> {
@@ -77,7 +108,7 @@ impl BinanceLive {
     /// Reads an order the venue reports in a terminal state into a fill.
     async fn settle(
         &self,
-        req: &OrderRequest,
+        symbol: &str,
         client_order_id: &str,
         order: BinanceOrderResponse,
     ) -> Result<CexFill> {
@@ -90,7 +121,7 @@ impl BinanceLive {
         }
         let unknown = |why| {
             unreadable_fill(
-                &req.symbol,
+                symbol,
                 client_order_id,
                 order.order_id,
                 order.executed_qty,
@@ -105,7 +136,7 @@ impl BinanceLive {
             trade_lines(
                 self.rest.client(),
                 MY_TRADES_PATH,
-                &req.symbol,
+                symbol,
                 order.order_id,
                 order.executed_qty,
             )
@@ -164,7 +195,13 @@ impl BinanceLive {
             .rest
             .place_market_order(&req.symbol, side, quantity, &client_order_id)
             .await;
-        let order = settled(
+        // When this request was signed, if its answer was lost: what a later
+        // "no such order" is told conclusive against.
+        let lost_at = match &placed {
+            Err(ApiError::Lost { signed_at, .. }) => Some(*signed_at),
+            _ => None,
+        };
+        let order = match settled(
             self.rest.client(),
             ORDER_PATH,
             &req.symbol,
@@ -172,8 +209,48 @@ impl BinanceLive {
             &what,
             placed,
         )
-        .await?;
-        self.settle(req, &client_order_id, order).await
+        .await
+        {
+            Ok(order) => order,
+            Err(err) => {
+                if let Some(signed_at) = lost_at {
+                    if err.downcast_ref::<OrderStateUnknown>().is_some() {
+                        self.lost
+                            .lock()
+                            .unwrap()
+                            .insert(client_order_id.clone(), signed_at);
+                    }
+                }
+                return Err(err);
+            }
+        };
+        self.settle(&req.symbol, &client_order_id, order).await
+    }
+
+    /// An order as the venue reports it, as a state: what it filled if it
+    /// ended, `Open` if it has not.
+    async fn state_of(
+        &self,
+        symbol: &str,
+        client_order_id: &str,
+        order: BinanceOrderResponse,
+    ) -> Result<OrderState> {
+        if !is_terminal(&order.status) {
+            return Ok(OrderState::Open);
+        }
+        if order.executed_qty.is_zero() {
+            return Ok(OrderState::Rejected {
+                order_ref: order.order_id,
+                status: order.status,
+            });
+        }
+        let filled = order.status == "FILLED";
+        let fill = self.settle(symbol, client_order_id, order).await?;
+        Ok(if filled {
+            OrderState::Filled(fill)
+        } else {
+            OrderState::PartlyFilled(fill)
+        })
     }
 
     /// Checks `req` as [`CexExecutor::execute`] would place it, at
@@ -189,10 +266,11 @@ impl BinanceLive {
             .test_market_order(&req.symbol, side, quantity, &client_order_id)
             .await
             .map_err(|err| {
-                anyhow!(
+                let message = format!(
                     "the test of {side} {quantity} {} ({client_order_id}) failed: {err}",
                     req.symbol
-                )
+                );
+                err.because(message)
             })?;
         Ok(OrderCheck {
             quantity,
@@ -214,6 +292,40 @@ impl CexExecutor for BinanceLive {
 
     fn label(&self) -> &'static str {
         "binance-live"
+    }
+}
+
+#[async_trait]
+impl CexOrders for BinanceLive {
+    async fn order_state(&self, symbol: &str, client_order_id: &str) -> Result<OrderState> {
+        // Taken before the query is signed and sent, so an answer counted as
+        // given after `recvWindow` was certainly asked after it.
+        let asked_at = Instant::now();
+        let client = self.rest.client();
+        match read_order::<BinanceOrderResponse>(client, ORDER_PATH, symbol, client_order_id).await
+        {
+            Ok(order) => {
+                self.lost.lock().unwrap().remove(client_order_id);
+                self.state_of(symbol, client_order_id, order)
+                    .await
+                    .with_context(|| format!("reading what order {client_order_id} filled"))
+            }
+            Err(err) if err.code() == Some(NO_SUCH_ORDER) => {
+                let signed_at = self.lost.lock().unwrap().get(client_order_id).copied();
+                match signed_at {
+                    // The venue could still accept the request that placed it.
+                    Some(signed_at) if asked_at <= client.recv_window_ends(signed_at) => {
+                        Ok(OrderState::Open)
+                    }
+                    _ => {
+                        self.lost.lock().unwrap().remove(client_order_id);
+                        Ok(OrderState::NotFound)
+                    }
+                }
+            }
+            Err(err) => Err(anyhow::Error::from(err)
+                .context(format!("reading order {client_order_id} on {symbol}"))),
+        }
     }
 }
 
@@ -441,6 +553,166 @@ mod tests {
         assert!(message.contains("insufficient balance"), "{message}");
     }
 
+    /// A caller acts on `-2010` and `-2015` by reading the code, not by
+    /// searching the text for it; the text is what it always was.
+    #[tokio::test]
+    async fn a_refused_order_is_a_venue_refusal_with_the_text_it_always_had() {
+        use crate::cex::{provenance_of, refusal_of, VenueRefusal};
+
+        let server = venue().await;
+        mount_placing(
+            &server,
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "code": -2010, "msg": "Account has insufficient balance for requested action."
+            })),
+        )
+        .await;
+
+        let err = live(&server, decimal("0.01"))
+            .execute(&request())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            refusal_of(&err),
+            Some(&VenueRefusal {
+                status: 400,
+                code: Some(-2010),
+                msg: "Account has insufficient balance for requested action.".to_string(),
+            })
+        );
+        let message = err.to_string();
+        assert!(message.starts_with("BUY 10.03 SOLUSDT (vp-"), "{message}");
+        assert!(
+            message.ends_with(
+                ") was not placed, nothing filled: refused (HTTP 400, code -2010): \
+                 Account has insufficient balance for requested action."
+            ),
+            "{message}"
+        );
+        assert_eq!(provenance_of(&err), Some(Provenance::Landed));
+        assert!(err.downcast_ref::<OrderStateUnknown>().is_none());
+    }
+
+    /// A refusal the venue gives with no body of its own (a gateway's) has no
+    /// code, never a made-up one.
+    #[tokio::test]
+    async fn a_refusal_with_no_venue_code_has_none() {
+        use crate::cex::{refusal_of, VenueRefusal};
+
+        let server = venue().await;
+        mount_placing(
+            &server,
+            ResponseTemplate::new(403).set_body_string("forbidden"),
+        )
+        .await;
+
+        let err = live(&server, decimal("0.01"))
+            .execute(&request())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            refusal_of(&err),
+            Some(&VenueRefusal {
+                status: 403,
+                code: None,
+                msg: "forbidden".to_string(),
+            })
+        );
+        assert!(
+            err.to_string()
+                .ends_with("nothing filled: refused (HTTP 403): forbidden"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_order_test_is_a_venue_refusal_with_the_text_it_always_had() {
+        use crate::cex::refusal_of;
+
+        let server = venue().await;
+        mount_order_test(
+            &server,
+            ResponseTemplate::new(400).set_body_json(
+                serde_json::json!({"code": -1013, "msg": "Filter failure: NOTIONAL"}),
+            ),
+        )
+        .await;
+
+        let err = live(&server, decimal("0.01"))
+            .test_order(&request())
+            .await
+            .unwrap_err();
+
+        let refusal = refusal_of(&err).expect("the venue refused the test");
+        assert_eq!((refusal.status, refusal.code), (400, Some(-1013)));
+        let message = err.to_string();
+        assert!(
+            message.starts_with("the test of BUY 10.03 SOLUSDT (vp-"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(") failed: refused (HTTP 400, code -1013): Filter failure: NOTIONAL"),
+            "{message}"
+        );
+    }
+
+    /// A status query the venue refuses is an `Err` the caller reads the code
+    /// from: `-2015` says the key or its address is wrong, not that the order
+    /// is missing.
+    #[tokio::test]
+    async fn a_refused_status_query_is_a_venue_refusal() {
+        use crate::cex::refusal_of;
+
+        let server = venue().await;
+        mount_status(
+            &server,
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "code": -2015, "msg": "Invalid API-key, IP, or permissions for action."
+            })),
+        )
+        .await;
+
+        let err = live(&server, decimal("0.01"))
+            .order_state("SOLUSDT", "vp-1")
+            .await
+            .unwrap_err();
+
+        assert_eq!(refusal_of(&err).unwrap().code, Some(-2015));
+        assert_eq!(err.to_string(), "reading order vp-1 on SOLUSDT");
+    }
+
+    /// An order the venue may have filled is not a refusal, whatever the status
+    /// query is answered with: the venue did act on, or may have acted on, the
+    /// request, and `OrderStateUnknown` is what says so.
+    #[tokio::test]
+    async fn an_order_left_unknown_is_not_a_refusal() {
+        use crate::cex::refusal_of;
+
+        let server = venue().await;
+        mount_placing(
+            &server,
+            ResponseTemplate::new(503).set_body_string("Unknown error"),
+        )
+        .await;
+        mount_status(
+            &server,
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "code": -2015, "msg": "Invalid API-key, IP, or permissions for action."
+            })),
+        )
+        .await;
+
+        let err = live(&server, decimal("0.01"))
+            .execute(&request())
+            .await
+            .unwrap_err();
+
+        assert!(err.downcast_ref::<OrderStateUnknown>().is_some(), "{err:#}");
+        assert!(refusal_of(&err).is_none(), "{err:#}");
+    }
+
     #[tokio::test]
     async fn a_market_order_that_expired_part_filled_is_a_partial_fill() {
         let server = venue().await;
@@ -537,7 +809,7 @@ mod tests {
             fill.trades.iter().map(|t| t.trade_id).collect::<Vec<_>>(),
             vec![Some(901), Some(902)]
         );
-        crate::testkit::contract::assert_fill_shape(&fill, adapter.label());
+        crate::testkit::contract::assert_fill_shape(&fill, "binance-live");
 
         let requests = server.received_requests().await.unwrap();
         let sent = requests
@@ -1096,5 +1368,358 @@ mod tests {
         eprintln!("sell: {sold:?}");
         assert_landed(&sold, qty, "sell");
         assert_ne!(bought.client_order_id, sold.client_order_id);
+    }
+
+    // The Spot API documentation's "Query order (USER_DATA)" response, a LIMIT order still working. Origin `documented`: the catalogue (`docs/responses/binance-spot.md`)
+    // keeps the gap in view until the testnet recording replaces the body.
+    const DOCUMENTED_ORDER_NEW: &str =
+        include_str!("../../../fixtures/binance-spot/documented/query-order-working.jsonc");
+
+    // The documentation's "New order (TRADE)" response, FULL: a MARKET order that filled in five trades. Origin `documented`: the catalogue (`docs/responses/binance-spot.md`)
+    // keeps the gap in view until the testnet recording replaces the body.
+    const DOCUMENTED_ORDER_FULL: &str = include_str!(
+        "../../../fixtures/binance-spot/documented/new-order-full-market-filled.jsonc"
+    );
+
+    // The documentation's "Account trade list (USER_DATA)" response. Origin `documented`: the catalogue (`docs/responses/binance-spot.md`)
+    // keeps the gap in view until the testnet recording replaces the body.
+    const DOCUMENTED_MY_TRADES: &str =
+        include_str!("../../../fixtures/binance-spot/documented/account-trade-list.json");
+
+    /// The documentation's example bodies carry `//` annotations, which JSON
+    /// does not: they are cut, and nothing else is.
+    fn without_doc_comments(body: &str) -> String {
+        body.lines()
+            .map(|line| line.find("//").map_or(line, |at| &line[..at]))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn documented(body: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_raw(without_doc_comments(body), "application/json")
+    }
+
+    fn documented_order(body: &str) -> Result<BinanceOrderResponse> {
+        Ok(serde_json::from_str(&without_doc_comments(body))?)
+    }
+
+    /// A venue that answers the status query with `response`.
+    async fn mount_status(server: &MockServer, response: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path("/api/v3/order"))
+            .respond_with(response)
+            .mount(server)
+            .await;
+    }
+
+    // The documented `-2013 NO_SUCH_ORDER` payload (errors.md, "Error codes for
+    // Binance"). Origin `documented`: see `docs/responses/binance-spot.md`.
+    fn no_such_order() -> ResponseTemplate {
+        ResponseTemplate::new(400).set_body_raw(
+            include_str!(
+                "../../../fixtures/binance-spot/documented/error-minus-2013-no-such-order.json"
+            ),
+            "application/json",
+        )
+    }
+
+    #[tokio::test]
+    async fn an_order_the_venue_reports_working_is_open() -> Result<()> {
+        let server = venue().await;
+        mount_status(&server, documented(DOCUMENTED_ORDER_NEW)).await;
+
+        let state = live(&server, decimal("0.01"))
+            .order_state("LTCBTC", "myOrder1")
+            .await?;
+
+        assert!(matches!(state, OrderState::Open), "{state:?}");
+        // The query asked for this order, by the id it was placed under.
+        let requests = server.received_requests().await.unwrap();
+        let query = requests
+            .iter()
+            .find(|r| r.url.path() == "/api/v3/order")
+            .expect("the order was asked about");
+        assert_eq!(query.method.as_str(), "GET");
+        assert_eq!(
+            param(query, "origClientOrderId").as_deref(),
+            Some("myOrder1")
+        );
+        assert_eq!(param(query, "symbol").as_deref(), Some("LTCBTC"));
+        Ok(())
+    }
+
+    /// A filled order is read as `execute` reads one: the fill, its price from its
+    /// trades, one commission, each trade, the id it was found by.
+    #[tokio::test]
+    async fn a_filled_order_is_filled_with_its_fill_read_as_execute_reads_it() -> Result<()> {
+        let server = venue().await;
+        mount_status(&server, documented(DOCUMENTED_ORDER_FULL)).await;
+        let adapter = live(&server, decimal("0.01"));
+
+        let OrderState::Filled(fill) = adapter.order_state("BTCUSDT", "vp-lost-1").await? else {
+            bail!("a FILLED order is Filled");
+        };
+
+        assert_eq!(fill.filled_qty, decimal("10"));
+        // 4000 + 5 x 3999 + 2 x 3998 + 3997 + 3995 = 39983 over 10.
+        assert_eq!(fill.filled_price, decimal("3998.3"));
+        assert_eq!(fill.commission, decimal("39.983"));
+        assert_eq!(fill.commission_asset, "USDT");
+        assert_eq!(fill.provenance, Provenance::Landed);
+        assert_eq!(fill.order_ref, Some(28));
+        assert_eq!(fill.client_order_id.as_deref(), Some("vp-lost-1"));
+        assert_eq!(fill.venue_time_ms, Some(1_507_725_176_595));
+        assert_eq!(
+            fill.trades.iter().map(|t| t.trade_id).collect::<Vec<_>>(),
+            [56, 57, 58, 59, 60].map(Some)
+        );
+        crate::testkit::contract::assert_fill_shape(&fill, "binance-live");
+
+        crate::testkit::contract::cex_orders_contract(
+            &adapter,
+            crate::testkit::contract::CexOrdersContractFixture {
+                symbol: "BTCUSDT".to_string(),
+                client_order_id: "vp-lost-1".to_string(),
+            },
+        )
+        .await;
+        Ok(())
+    }
+
+    /// An order the status query reports filled has no `fills`: its trade lines
+    /// are read from `myTrades`, as `execute` reads them for an order it found
+    /// by a status query. The order is the documented working order, read as
+    /// filled in the one trade the documented `myTrades` lists.
+    #[tokio::test]
+    async fn a_filled_order_with_no_fills_reads_its_trade_lines_from_my_trades() -> Result<()> {
+        let server = venue().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/myTrades"))
+            .respond_with(documented(DOCUMENTED_MY_TRADES))
+            .mount(&server)
+            .await;
+        let mut order = documented_order(DOCUMENTED_ORDER_NEW)?;
+        order.order_id = 100_234;
+        order.status = "FILLED".to_string();
+        order.executed_qty = decimal("12");
+
+        let state = live(&server, decimal("0.01"))
+            .state_of("BNBBTC", "vp-1", order)
+            .await?;
+
+        let OrderState::Filled(fill) = state else {
+            bail!("a FILLED order is Filled: {state:?}");
+        };
+        assert_eq!(fill.filled_qty, decimal("12"));
+        assert_eq!(fill.filled_price, decimal("4.000001"));
+        assert_eq!(fill.commission, decimal("10.1"));
+        assert_eq!(fill.commission_asset, "BNB");
+        assert_eq!(fill.trades.len(), 1);
+        assert_eq!(fill.trades[0].trade_id, Some(28_457));
+        // The status query's own time, since it carries no `transactTime`.
+        assert_eq!(fill.venue_time_ms, Some(1_499_827_319_559));
+        Ok(())
+    }
+
+    /// A market order that ran out of book ends `EXPIRED` with part filled: what
+    /// `execute` returns as a partial fill. The order is the documented one,
+    /// read as expired after its first two trades.
+    #[tokio::test]
+    async fn an_order_that_ended_with_part_filled_is_partly_filled() -> Result<()> {
+        let server = venue().await;
+        let mut order = documented_order(DOCUMENTED_ORDER_FULL)?;
+        order.status = "EXPIRED".to_string();
+        order.fills.truncate(2);
+        order.executed_qty = decimal("6");
+
+        let state = live(&server, decimal("0.01"))
+            .state_of("BTCUSDT", "vp-1", order)
+            .await?;
+
+        let OrderState::PartlyFilled(fill) = state else {
+            bail!("an EXPIRED order with part filled is PartlyFilled: {state:?}");
+        };
+        assert_eq!(fill.filled_qty, decimal("6"));
+        // (4000 + 5 x 3999) / 6.
+        assert_eq!(fill.filled_price.round_dp(6), decimal("3999.166667"));
+        assert_eq!(fill.trades.len(), 2);
+        Ok(())
+    }
+
+    /// An order that ended with nothing filled exposes nothing, whichever terminal
+    /// status it ended in; one still working is open, whatever it has filled.
+    #[tokio::test]
+    async fn an_order_that_ended_with_nothing_filled_is_rejected() -> Result<()> {
+        let server = venue().await;
+        let adapter = live(&server, decimal("0.01"));
+        for status in ["REJECTED", "EXPIRED", "CANCELED", "EXPIRED_IN_MATCH"] {
+            let mut order = documented_order(DOCUMENTED_ORDER_FULL)?;
+            order.status = status.to_string();
+            order.executed_qty = Decimal::ZERO;
+            order.fills.clear();
+
+            match adapter.state_of("BTCUSDT", "vp-1", order).await? {
+                OrderState::Rejected {
+                    order_ref,
+                    status: got,
+                } => {
+                    assert_eq!((order_ref, got.as_str()), (28, status));
+                }
+                other => bail!("{status} with nothing filled is Rejected: {other:?}"),
+            }
+        }
+
+        let mut working = documented_order(DOCUMENTED_ORDER_FULL)?;
+        working.status = "PARTIALLY_FILLED".to_string();
+        working.fills.truncate(1);
+        working.executed_qty = decimal("1");
+        assert!(matches!(
+            adapter.state_of("BTCUSDT", "vp-1", working).await?,
+            OrderState::Open
+        ));
+        Ok(())
+    }
+
+    /// An order whose fill cannot be read is a failed read, not a state: the
+    /// order filled and its commission is unknown, so nothing is returned.
+    #[tokio::test]
+    async fn a_fill_whose_trade_lines_cannot_be_read_is_an_error() -> Result<()> {
+        let server = venue().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/myTrades"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let mut order = documented_order(DOCUMENTED_ORDER_NEW)?;
+        order.status = "FILLED".to_string();
+        order.executed_qty = decimal("12");
+
+        let err = live(&server, decimal("0.01"))
+            .state_of("BNBBTC", "vp-1", order)
+            .await
+            .unwrap_err();
+
+        assert!(format!("{err:#}").contains("could not be read"), "{err:#}");
+        Ok(())
+    }
+
+    /// An id this adapter holds no lost request for was not placed by a request
+    /// that may still be accepted: the venue's "no such order" is final.
+    #[tokio::test]
+    async fn an_id_with_no_lost_request_is_not_found_at_once() -> Result<()> {
+        let server = venue().await;
+        mount_status(&server, no_such_order()).await;
+
+        let state = live(&server, decimal("0.01"))
+            .order_state("SOLUSDT", "vp-never-placed")
+            .await?;
+
+        assert!(matches!(state, OrderState::NotFound), "{state:?}");
+        Ok(())
+    }
+
+    /// For an order whose placing answer was lost, "no such order" says nothing
+    /// until `recvWindow` and the clock's error bound have passed since the
+    /// request was signed: until then the venue could still accept it, so the
+    /// order is `Open`. After, nothing can, and it is `NotFound`, which is
+    /// remembered no more.
+    #[tokio::test]
+    async fn not_found_is_conclusive_only_after_the_receive_window_and_the_clock_bound(
+    ) -> Result<()> {
+        let server = venue().await;
+        mount_status(&server, no_such_order()).await;
+        let adapter = live(&server, decimal("0.01"));
+        let signed_at = Instant::now();
+        adapter
+            .lost
+            .lock()
+            .unwrap()
+            .insert("vp-lost-1".to_string(), signed_at);
+
+        let early = adapter.order_state("SOLUSDT", "vp-lost-1").await?;
+        assert!(matches!(early, OrderState::Open), "{early:?}");
+        assert!(adapter.lost.lock().unwrap().contains_key("vp-lost-1"));
+
+        // The window (300 ms), the clock bound (one local round trip) and a margin.
+        tokio::time::sleep(fast().recv_window + Duration::from_millis(150)).await;
+        let late = adapter.order_state("SOLUSDT", "vp-lost-1").await?;
+        assert!(matches!(late, OrderState::NotFound), "{late:?}");
+        assert!(adapter.lost.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    /// A read that fails is an error, never `NotFound`: not even for an order
+    /// whose window has long passed.
+    #[tokio::test]
+    async fn a_failed_read_is_an_error_never_not_found() -> Result<()> {
+        let server = venue().await;
+        mount_status(
+            &server,
+            ResponseTemplate::new(503).set_body_string("Unknown error"),
+        )
+        .await;
+        let adapter = live(&server, decimal("0.01"));
+        adapter.lost.lock().unwrap().insert(
+            "vp-lost-1".to_string(),
+            Instant::now() - Duration::from_secs(60),
+        );
+
+        let err = adapter
+            .order_state("SOLUSDT", "vp-lost-1")
+            .await
+            .unwrap_err();
+
+        assert!(format!("{err:#}").contains("vp-lost-1"), "{err:#}");
+        assert!(adapter.lost.lock().unwrap().contains_key("vp-lost-1"));
+        Ok(())
+    }
+
+    /// The whole road: an order whose placing answer is lost and whose status
+    /// cannot be read ends `OrderStateUnknown`, and its id then resolves to what
+    /// the venue did with it.
+    #[tokio::test]
+    async fn an_order_left_unknown_is_resolved_by_the_id_the_error_names() -> Result<()> {
+        let server = venue().await;
+        mount_placing(
+            &server,
+            ResponseTemplate::new(200)
+                .set_body_json(filled_order("FILLED", "10.03"))
+                .set_delay(Duration::from_millis(600)),
+        )
+        .await;
+        let unreadable = Mock::given(method("GET"))
+            .and(path("/api/v3/order"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount_as_scoped(&server)
+            .await;
+        let adapter = live(&server, decimal("0.01"));
+
+        let err = adapter.execute(&request()).await.unwrap_err();
+        let unknown = err
+            .downcast_ref::<OrderStateUnknown>()
+            .ok_or_else(|| anyhow!("an OrderStateUnknown: {err:#}"))?;
+        assert_eq!(unknown.order_ref, None);
+        assert!(adapter
+            .lost
+            .lock()
+            .unwrap()
+            .contains_key(&unknown.client_order_id));
+
+        // The venue did take the order, and it filled.
+        drop(unreadable);
+        mount_status(&server, documented(DOCUMENTED_ORDER_FULL)).await;
+        let state = adapter
+            .order_state(&unknown.symbol, &unknown.client_order_id)
+            .await?;
+
+        let OrderState::Filled(fill) = state else {
+            bail!("the order filled: {state:?}");
+        };
+        assert_eq!(
+            fill.client_order_id.as_deref(),
+            Some(unknown.client_order_id.as_str())
+        );
+        assert!(adapter.lost.lock().unwrap().is_empty());
+        Ok(())
     }
 }

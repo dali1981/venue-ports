@@ -26,8 +26,15 @@
 //! Nothing can enforce this across processes: run one process per wallet
 //! per chain.
 //!
+//! **A fork never reads as a landing.** [`EvmSender::connect`] reads the node's
+//! `web3_clientVersion` once: a node that reports `anvil` makes the sender
+//! `Simulated`, whatever key signs, so a rehearsal signed with a real key on a
+//! fork cannot be read as a mainnet trade. Only "no such method" (`-32601`)
+//! says the node is not anvil; any other answer that is not a version is an
+//! error, never a guess that it is a mainnet.
+//!
 //! **Two backends, one send path** (`SPEC.md` §5b). A signing sender signs
-//! with its own key and is `Landed`. A fork sender ([`EvmSender::fork`])
+//! with its own key and is `Landed`, unless its node is anvil. A fork sender ([`EvmSender::fork`])
 //! impersonates an owner on an anvil fork with `anvil_impersonateAccount`
 //! and `eth_sendTransaction`, and is `Simulated`: the same operation as a
 //! live send, to a chain that is thrown away afterwards. Both follow the
@@ -61,6 +68,41 @@ const FORK_REVERT_GAS_LIMIT: u64 = 3_000_000;
 /// [`FORK_MIN_GAS_BALANCE`]: an impersonated account still pays for gas.
 const FORK_GAS_BALANCE: u128 = 100_000_000_000_000_000_000; // 100 ETH
 const FORK_MIN_GAS_BALANCE: u128 = 1_000_000_000_000_000_000; // 1 ETH
+
+/// The error [`EvmSender::resolve`] returns when the transaction was replaced or
+/// dropped and did not land: the node no longer knows it and its nonce has been
+/// used. Found with `downcast_ref`. Any other error from `resolve` is a read
+/// that failed, with the hash still unresolved, and says nothing about the
+/// transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxReplacedOrDropped {
+    pub tx_hash: B256,
+    /// The nonce the transaction was sent with, which another transaction used.
+    pub nonce: u64,
+    pub address: Address,
+}
+
+impl std::fmt::Display for TxReplacedOrDropped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "transaction {} is no longer known to the node and nonce {} of {} has been used: \
+             it was replaced or dropped, and did not land",
+            self.tx_hash, self.nonce, self.address
+        )
+    }
+}
+
+impl std::error::Error for TxReplacedOrDropped {}
+
+/// The JSON-RPC code for a method the node does not have: the only error object
+/// that says a node is not anvil, which has `web3_clientVersion`.
+const METHOD_NOT_FOUND: i64 = -32601;
+
+/// Whether a `web3_clientVersion` is anvil's (`anvil/v1.3.0`).
+fn is_anvil(client_version: &str) -> bool {
+    client_version.starts_with("anvil")
+}
 
 /// One secp256k1 signing key and the address it controls. It signs; it
 /// does not send — sending, and the nonce that goes with it, belong to the
@@ -212,6 +254,9 @@ pub struct EvmSender {
     /// Balance-slot indices found by `ensure_balance` on a fork.
     slots: SlotCache,
     registered: bool,
+    /// `Simulated` for a fork sender and for a signing sender whose node is
+    /// anvil, read once when it connected; `Landed` otherwise.
+    provenance: Provenance,
 }
 
 fn registry() -> &'static Mutex<HashSet<(Address, u64)>> {
@@ -220,8 +265,15 @@ fn registry() -> &'static Mutex<HashSet<(Address, u64)>> {
 }
 
 impl EvmSender {
-    /// Checks `eth_chainId` against `chain_id`. Returns an error if this
-    /// process already holds an `EvmSender` for the same (address, chain_id).
+    /// Checks `eth_chainId` against `chain_id`, and reads `web3_clientVersion`
+    /// once: a node that reports `anvil` makes this sender `Simulated`, so
+    /// nothing it sends reads as a landing. A node that answers that it has no
+    /// such method (`-32601`) is not anvil, which has it; any other answer that
+    /// is not a version (another error object, a rate limit or a gateway's
+    /// refusal included, or no answer at all) is an error, since the sender
+    /// could not say what it sends to.
+    /// Returns an error if this process already holds an `EvmSender` for the
+    /// same (address, chain_id).
     pub async fn connect(
         rpc: EvmRpc,
         signer: Signer,
@@ -238,6 +290,24 @@ impl EvmSender {
                 rpc.url()
             );
         }
+        let provenance = match rpc.client_version().await {
+            Ok(version) if is_anvil(&version) => Provenance::Simulated,
+            Ok(_) => Provenance::Landed,
+            Err(err)
+                if err
+                    .downcast_ref::<RpcError>()
+                    .is_some_and(|node| node.code == Some(METHOD_NOT_FOUND)) =>
+            {
+                Provenance::Landed
+            }
+            Err(err) => {
+                return Err(err.context(format!(
+                    "reading the node's web3_clientVersion at {}: without it the sender cannot \
+                     say whether it sends to a fork",
+                    rpc.url()
+                )))
+            }
+        };
         let address = signer.address();
         if !registry().lock().unwrap().insert((address, chain_id)) {
             bail!(
@@ -257,6 +327,7 @@ impl EvmSender {
             unresolved: Mutex::new(None),
             slots: SlotCache::default(),
             registered: true,
+            provenance,
         }))
     }
 
@@ -269,7 +340,7 @@ impl EvmSender {
             .client_version()
             .await
             .context("reading the node's web3_clientVersion")?;
-        if !version.starts_with("anvil") {
+        if !is_anvil(&version) {
             bail!(
                 "a fork sender only sends to an anvil node, and {} reports {version:?}",
                 rpc.url()
@@ -307,6 +378,7 @@ impl EvmSender {
             unresolved: Mutex::new(None),
             slots: SlotCache::default(),
             registered: false,
+            provenance: Provenance::Simulated,
         }))
     }
 
@@ -322,14 +394,12 @@ impl EvmSender {
         &self.rpc
     }
 
-    /// `Simulated` for a fork sender, `Landed` for a signing one. Adapters
-    /// take their provenance from this. Either way a transaction was sent,
-    /// so they set `tx_ref` to its hash.
+    /// `Simulated` for a fork sender, and for a signing sender whose node is
+    /// anvil (read once, at `connect`); `Landed` for a signing sender on any
+    /// other node. Adapters take their provenance from this. Either way a
+    /// transaction was sent, so they set `tx_ref` to its hash.
     pub fn provenance(&self) -> Provenance {
-        match self.backend {
-            Backend::Signing(_) => Provenance::Landed,
-            Backend::Fork => Provenance::Simulated,
-        }
+        self.provenance
     }
 
     /// Changes how receipts are polled for — for a slow chain, or for a
@@ -478,7 +548,9 @@ impl EvmSender {
     /// clears it. Returns `None` if it is still pending. Once the node no
     /// longer knows the hash and the account's `latest` nonce has moved past
     /// it, it was replaced or dropped: that is reported as an error naming
-    /// the hash, and the hash is cleared.
+    /// the hash, a [`TxReplacedOrDropped`], and the hash is cleared. Any other
+    /// error is a read that failed: the hash is still unresolved, and nothing
+    /// is known of the transaction.
     ///
     /// A hash the node does not know whose nonce is still unused stays
     /// unresolved: another node may yet broadcast it. A caller who has
@@ -512,13 +584,12 @@ impl EvmSender {
             .await?;
         if latest > pending.nonce {
             *self.unresolved.lock().unwrap() = None;
-            bail!(
-                "transaction {} is no longer known to the node and nonce {} of {} has been used: \
-                 it was replaced or dropped, and did not land",
-                pending.tx_hash,
-                pending.nonce,
-                self.address
-            );
+            return Err(TxReplacedOrDropped {
+                tx_hash: pending.tx_hash,
+                nonce: pending.nonce,
+                address: self.address,
+            }
+            .into());
         }
         Ok(None)
     }
@@ -708,6 +779,10 @@ pub(crate) mod tests {
     pub(crate) async fn mount_send_plumbing(server: &MockServer) {
         for (rpc_method, result) in [
             ("eth_chainId", json!(format!("0x{SEPOLIA:x}"))),
+            (
+                "web3_clientVersion",
+                json!("Geth/v1.14.0-stable/linux-amd64/go1.22"),
+            ),
             ("eth_getTransactionCount", json!("0x5")),
             (
                 "eth_getBlockByNumber",
@@ -804,11 +879,16 @@ pub(crate) mod tests {
 
         // The same wallet on another chain is another nonce sequence.
         let other_chain = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(body_partial_json(json!({"method": "eth_chainId"})))
-            .respond_with(ok(json!("0x1")))
-            .mount(&other_chain)
-            .await;
+        for (rpc_method, result) in [
+            ("eth_chainId", json!("0x1")),
+            ("web3_clientVersion", json!("Geth/v1.14.0-stable")),
+        ] {
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({ "method": rpc_method })))
+                .respond_with(ok(result))
+                .mount(&other_chain)
+                .await;
+        }
         let mainnet = EvmSender::connect(
             EvmRpc::new(other_chain.uri()),
             signer(),
@@ -1029,7 +1109,193 @@ pub(crate) mod tests {
         let err = sender.resolve().await.unwrap_err();
         assert!(err.to_string().contains(&tx_hash.to_string()));
         assert!(err.to_string().contains("replaced or dropped"));
+        let dropped = err
+            .downcast_ref::<TxReplacedOrDropped>()
+            .expect("a replaced or dropped transaction is a TxReplacedOrDropped");
+        assert_eq!(dropped.tx_hash, tx_hash);
+        assert_eq!(dropped.nonce, 5);
+        assert_eq!(dropped.address, sender.address());
         assert_eq!(sender.unresolved(), None);
+    }
+
+    /// A failed read is not a drop: the error is not a `TxReplacedOrDropped`,
+    /// and the hash stays unresolved, so the same `resolve` can be asked again.
+    #[tokio::test]
+    async fn a_failed_read_while_resolving_is_not_a_drop_and_keeps_the_hash() {
+        let server = MockServer::start().await;
+        mount_send_plumbing(&server).await;
+        let receipts = Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "eth_getTransactionReceipt"}),
+            ))
+            .respond_with(ok(Value::Null))
+            .mount_as_scoped(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "eth_getTransactionByHash"}),
+            ))
+            .respond_with(ok(json!({ "hash": "0x01" })))
+            .mount(&server)
+            .await;
+
+        let sender = connect(&server).await;
+        sender.set_poll_settings(fast_poll());
+        let TxOutcome::TimedOut { tx_hash } = sender
+            .send_and_confirm(Address::from([0x11; 20]), vec![1], U256::ZERO)
+            .await
+            .unwrap()
+        else {
+            panic!("expected TimedOut");
+        };
+
+        // The node answers the receipt read with an error object.
+        drop(receipts);
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "eth_getTransactionReceipt"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1,
+                "error": { "code": -32005, "message": "rate limit exceeded" },
+            })))
+            .mount(&server)
+            .await;
+        let err = sender.resolve().await.unwrap_err();
+        assert!(err.downcast_ref::<TxReplacedOrDropped>().is_none(), "{err}");
+        assert_eq!(sender.unresolved(), Some(tx_hash));
+    }
+
+    /// The node's own answer to `web3_clientVersion` decides the sender's
+    /// provenance, once, at `connect`. The node is gone when this returns: a
+    /// test reads what the sender says it is, and sends nothing.
+    pub(crate) async fn connect_to_a_node_that_reports(version: Value) -> Arc<EvmSender> {
+        let server = MockServer::start().await;
+        mount_send_plumbing(&server).await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "web3_clientVersion"})))
+            .respond_with(ok(version))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        connect(&server).await
+    }
+
+    #[tokio::test]
+    async fn a_signing_sender_is_landed_on_a_node_that_is_not_anvil() {
+        let sender =
+            connect_to_a_node_that_reports(json!("Geth/v1.14.0-stable/linux-amd64/go1.22")).await;
+        assert_eq!(sender.provenance(), Provenance::Landed);
+    }
+
+    #[tokio::test]
+    async fn a_signing_sender_on_anvil_is_simulated() {
+        let sender = connect_to_a_node_that_reports(json!("anvil/v1.3.0")).await;
+        assert_eq!(sender.provenance(), Provenance::Simulated);
+    }
+
+    /// A node with no `web3_clientVersion` answers with an error object: it is
+    /// not anvil, which has the method.
+    #[tokio::test]
+    async fn a_node_that_has_no_client_version_method_is_not_anvil() {
+        let server = MockServer::start().await;
+        mount_send_plumbing(&server).await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "web3_clientVersion"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1,
+                "error": { "code": -32601, "message": "the method web3_clientVersion does not exist/is not available" },
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        assert_eq!(connect(&server).await.provenance(), Provenance::Landed);
+    }
+
+    /// Only "no such method" says the node is not anvil. A node that answers the
+    /// version with any other error object (a rate limit, a gateway's refusal)
+    /// has not said what it is, so the sender does not connect on a guess that
+    /// it sends to a mainnet: a fork behind such a gateway would read as a
+    /// landing. Its registry slot stays free.
+    #[tokio::test]
+    async fn a_node_that_answers_the_version_with_another_error_refuses_the_connect() {
+        let server = MockServer::start().await;
+        mount_send_plumbing(&server).await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "web3_clientVersion"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1,
+                "error": { "code": -32005, "message": "rate limit exceeded" },
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let signer = || Signer::from_private_key_hex(&hex::encode([0x44u8; 32])).unwrap();
+
+        let err = EvmSender::connect(
+            EvmRpc::new(server.uri()),
+            signer(),
+            SEPOLIA,
+            FeePolicy::default(),
+        )
+        .await
+        .err()
+        .expect("a node that answered the version with a rate limit");
+        assert!(format!("{err:#}").contains("web3_clientVersion"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("rate limit exceeded"),
+            "{err:#}"
+        );
+
+        // Nothing was registered: the same wallet connects once the node answers.
+        let healthy = MockServer::start().await;
+        mount_send_plumbing(&healthy).await;
+        EvmSender::connect(
+            EvmRpc::new(healthy.uri()),
+            signer(),
+            SEPOLIA,
+            FeePolicy::default(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A node that cannot be asked at all leaves the sender unable to say what
+    /// it sends to, so it does not connect, and its registry slot is free.
+    #[tokio::test]
+    async fn a_node_that_cannot_be_asked_its_version_refuses_the_connect() {
+        let server = MockServer::start().await;
+        mount_send_plumbing(&server).await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "web3_clientVersion"})))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let signer = || Signer::from_private_key_hex(&hex::encode([0x43u8; 32])).unwrap();
+
+        let err = EvmSender::connect(
+            EvmRpc::new(server.uri()),
+            signer(),
+            SEPOLIA,
+            FeePolicy::default(),
+        )
+        .await
+        .err()
+        .expect("a node that cannot report its version");
+        assert!(format!("{err:#}").contains("web3_clientVersion"), "{err:#}");
+
+        // Nothing was registered: the same wallet connects once the node answers.
+        let healthy = MockServer::start().await;
+        mount_send_plumbing(&healthy).await;
+        EvmSender::connect(
+            EvmRpc::new(healthy.uri()),
+            signer(),
+            SEPOLIA,
+            FeePolicy::default(),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1166,7 +1432,7 @@ pub(crate) mod tests {
 
     /// Anvil's first well-known dev account, funded on every anvil node and
     /// fork. Public, so worthless anywhere else.
-    const ANVIL_DEV_KEY_0: &str =
+    pub(crate) const ANVIL_DEV_KEY_0: &str =
         "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
     /// The unresolved-timeout rule against a real node: with automine off a
@@ -1225,6 +1491,36 @@ pub(crate) mod tests {
             other => panic!("expected the mined transaction's receipt, got {other:?}"),
         }
         assert_eq!(sender.unresolved(), None);
+    }
+
+    /// A signing sender whose node is anvil is `Simulated`, whatever key signs:
+    /// what it sends to a fork must never read as a mainnet trade. A fork sender
+    /// says the same, and both send for real to the node.
+    #[tokio::test]
+    async fn against_anvil_a_signing_sender_is_simulated() {
+        let Some((rpc, _anvil)) = anvil().await else {
+            return;
+        };
+        let chain_id = rpc.chain_id().await.unwrap();
+        let sender = EvmSender::connect(
+            rpc.clone(),
+            Signer::from_private_key_hex(ANVIL_DEV_KEY_0).unwrap(),
+            chain_id,
+            FeePolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sender.provenance(), Provenance::Simulated);
+
+        // It signs and sends for real: the transaction lands on the node.
+        let TxOutcome::Success { tx_hash, .. } = sender
+            .send_and_confirm(Address::from([0x77; 20]), Vec::new(), U256::from(1u64))
+            .await
+            .unwrap()
+        else {
+            panic!("a plain transfer on anvil should succeed");
+        };
+        assert!(rpc.transaction_receipt(tx_hash).await.unwrap().is_some());
     }
 
     #[tokio::test]
