@@ -15,6 +15,8 @@ pub(crate) mod clock;
 mod live;
 pub(crate) mod order;
 mod reads;
+#[cfg(test)]
+mod recorded;
 mod rest;
 pub(crate) mod sign;
 
