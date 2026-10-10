@@ -223,7 +223,7 @@ and after with `SpotBalanceReader` and `EvmBalanceReader`).
 
 ### LV2a — one exchange order at a time, reconciled to the unit
 
-`production_lv2a_exchange`. Ten round trips on `VP_SYMBOL` (a market buy, then a market sell of what the
+`production_lv2a_exchange`. Ten round trips (`VP_ROUND_TRIPS`, default 10: fewer for a pilot) on `VP_SYMBOL` (a market buy, then a market sell of what the
 buy delivered), each of about `VP_ORDER_USD` (default 10, within the cap and above the symbol's minimum
 notional): one at about $6, one whose quantity needs rounding to the lot step. The account is the
 production key's. Before each order the test reads `order_book(symbol, 5)` and the balances; after it, the balances.
@@ -258,7 +258,7 @@ of $10 plus the spread; the ledger enforces the cap.
 
 ### LV2b — one swap at a time, the port's reading equals the chain's record
 
-`production_lv2b_chain`. Sixty swaps of about `VP_SWAP_USD` (default 10) through an EVM router, alternating
+`production_lv2b_chain`. Sixty swaps (`VP_SWAPS`, default 60 and always even: fewer for a pilot) of about `VP_SWAP_USD` (default 10) through an EVM router, alternating
 direction, at exponential intervals (mean 90 s), at the node's suggested priority fee, through a shared
 `EvmSender` and `EvmLive`. Inputs: `VP_BASE_RPC_URL`, `VP_SIGNER_KEY_HEX` *(read once from the environment of the shell that
 starts the run, removed from the process environment after reading, never logged, never a file in the

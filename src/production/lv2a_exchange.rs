@@ -40,7 +40,7 @@ use crate::cex::{
     BinanceLive, BinanceRest, CexExecutor, CexFill, CexOrders, CexTimings, OrderRequest, OrderSide,
     SymbolCommission, SymbolRules,
 };
-use crate::production::env::{positive_decimal, Env};
+use crate::production::env::{positive_count, positive_decimal, Env};
 use crate::production::exchange_checks::{
     e1_order_state, e2_my_trades, e3_public_trades, e4_commission, e5_balances, e6_step_and_time,
     effective_rate, order_references, Touch, E4,
@@ -76,7 +76,7 @@ pub(crate) struct Settings {
     pub(crate) symbol: String,
     /// `VP_ORDER_USD`, default 10: about what one order is worth.
     pub(crate) order_usd: Decimal,
-    /// How many round trips; ten, unless a test asks for fewer.
+    /// `VP_ROUND_TRIPS`, default ten: fewer for a pilot.
     pub(crate) round_trips: usize,
 }
 
@@ -87,7 +87,7 @@ impl Settings {
                 .var("VP_SYMBOL")
                 .unwrap_or_else(|| "AEROUSDT".to_string()),
             order_usd: positive_decimal(env, "VP_ORDER_USD", Some(Decimal::from(10)))?,
-            round_trips: ROUND_TRIPS,
+            round_trips: positive_count(env, "VP_ROUND_TRIPS", ROUND_TRIPS)?,
         })
     }
 }
@@ -1535,6 +1535,21 @@ mod tests {
         lab.setup.clean_up();
     }
 
+    /// A pilot asks for fewer round trips than the ten of a full run.
+    #[test]
+    fn a_pilot_asks_for_fewer_round_trips_and_a_bad_count_is_refused_by_name() {
+        let env = crate::production::env::MapEnv::new(&[("VP_ROUND_TRIPS", "2")]);
+        assert_eq!(Settings::from_env(&env).unwrap().round_trips, 2);
+        for bad in ["0", "-1", "2.5", "ten"] {
+            let env = crate::production::env::MapEnv::new(&[("VP_ROUND_TRIPS", bad)]);
+            let why = format!("{:#}", Settings::from_env(&env).unwrap_err());
+            assert!(
+                why.contains("VP_ROUND_TRIPS") && why.contains(bad),
+                "{bad}: {why}"
+            );
+        }
+    }
+
     #[test]
     fn the_first_round_trip_is_about_six_dollars_and_the_second_is_asked_for_off_the_step() {
         let env = crate::production::env::MapEnv::new(&[]);
@@ -2026,7 +2041,8 @@ mod tests {
     /// Needs `BINANCE_BASE_URL=https://api.binance.com`, `BINANCE_API_KEY` and
     /// `BINANCE_API_SECRET` (trading enabled, withdrawals off, "pay fees with BNB"
     /// off), `VP_SPEND_CAP_USD`, `VP_HALT_FILE` and `VP_OUT`; optionally `VP_SYMBOL`,
-    /// `VP_ORDER_USD`, `VP_ORDER_CAP_USD` and `VP_RECORD_DIR`.
+    /// `VP_ORDER_USD`, `VP_ROUND_TRIPS` (default 10; fewer for a pilot),
+    /// `VP_ORDER_CAP_USD` and `VP_RECORD_DIR`.
     #[tokio::test]
     #[ignore = "places real orders on Binance production with a real key: see specs/V7-production-validation.md"]
     async fn production_lv2a_exchange() {

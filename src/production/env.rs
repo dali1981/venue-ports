@@ -93,6 +93,19 @@ pub(crate) fn positive_decimal(
     Ok(value)
 }
 
+/// A count from the variable, or `default` when it is unset. A value that is not
+/// a whole number greater than zero is an error naming the variable: a run of
+/// nothing is not a pilot.
+pub(crate) fn positive_count(env: &dyn Env, key: &str, default: usize) -> Result<usize> {
+    let Some(text) = env.var(key) else {
+        return Ok(default);
+    };
+    match text.trim().parse::<usize>() {
+        Ok(count) if count > 0 => Ok(count),
+        _ => bail!("{key} is {text:?}, which is not a whole number greater than zero"),
+    }
+}
+
 /// Whether the variable is exactly `1`.
 pub(crate) fn flag(env: &dyn Env, key: &str) -> bool {
     env.var(key).as_deref() == Some("1")
@@ -152,6 +165,17 @@ mod tests {
             words.contains("WORDS") && words.contains("not a decimal"),
             "{words}"
         );
+    }
+
+    #[test]
+    fn a_count_is_a_whole_number_above_zero_with_a_named_failure() {
+        let env = MapEnv::new(&[("N", " 4 "), ("ZERO", "0"), ("NEG", "-1"), ("FRAC", "2.5")]);
+        assert_eq!(positive_count(&env, "N", 10).unwrap(), 4);
+        assert_eq!(positive_count(&env, "UNSET", 10).unwrap(), 10);
+        for key in ["ZERO", "NEG", "FRAC"] {
+            let why = positive_count(&env, key, 10).unwrap_err().to_string();
+            assert!(why.contains(key) && why.contains("whole number"), "{why}");
+        }
     }
 
     #[test]

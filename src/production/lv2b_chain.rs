@@ -49,7 +49,7 @@ use crate::production::chain_checks::{
     swap_references, x1_amount_out, x2_amount_in, x3_cost, x4_native_change, x5_token_changes,
     x6_landing, Quote, SwapFacts,
 };
-use crate::production::env::{positive_decimal, required, Env};
+use crate::production::env::{positive_count, positive_decimal, required, Env};
 use crate::production::gate::now_ns;
 use crate::production::guard;
 use crate::production::lv1_base::{host_of, rpc_request, BASE_CHAIN_ID};
@@ -132,7 +132,8 @@ pub(crate) struct Settings {
     /// `VP_NATIVE_USD`: what a unit of the chain's native token is worth, to value
     /// the gas the wallet spends.
     pub(crate) native_usd: Decimal,
-    /// How many swaps; sixty, unless a test asks for fewer.
+    /// `VP_SWAPS`, default sixty, always even: fewer for a pilot. Swaps alternate
+    /// direction, so an even count ends holding what the run began with.
     pub(crate) swaps: usize,
     /// The mean of the exponential interval between swaps.
     pub(crate) mean_interval: Duration,
@@ -157,7 +158,7 @@ impl Settings {
             token_out: address("VP_TOKEN_OUT")?,
             swap_usd: positive_decimal(env, "VP_SWAP_USD", Some(Decimal::from(10)))?,
             native_usd: positive_decimal(env, "VP_NATIVE_USD", None)?,
-            swaps: SWAPS,
+            swaps: even_swaps(env)?,
             mean_interval: MEAN_INTERVAL,
             poll: POLL,
         };
@@ -169,6 +170,16 @@ impl Settings {
             .map_err(|_| anyhow!("VP_SIGNER_KEY_HEX is not a secp256k1 private key in hex"))?;
         Ok((settings, signer))
     }
+}
+
+/// `VP_SWAPS`: how many swaps, an even number so that the alternating directions
+/// leave the wallet holding what it began with.
+fn even_swaps(env: &dyn Env) -> Result<usize> {
+    let swaps = positive_count(env, "VP_SWAPS", SWAPS)?;
+    if swaps % 2 != 0 {
+        bail!("VP_SWAPS is {swaps}: it must be even, so that the run ends holding the input token");
+    }
+    Ok(swaps)
 }
 
 // --- the calldata: the one place the router's ABI is written ---------------------
@@ -1476,6 +1487,29 @@ mod tests {
         .contains("VP_ROUTER"));
     }
 
+    /// A pilot asks for fewer swaps than the sixty of a full run. Swaps alternate
+    /// direction, so an odd count would end holding the output token.
+    #[test]
+    fn a_pilot_asks_for_fewer_swaps_and_the_count_is_even() {
+        let with = |count: &str| {
+            let mut vars = vars();
+            vars.push(("VP_SWAPS", count.to_string()));
+            vars
+        };
+        let (settings, _) = Settings::from_env(&env(&with("4"))).unwrap();
+        assert_eq!(settings.swaps, 4);
+        for bad in ["0", "-2", "5", "2.5", "four"] {
+            let why = format!(
+                "{:#}",
+                Settings::from_env(&env(&with(bad))).err().expect("refused")
+            );
+            assert!(
+                why.contains("VP_SWAPS") && why.contains(bad),
+                "{bad}: {why}"
+            );
+        }
+    }
+
     // --- the calldata ---
 
     #[test]
@@ -2651,7 +2685,8 @@ mod tests {
     /// Needs `VP_BASE_RPC_URL`, `VP_SIGNER_KEY_HEX` (a funded throwaway wallet, read
     /// once), `VP_ROUTER`, `VP_POOL`, `VP_TOKEN_IN` (USD-pegged), `VP_TOKEN_OUT`,
     /// `VP_NATIVE_USD`, `VP_SPEND_CAP_USD`, `VP_HALT_FILE` and `VP_OUT`; optionally
-    /// `VP_SWAP_USD`, `VP_ORDER_CAP_USD` and `VP_RECORD_DIR`.
+    /// `VP_SWAP_USD`, `VP_SWAPS` (default 60, even; fewer for a pilot),
+    /// `VP_ORDER_CAP_USD` and `VP_RECORD_DIR`.
     #[tokio::test]
     #[ignore = "sends real swaps on Base mainnet with a real key: see specs/V7-production-validation.md"]
     async fn production_lv2b_chain() {
