@@ -25,8 +25,8 @@ pub use account::{CexAccount, FundingPayment, MarginMode, MarginState, PerpPosit
 pub use account_stub::{AccountCall, AccountRead, CexAccountStub};
 pub use binance::{
     ApiRestrictions, BinanceConfig, BinanceLive, BinanceRest, BookTicker, Commission,
-    CommissionDiscount, CommissionRates, MakerTaker, OrderBookSnapshot, OrderCheck, PublicTrade,
-    SymbolCommission, SymbolRules,
+    CommissionDiscount, CommissionRates, MakerTaker, OrderBookSnapshot, OrderCheck, OrderStyle,
+    PublicTrade, SymbolCommission, SymbolRules,
 };
 pub use binance_futures::{
     BinanceFuturesAccount, BinanceFuturesConfig, BinanceFuturesLive, BinanceFuturesRest,
@@ -48,11 +48,15 @@ pub struct OrderRequest {
     pub symbol: String,
     pub side: OrderSide,
     pub quantity: Decimal,
-    /// The price this order was decided against. Used by a simulated or
-    /// stub implementation to price the resulting fill; a live
-    /// implementation may log it for comparison but must never use it to
-    /// build the order itself — a market order carries no price, and
-    /// treating this as one would be a fabricated quote, not a real order.
+    /// The price this order was decided against: the touch the caller saw
+    /// (the ask for a buy, the bid for a sell). Used by a simulated or
+    /// stub implementation to price the resulting fill. A live implementation
+    /// expressing the order as a **market** order may log it for comparison
+    /// but must never use it to build the order — a market order carries no
+    /// price, and treating this as one would be a fabricated quote. One
+    /// expressing it as a **limit** order (`OrderStyle::LimitIoc`) sends it
+    /// as the limit price, which is what makes it the price seen and not a
+    /// guess; so the caller must give the touch itself, on the tick.
     pub quoted_price: Decimal,
     /// The venue must refuse any part of this order that would increase or
     /// flip the position instead of reducing it. A venue with no positions

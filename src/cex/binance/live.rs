@@ -67,10 +67,31 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
 
+/// How an order is expressed to the exchange. Both styles are kept, and the
+/// one in force is chosen by configuration and handed to the adapter when it
+/// is built ([`BinanceLive::with_order_style`]); nothing else asks which it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderStyle {
+    /// A market order: no price, so whatever the book offers. This is what
+    /// `BinanceLive::new` builds, as it always did.
+    Market,
+    /// A limit order at the price the request was decided against
+    /// (`OrderRequest::quoted_price`: the touch the caller saw, the ask for a
+    /// buy and the bid for a sell), immediate-or-cancel: it fills at that
+    /// price or better, never rests in the book, and never pays more than the
+    /// price seen. Whatever does not fill expires, so a fill can be partial or
+    /// nothing at all. `tick_size` is each symbol's `PRICE_FILTER` tick: a price
+    /// off it, or a symbol with none configured, is refused before anything is
+    /// sent, never rounded.
+    LimitIoc { tick_size: HashMap<String, Decimal> },
+}
+
 pub struct BinanceLive {
     rest: BinanceRest,
     /// Symbol (e.g. `"SOLUSDT"`) -> the venue's `LOT_SIZE` step for it.
     step_size: HashMap<String, Decimal>,
+    /// How orders are expressed; `Market` unless the caller says otherwise.
+    order_style: OrderStyle,
     /// For each order that ended `OrderStateUnknown` after the answer to its
     /// placing request was lost: when that request was signed, which is what
     /// "no such order" can be told conclusive against. Removed once the order's
@@ -83,8 +104,42 @@ impl BinanceLive {
         Self {
             rest,
             step_size,
+            order_style: OrderStyle::Market,
             lost: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// This adapter, expressing its orders in `style`.
+    pub fn with_order_style(mut self, style: OrderStyle) -> Self {
+        self.order_style = style;
+        self
+    }
+
+    /// The limit price of `req` under the limit style, or `None` under the
+    /// market style. The price is the one the request was decided against, and
+    /// it must sit on the symbol's tick: an off-tick price is a wrong price
+    /// (a mid, a product), not one to round into an order.
+    fn limit_price(&self, req: &OrderRequest) -> Result<Option<Decimal>> {
+        let OrderStyle::LimitIoc { tick_size } = &self.order_style else {
+            return Ok(None);
+        };
+        let tick = tick_size.get(&req.symbol).ok_or_else(|| {
+            anyhow!(
+                "no PRICE_FILTER tick configured for symbol {} — refusing to send a limit order",
+                req.symbol
+            )
+        })?;
+        if tick.is_zero() {
+            bail!("tick size for {} is zero", req.symbol);
+        }
+        let price = req.quoted_price;
+        if price <= Decimal::ZERO || !(price % tick).is_zero() {
+            bail!(
+                "limit price {price} is not a positive multiple of {}'s tick {tick} — refusing to send a price the venue would round",
+                req.symbol
+            );
+        }
+        Ok(Some(price))
     }
 
     /// The REST client this adapter trades through, which the account reads
@@ -189,12 +244,27 @@ impl BinanceLive {
     /// without its errors' provenance.
     async fn place(&self, req: &OrderRequest) -> Result<CexFill> {
         let (side, quantity) = self.market_order(req)?;
+        let limit = self.limit_price(req)?;
         let client_order_id = new_client_order_id();
-        let what = format!("{side} {quantity} {} ({client_order_id})", req.symbol);
-        let placed = self
-            .rest
-            .place_market_order(&req.symbol, side, quantity, &client_order_id)
-            .await;
+        let what = match limit {
+            None => format!("{side} {quantity} {} ({client_order_id})", req.symbol),
+            Some(price) => format!(
+                "{side} {quantity} {} at {price} IOC ({client_order_id})",
+                req.symbol
+            ),
+        };
+        let placed = match limit {
+            None => {
+                self.rest
+                    .place_market_order(&req.symbol, side, quantity, &client_order_id)
+                    .await
+            }
+            Some(price) => {
+                self.rest
+                    .place_limit_ioc_order(&req.symbol, side, quantity, price, &client_order_id)
+                    .await
+            }
+        };
         // When this request was signed, if its answer was lost: what a later
         // "no such order" is told conclusive against.
         let lost_at = match &placed {
@@ -260,18 +330,27 @@ impl BinanceLive {
     /// any failure, a lost answer included, is a plain error.
     pub async fn test_order(&self, req: &OrderRequest) -> Result<OrderCheck> {
         let (side, quantity) = self.market_order(req)?;
+        let limit = self.limit_price(req)?;
         let client_order_id = new_client_order_id();
-        let rates = self
-            .rest
-            .test_market_order(&req.symbol, side, quantity, &client_order_id)
-            .await
-            .map_err(|err| {
-                let message = format!(
-                    "the test of {side} {quantity} {} ({client_order_id}) failed: {err}",
-                    req.symbol
-                );
-                err.because(message)
-            })?;
+        let tested = match limit {
+            None => {
+                self.rest
+                    .test_market_order(&req.symbol, side, quantity, &client_order_id)
+                    .await
+            }
+            Some(price) => {
+                self.rest
+                    .test_limit_ioc_order(&req.symbol, side, quantity, price, &client_order_id)
+                    .await
+            }
+        };
+        let rates = tested.map_err(|err| {
+            let message = format!(
+                "the test of {side} {quantity} {} ({client_order_id}) failed: {err}",
+                req.symbol
+            );
+            err.because(message)
+        })?;
         Ok(OrderCheck {
             quantity,
             client_order_id,
@@ -1721,5 +1800,172 @@ mod tests {
         );
         assert!(adapter.lost.lock().unwrap().is_empty());
         Ok(())
+    }
+
+    // --- the limit style (Mo, 11 Oct 2026: no market orders by default; both styles stay) ---
+
+    fn live_limit(server: &MockServer, step_size: Decimal, tick: &str) -> BinanceLive {
+        live(server, step_size).with_order_style(OrderStyle::LimitIoc {
+            tick_size: HashMap::from([("SOLUSDT".to_string(), decimal(tick))]),
+        })
+    }
+
+    fn posts(requests: &[Request]) -> Vec<&Request> {
+        requests
+            .iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_limit_ioc_order_is_sent_at_the_price_seen_and_never_as_a_market_order() {
+        let server = venue().await;
+        mount_placing(
+            &server,
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "orderId": 42, "status": "FILLED", "executedQty": "10.03",
+                "fills": [{"price": "149.9", "qty": "10.03", "commission": "0.01", "commissionAsset": "USDT"}]
+            })),
+        )
+        .await;
+
+        let adapter = live_limit(&server, decimal("0.01"), "0.01");
+        let fill = adapter.execute(&request()).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let sent = posts(&requests);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(param(sent[0], "type").unwrap(), "LIMIT");
+        assert_eq!(param(sent[0], "timeInForce").unwrap(), "IOC");
+        assert_eq!(param(sent[0], "price").unwrap(), "150");
+        assert_eq!(param(sent[0], "quantity").unwrap(), "10.03");
+        assert_eq!(param(sent[0], "side").unwrap(), "BUY");
+        assert_eq!(param(sent[0], "newOrderRespType").unwrap(), "FULL");
+        assert!(sent[0].url.query().unwrap().find("MARKET").is_none());
+        // It filled at a price better than the limit, and the fill says so.
+        assert_eq!(fill.filled_qty, decimal("10.03"));
+        assert_eq!(fill.filled_price, decimal("149.9"));
+    }
+
+    #[tokio::test]
+    async fn the_default_style_is_still_the_market_order() {
+        let server = venue().await;
+        mount_placing(
+            &server,
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "orderId": 42, "status": "FILLED", "executedQty": "10.03",
+                "fills": [{"price": "150", "qty": "10.03", "commission": "0.01", "commissionAsset": "USDT"}]
+            })),
+        )
+        .await;
+
+        live(&server, decimal("0.01"))
+            .execute(&request())
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let sent = posts(&requests);
+        assert_eq!(param(sent[0], "type").unwrap(), "MARKET");
+        assert!(param(sent[0], "price").is_none() && param(sent[0], "timeInForce").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_price_off_the_tick_is_refused_before_anything_is_sent() {
+        let server = venue().await;
+        let adapter = live_limit(&server, decimal("0.01"), "0.01");
+        let mut off_tick = request();
+        off_tick.quoted_price = decimal("150.005");
+
+        let err = adapter.execute(&off_tick).await.unwrap_err();
+        assert!(err.to_string().contains("not a positive multiple"), "{err}");
+        assert!(adapter.test_order(&off_tick).await.is_err());
+        assert!(posts(&server.received_requests().await.unwrap()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_symbol_with_no_configured_tick_is_refused_before_anything_is_sent() {
+        let server = venue().await;
+        let adapter = live(&server, decimal("0.01")).with_order_style(OrderStyle::LimitIoc {
+            tick_size: HashMap::new(),
+        });
+
+        let err = adapter.execute(&request()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("no PRICE_FILTER tick configured"),
+            "{err}"
+        );
+        assert!(posts(&server.received_requests().await.unwrap()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_limit_ioc_order_that_nothing_could_fill_is_an_error_not_a_fill() {
+        let server = venue().await;
+        mount_placing(
+            &server,
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "orderId": 42, "status": "EXPIRED", "executedQty": "0.00000000", "fills": []
+            })),
+        )
+        .await;
+
+        let err = live_limit(&server, decimal("0.01"), "0.01")
+            .execute(&request())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("nothing filled"), "{err}");
+        assert!(err.downcast_ref::<OrderStateUnknown>().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_limit_ioc_order_that_filled_in_part_and_expired_is_a_partial_fill() {
+        let server = venue().await;
+        mount_placing(
+            &server,
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "orderId": 42, "status": "EXPIRED", "executedQty": "4.00",
+                "fills": [{"price": "150", "qty": "4.00", "commission": "0.004", "commissionAsset": "USDT"}]
+            })),
+        )
+        .await;
+
+        let fill = live_limit(&server, decimal("0.01"), "0.01")
+            .execute(&request())
+            .await
+            .unwrap();
+        assert_eq!(fill.filled_qty, decimal("4.00"));
+        assert!(fill.filled_qty < decimal("10.03"));
+    }
+
+    #[tokio::test]
+    async fn a_limit_order_test_sends_the_same_limit_order_to_the_test_endpoint() {
+        let server = venue().await;
+        mount_order_test(
+            &server,
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "standardCommissionForOrder": {"maker": "0.00100000", "taker": "0.00100000"},
+                "specialCommissionForOrder": {"maker": "0.00000000", "taker": "0.00000000"},
+                "taxCommissionForOrder": {"maker": "0.00000000", "taker": "0.00000000"},
+                "discount": {"enabledForAccount": false, "enabledForSymbol": false, "discountAsset": null, "discount": "0.00000000"}
+            })),
+        )
+        .await;
+
+        live_limit(&server, decimal("0.01"), "0.01")
+            .test_order(&request())
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let tested = posts(&requests);
+        assert_eq!(
+            tested[0].url.path(),
+            "/api/v3/order/test",
+            "nothing is placed"
+        );
+        assert_eq!(param(tested[0], "type").unwrap(), "LIMIT");
+        assert_eq!(param(tested[0], "timeInForce").unwrap(), "IOC");
+        assert_eq!(param(tested[0], "price").unwrap(), "150");
+        assert_eq!(param(tested[0], "computeCommissionRates").unwrap(), "true");
     }
 }

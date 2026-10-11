@@ -20,7 +20,7 @@ mod recorded;
 mod rest;
 pub(crate) mod sign;
 
-pub use live::BinanceLive;
+pub use live::{BinanceLive, OrderStyle};
 pub use reads::{
     ApiRestrictions, BookTicker, Commission, OrderBookSnapshot, PublicTrade, SymbolCommission,
     SymbolRules,

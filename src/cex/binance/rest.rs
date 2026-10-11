@@ -174,6 +174,41 @@ impl BinanceRest {
         self.client.signed(Method::POST, ORDER_PATH, &params).await
     }
 
+    /// Places a limit order, immediate-or-cancel, at `price` under
+    /// `client_order_id`, and returns Binance's own answer to that call.
+    /// Whatever can fill at `price` or better fills, at once; the rest
+    /// expires, so the order never rests in the book. `quantity` and `price`
+    /// are venue-ready: rounding the quantity to the step and checking the
+    /// price against the tick are `BinanceLive`'s job, not this client's.
+    pub(crate) async fn place_limit_ioc_order(
+        &self,
+        symbol: &str,
+        side: &str,
+        quantity: Decimal,
+        price: Decimal,
+        client_order_id: &str,
+    ) -> Result<BinanceOrderResponse, ApiError> {
+        let params = limit_ioc_order(symbol, side, quantity, price, client_order_id);
+        self.client.signed(Method::POST, ORDER_PATH, &params).await
+    }
+
+    /// Checks the limit order [`Self::place_limit_ioc_order`] would place,
+    /// as [`Self::test_market_order`] checks a market order.
+    pub(crate) async fn test_limit_ioc_order(
+        &self,
+        symbol: &str,
+        side: &str,
+        quantity: Decimal,
+        price: Decimal,
+        client_order_id: &str,
+    ) -> Result<CommissionRates, ApiError> {
+        let mut params = limit_ioc_order(symbol, side, quantity, price, client_order_id).to_vec();
+        params.push(("computeCommissionRates", "true".to_string()));
+        self.client
+            .signed(Method::POST, ORDER_TEST_PATH, &params)
+            .await
+    }
+
     /// Checks the market order [`Self::place_market_order`] would place,
     /// with the same parameters, at `POST /api/v3/order/test`, and returns
     /// the commission rates Binance says its trades would pay. Nothing is
@@ -191,6 +226,27 @@ impl BinanceRest {
             .signed(Method::POST, ORDER_TEST_PATH, &params)
             .await
     }
+}
+
+/// A limit order's parameters, immediate-or-cancel, as both the order and its
+/// test send them.
+fn limit_ioc_order(
+    symbol: &str,
+    side: &str,
+    quantity: Decimal,
+    price: Decimal,
+    client_order_id: &str,
+) -> [(&'static str, String); 8] {
+    [
+        ("symbol", symbol.to_string()),
+        ("side", side.to_string()),
+        ("type", "LIMIT".to_string()),
+        ("timeInForce", "IOC".to_string()),
+        ("quantity", quantity.normalize().to_string()),
+        ("price", price.normalize().to_string()),
+        ("newClientOrderId", client_order_id.to_string()),
+        ("newOrderRespType", "FULL".to_string()),
+    ]
 }
 
 /// A market order's parameters, as both the order and its test send them.
