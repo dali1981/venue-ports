@@ -348,18 +348,18 @@ fn scrub_json(value: serde_json::Value, scrub: &dyn Fn(&str) -> String) -> serde
 
 /// How many calls ended each way.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct Tally {
-    pub(crate) pass: u32,
-    pub(crate) fail: u32,
-    pub(crate) skipped: u32,
-    pub(crate) halted: u32,
-    pub(crate) unmapped: u32,
+pub struct Tally {
+    pub pass: u32,
+    pub fail: u32,
+    pub skipped: u32,
+    pub halted: u32,
+    pub unmapped: u32,
 }
 
 impl Tally {
     /// Whether the run's exit status is success: nothing failed, nothing was
     /// halted and nothing is unmapped.
-    pub(crate) fn is_clean(&self) -> bool {
+    pub fn is_clean(&self) -> bool {
         self.fail == 0 && self.halted == 0 && self.unmapped == 0
     }
 }

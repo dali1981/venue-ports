@@ -1,16 +1,19 @@
 //! The production test tier (`specs/V7-production-validation.md`).
 //!
-//! Everything here is `#[cfg(test)]`: the signed Binance client is
-//! `pub(crate)`, so a test inside the crate is the only code that can drive it
-//! the way a production run needs. Every test that touches a production venue
-//! is `#[ignore]`d and run by a person, with keys and money:
+//! The signed Binance client is `pub(crate)`, so the tier is compiled inside
+//! this crate: in test builds, where every test that touches a production
+//! venue is `#[ignore]`d and run by a person, with keys and money:
 //!
 //! ```text
 //! cargo test --lib production_lv1_binance -- --ignored --nocapture
 //! ```
 //!
-//! **Nothing in this crate's build runs one.** What the build runs is each
-//! case's self-test, against a mock standing in for the venue.
+//! and, with the `production` feature, as [`run`], the one function another
+//! repository calls to run a case (see [`api`]).
+//!
+//! **Nothing in this crate's build runs a case against a venue.** What the
+//! build runs is each case's self-test, against a mock standing in for the
+//! venue.
 //!
 //! The harness:
 //!
@@ -27,6 +30,10 @@
 //! A [`Run`] holds them together, and [`Run::call`] is how every call is
 //! made: it times the call, reads its outcome, judges it against what the case
 //! expects, and writes the line.
+
+mod api;
+pub use api::{run, Case, Summary, Variables};
+pub use results::Tally;
 
 pub(crate) mod chain_checks;
 pub(crate) mod env;
@@ -54,7 +61,7 @@ use crate::production::gate::{Echo, Gate, OrderPermit};
 use crate::production::ledger::{Ledger, Stop};
 use crate::production::record::Recorder;
 use crate::production::results::{
-    judge, Expected, Kind, Outcome, Params, RequestRecord, ResultLine, Results, Tally, Verdict,
+    judge, Expected, Kind, Outcome, Params, RequestRecord, ResultLine, Results, Verdict,
 };
 use crate::production::wire::{Call, Held, Wire};
 use anyhow::{bail, Context, Result};
@@ -156,8 +163,10 @@ impl From<std::result::Result<(), String>> for Grade {
 /// A call that was made, and what was made of it.
 pub(crate) struct Called<T> {
     pub(crate) result: Result<T>,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) outcome: Outcome,
     pub(crate) verdict: Verdict,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) reason: String,
     /// The venue accepted a request the case expected it to refuse.
     accepted_a_refusal_case: bool,
@@ -532,6 +541,7 @@ impl Run {
 
     /// The run is over: `Ok` only if nothing failed, nothing was halted and
     /// nothing is unmapped.
+    #[cfg(test)]
     pub(crate) fn finish(&self) -> Result<Tally> {
         let tally = self.tally();
         if !tally.is_clean() {

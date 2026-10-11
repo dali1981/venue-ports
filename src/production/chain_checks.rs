@@ -490,6 +490,7 @@ pub(crate) fn swap_references(facts: &SwapFacts<'_>) -> Value {
 }
 
 /// The names of the fields every swap's `references` has, present or `null`.
+#[cfg(test)]
 pub(crate) const SWAP_REFERENCE_FIELDS: [&str; 22] = [
     "quote_pre_send",
     "calldata",

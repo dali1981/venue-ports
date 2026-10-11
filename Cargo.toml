@@ -45,7 +45,14 @@ borsh = "1.5"
 # own short-vec layout).
 bincode = "1.3.3"
 base64 = "0.22.1"
+# LV1's case C5 (a node that sleeps past the timeout) starts a local server; only the `production` feature needs it outside tests.
+wiremock = { version = "0.6.5", optional = true }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "time", "macros", "sync"] }
+
+[features]
+# Compiles the production validation tier (`src/production`) as library code, so that another repository can run one of its cases
+# (`production::run`). Off by default: without it the tier is what it always was, test code.
+production = ["dep:wiremock"]
 
 [dev-dependencies]
 # Already in the graph through `alloy-consensus`; the tests use it to decode

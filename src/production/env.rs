@@ -6,8 +6,10 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use rust_decimal::Decimal;
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::str::FromStr;
+#[cfg(test)]
 use std::sync::Mutex;
 
 pub(crate) trait Env {
@@ -35,9 +37,11 @@ impl Env for ProcessEnv {
 }
 
 /// A fixed set of variables, for a test.
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct MapEnv(Mutex<BTreeMap<String, String>>);
 
+#[cfg(test)]
 impl MapEnv {
     pub(crate) fn new(vars: &[(&str, &str)]) -> Self {
         Self(Mutex::new(
@@ -48,6 +52,7 @@ impl MapEnv {
     }
 }
 
+#[cfg(test)]
 impl Env for MapEnv {
     fn var(&self, key: &str) -> Option<String> {
         self.0

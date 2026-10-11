@@ -1381,7 +1381,7 @@ mod tests {
     use crate::evm::erc20::transfer_topic;
     use crate::evm::rpc::format_u256;
     use crate::production::chain_checks::SWAP_REFERENCE_FIELDS;
-    use crate::production::env::{MapEnv, ProcessEnv};
+    use crate::production::env::MapEnv;
     use crate::production::gate::Echo;
     use crate::production::lv1_base::Throwaway;
     use crate::production::mini_chain::{self as mini, Knobs, MiniChain, Tweak};
@@ -2795,15 +2795,12 @@ mod tests {
     #[tokio::test]
     #[ignore = "sends real swaps on Base mainnet with a real key: see specs/V7-production-validation.md"]
     async fn production_lv2b_chain() {
-        let env = ProcessEnv;
-        // The run reads the key's value first, so that no line can hold it.
-        let run =
-            Run::start(&env, "base", "base-mainnet", Echo::Stdout).expect("the run's settings");
-        let (settings, signer) = Settings::from_env(&env).expect("the case settings");
-        Lv2bChain::new(&run, settings)
-            .run_all(signer)
-            .await
-            .expect("the run");
-        run.finish().expect("LV2b is clean");
+        let summary = crate::production::run(
+            crate::production::Case::Lv2bChain,
+            &crate::production::Variables::process(),
+        )
+        .await
+        .expect("the run");
+        assert!(summary.is_clean(), "LV2b is clean: {summary:?}");
     }
 }

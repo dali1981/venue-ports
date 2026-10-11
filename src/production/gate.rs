@@ -18,6 +18,7 @@ pub(crate) enum Echo {
     /// Printed to the standard output, as an ignored test run by hand shows it.
     Stdout,
     /// Kept only, for a test to read.
+    #[cfg_attr(not(test), allow(dead_code))]
     Quiet,
 }
 
@@ -138,6 +139,7 @@ impl Gate {
     }
 
     /// What a dry run has printed.
+    #[cfg(test)]
     pub(crate) fn printed(&self) -> Vec<String> {
         self.state.lock().unwrap().printed.clone()
     }

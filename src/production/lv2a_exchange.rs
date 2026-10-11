@@ -771,10 +771,7 @@ mod tests {
     use super::*;
     use crate::cex::binance::clock::local_now_ms;
     use crate::cex::binance::sign;
-    use crate::production::env::ProcessEnv;
     use crate::production::exchange_checks::ORDER_REFERENCE_FIELDS;
-    use crate::production::gate::Echo;
-    use crate::production::guard::PRODUCTION_BINANCE_SPOT;
     use crate::production::sizing::is_on_step;
     use crate::production::testing::{fast, Setup};
     use serde_json::{json, Value};
@@ -2046,18 +2043,12 @@ mod tests {
     #[tokio::test]
     #[ignore = "places real orders on Binance production with a real key: see specs/V7-production-validation.md"]
     async fn production_lv2a_exchange() {
-        let env = ProcessEnv;
-        let run = Run::start(&env, "binance-spot", "api.binance.com", Echo::Stdout)
-            .expect("the run's settings");
-        let settings = Settings::from_env(&env).expect("the case settings");
-        let mut lv2a = Lv2aExchange::new(
-            &run,
-            &env,
-            PRODUCTION_BINANCE_SPOT.to_string(),
-            CexTimings::default(),
-            settings,
-        );
-        lv2a.run_all().await.expect("the run");
-        run.finish().expect("LV2a is clean");
+        let summary = crate::production::run(
+            crate::production::Case::Lv2aExchange,
+            &crate::production::Variables::process(),
+        )
+        .await
+        .expect("the run");
+        assert!(summary.is_clean(), "LV2a is clean: {summary:?}");
     }
 }

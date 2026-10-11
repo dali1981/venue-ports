@@ -771,9 +771,6 @@ mod tests {
     use super::*;
     use crate::cex::binance::clock::local_now_ms;
     use crate::cex::binance::sign;
-    use crate::production::env::ProcessEnv;
-    use crate::production::gate::Echo;
-    use crate::production::guard::PRODUCTION_BINANCE_SPOT;
     use crate::production::testing::{fast, Setup};
     use serde_json::{json, Value};
     use std::str::FromStr;
@@ -1996,18 +1993,12 @@ mod tests {
     #[tokio::test]
     #[ignore = "runs against Binance production with a real key: see specs/V7-production-validation.md"]
     async fn production_lv1_binance() {
-        let env = ProcessEnv;
-        let run = Run::start(&env, "binance-spot", "api.binance.com", Echo::Stdout)
-            .expect("the run's settings");
-        let settings = Settings::from_env(&env).expect("the case settings");
-        let mut lv1 = Lv1Binance::new(
-            &run,
-            &env,
-            PRODUCTION_BINANCE_SPOT.to_string(),
-            CexTimings::default(),
-            settings,
-        );
-        lv1.run_all().await.expect("the run");
-        run.finish().expect("LV1 is clean");
+        let summary = crate::production::run(
+            crate::production::Case::Lv1Binance,
+            &crate::production::Variables::process(),
+        )
+        .await
+        .expect("the run");
+        assert!(summary.is_clean(), "LV1 is clean: {summary:?}");
     }
 }

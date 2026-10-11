@@ -540,6 +540,7 @@ pub(crate) fn order_references(
 }
 
 /// The names of the fields every order's `references` has, present or `null`.
+#[cfg(test)]
 pub(crate) const ORDER_REFERENCE_FIELDS: [&str; 8] = [
     "touch_at_send",
     "sent_ns",

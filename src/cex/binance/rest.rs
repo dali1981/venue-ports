@@ -150,7 +150,7 @@ impl BinanceRest {
 
     /// This client, asking `wire` before each call and telling it each reply:
     /// how the production harness holds a call back, or records its reply.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "production"))]
     pub(crate) fn with_wire(
         mut self,
         wire: std::sync::Arc<dyn crate::production::wire::Wire>,

@@ -124,6 +124,7 @@ impl Ledger {
         self.spend_cap
     }
 
+    #[cfg(test)]
     pub(crate) fn order_cap(&self) -> Decimal {
         self.order_cap
     }

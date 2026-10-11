@@ -133,7 +133,7 @@ pub(crate) struct BinanceClient {
     timings: CexTimings,
     /// The production harness's seam (`src/production`): asked before each
     /// call, told each reply. Test builds only; unset, the client is as it is.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "production"))]
     wire: Option<Arc<dyn crate::production::wire::Wire>>,
 }
 
@@ -161,7 +161,7 @@ impl BinanceClient {
             time_path,
             clock: Arc::new(ServerClock::new(timings.recv_window, timings.clock_refresh)),
             timings,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "production"))]
             wire: None,
         }
     }
@@ -202,7 +202,7 @@ impl BinanceClient {
         path: &str,
         params: &[(&str, String)],
     ) -> Result<T, ApiError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "production"))]
         self.gate(&Method::GET, path, params)?;
         let query = sign::encode_query(params);
         self.send(Method::GET, path, &query, false, Instant::now())
@@ -212,7 +212,7 @@ impl BinanceClient {
     /// Reads the venue's clock now, refusing a round trip that does not fit
     /// inside `recvWindow`. Returns the round trip.
     pub(crate) async fn sync_clock(&self) -> anyhow::Result<Duration> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "production"))]
         self.gate(&Method::GET, self.time_path, &[])?;
         let sent_local_ms = local_now_ms();
         let started = Instant::now();
@@ -242,7 +242,7 @@ impl BinanceClient {
         path: &str,
         params: &[(&str, String)],
     ) -> Result<T, ApiError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "production"))]
         self.gate(&method, path, params)?;
         let mut resynced = false;
         loop {
@@ -306,7 +306,7 @@ impl BinanceClient {
             request = request.header("X-MBX-APIKEY", &self.api_key);
         }
 
-        #[cfg(test)]
+        #[cfg(any(test, feature = "production"))]
         self.sending(method.as_str(), path);
         let response = match request.send().await {
             Ok(response) => response,
@@ -327,7 +327,7 @@ impl BinanceClient {
 
         let status = response.status();
         let body = response.text().await;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "production"))]
         if let Ok(text) = &body {
             self.observe(method.as_str(), path, status.as_u16(), text);
         }
@@ -370,7 +370,7 @@ impl BinanceClient {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "production"))]
 mod hooks;
 
 #[cfg(test)]

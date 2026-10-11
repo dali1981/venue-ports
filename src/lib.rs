@@ -17,10 +17,12 @@ pub mod liquidity;
 pub mod solana;
 pub mod testkit;
 
-// The production test tier (`specs/V7-production-validation.md`): test builds
-// only, because the signed clients are `pub(crate)`.
-#[cfg(test)]
-mod production;
+// The production validation tier (`specs/V7-production-validation.md`). The signed clients are
+// `pub(crate)`, so the tier is compiled inside this crate: in test builds, where each case is an
+// `#[ignore]`d test, and, with the `production` feature, as `production::run`, the one function
+// another repository calls to run a case.
+#[cfg(any(test, feature = "production"))]
+pub mod production;
 
 #[cfg(test)]
 mod catalogue;

@@ -973,8 +973,7 @@ impl<'a> Lv1Base<'a> {
 mod tests {
     use super::*;
     use crate::evm::rpc::encode_error_string;
-    use crate::production::env::{MapEnv, ProcessEnv};
-    use crate::production::gate::Echo;
+    use crate::production::env::MapEnv;
     use crate::production::testing::{MockNode, Setup};
     use alloy_primitives::B256;
     use wiremock::MockServer;
@@ -1920,14 +1919,12 @@ mod tests {
     #[tokio::test]
     #[ignore = "runs against Base mainnet nodes: see specs/V7-production-validation.md"]
     async fn production_lv1_base() {
-        let env = ProcessEnv;
-        let run =
-            Run::start(&env, "base", "base-mainnet", Echo::Stdout).expect("the run's settings");
-        let settings = Settings::from_env(&env).expect("the case settings");
-        Lv1Base::new(&run, settings)
-            .run_all()
-            .await
-            .expect("the run");
-        run.finish().expect("LV1 on Base is clean");
+        let summary = crate::production::run(
+            crate::production::Case::Lv1Base,
+            &crate::production::Variables::process(),
+        )
+        .await
+        .expect("the run");
+        assert!(summary.is_clean(), "LV1 on Base is clean: {summary:?}");
     }
 }
