@@ -1,9 +1,15 @@
 //! LV2a against Binance spot (`specs/V7-production-validation.md`, "LV2a"): one
 //! exchange order at a time, reconciled to the unit. One test,
-//! `production_lv2a_exchange`, makes ten round trips on `VP_SYMBOL`, each a market
-//! buy and then a market sell of what the buy delivered, of about `VP_ORDER_USD`:
-//! the first at about 6 USD, the second with a quantity that needs rounding to the
-//! lot step.
+//! `production_lv2a_exchange`, makes ten round trips on `VP_SYMBOL`, each a buy and
+//! then a sell of what the buy delivered, of about `VP_ORDER_USD`: the first at about
+//! 6 USD, the second with a quantity that needs rounding to the lot step.
+//!
+//! Each leg is a market order unless `VP_BUY_ORDER` or `VP_SELL_ORDER` says
+//! `limit-ioc`: a limit order at the touch the case read just before it
+//! (`OrderStyle::LimitIoc`), which fills at that price or better and never rests. A
+//! limit-ioc leg is refused (nothing sent) when the touch holds less than its
+//! quantity, because it would fill in part. The style of each order is on its line,
+//! in `references.order_style`, with `references.limit_price`.
 //!
 //! Before each order the case reads the book (five levels) and the account's
 //! balances; it sends the order; and it checks what the venue says of it against
@@ -38,7 +44,7 @@ use crate::balance::{SpotAccountBalances, SpotBalanceReader};
 use crate::cex::binance::order::trade_lines;
 use crate::cex::{
     BinanceLive, BinanceRest, CexExecutor, CexFill, CexOrders, CexTimings, OrderRequest, OrderSide,
-    SymbolCommission, SymbolRules,
+    OrderStyle, SymbolCommission, SymbolRules,
 };
 use crate::production::env::{positive_count, positive_decimal, Env};
 use crate::production::exchange_checks::{
@@ -51,10 +57,13 @@ use crate::production::lv1_binance::Flow;
 use crate::production::results::{Expected, Tally, Verdict};
 use crate::production::sizing::{quantity_for, round_down};
 use crate::production::{CallSpec, Grade, Run};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use rust_decimal::Decimal;
+use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::str::FromStr;
 
+const EXCHANGE_INFO_PATH: &str = "/api/v3/exchangeInfo";
 const ORDER_PATH: &str = "/api/v3/order";
 const DEPTH_PATH: &str = "/api/v3/depth";
 const MY_TRADES_PATH: &str = "/api/v3/myTrades";
@@ -78,6 +87,10 @@ pub(crate) struct Settings {
     pub(crate) order_usd: Decimal,
     /// `VP_ROUND_TRIPS`, default ten: fewer for a pilot.
     pub(crate) round_trips: usize,
+    /// `VP_BUY_ORDER`, default `market`: how every buy is expressed.
+    pub(crate) buy_order: LegStyle,
+    /// `VP_SELL_ORDER`, default `market`: how every sell is expressed.
+    pub(crate) sell_order: LegStyle,
 }
 
 impl Settings {
@@ -88,7 +101,38 @@ impl Settings {
                 .unwrap_or_else(|| "AEROUSDT".to_string()),
             order_usd: positive_decimal(env, "VP_ORDER_USD", Some(Decimal::from(10)))?,
             round_trips: positive_count(env, "VP_ROUND_TRIPS", ROUND_TRIPS)?,
+            buy_order: LegStyle::from_env(env, "VP_BUY_ORDER")?,
+            sell_order: LegStyle::from_env(env, "VP_SELL_ORDER")?,
         })
+    }
+}
+
+/// How a leg's order is expressed to the exchange: what the case asks of the adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LegStyle {
+    /// A market order: no price, so whatever the book offers.
+    Market,
+    /// A limit order at the touch the case read just before it, immediate-or-cancel
+    /// (`OrderStyle::LimitIoc`): it fills at that price or better, or not at all.
+    LimitIoc,
+}
+
+impl LegStyle {
+    /// The word the environment and the recorded line use.
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            Self::Market => "market",
+            Self::LimitIoc => "limit-ioc",
+        }
+    }
+
+    fn from_env(env: &dyn Env, key: &str) -> Result<Self> {
+        match env.var(key).as_deref() {
+            None => Ok(Self::Market),
+            Some("market") => Ok(Self::Market),
+            Some("limit-ioc") => Ok(Self::LimitIoc),
+            Some(other) => bail!("{key} is {other:?}: it is `market` or `limit-ioc`"),
+        }
     }
 }
 
@@ -122,7 +166,10 @@ pub(crate) struct Lv2aExchange<'a> {
     rules: Option<SymbolRules>,
     commission: Option<SymbolCommission>,
     start: Option<SpotAccountBalances>,
+    /// The adapter that sends market orders.
     live: Option<BinanceLive>,
+    /// The adapter that sends limit-ioc orders, built only when a leg asks for them.
+    live_limit: Option<BinanceLive>,
 }
 
 fn stem(trip: usize, side: OrderSide) -> String {
@@ -150,6 +197,32 @@ fn minimum_notional(rules: &SymbolRules) -> Option<Decimal> {
         .filter(|_| rules.apply_min_to_market != Some(false))
 }
 
+/// The minimum notional an order of this style must meet: a market order's is
+/// the venue's `applyMinToMarket` rule; a limit order always meets it.
+fn minimum_for(style: LegStyle, rules: &SymbolRules) -> Option<Decimal> {
+    match style {
+        LegStyle::Market => minimum_notional(rules),
+        LegStyle::LimitIoc => rules.min_notional,
+    }
+}
+
+/// `PRICE_FILTER.tickSize` of `symbol` in the body of `GET /api/v3/exchangeInfo`, read
+/// from the body as the venue sent it (`SymbolRules` does not carry it). `None` where
+/// the symbol, the filter or a non-zero tick is not there.
+fn price_tick(body: &str, symbol: &str) -> Option<Decimal> {
+    let info: Value = serde_json::from_str(body).ok()?;
+    let row = info["symbols"]
+        .as_array()?
+        .iter()
+        .find(|row| row["symbol"] == symbol)?;
+    let tick = row["filters"]
+        .as_array()?
+        .iter()
+        .find(|filter| filter["filterType"] == "PRICE_FILTER")?["tickSize"]
+        .as_str()?;
+    Decimal::from_str(tick).ok().filter(|tick| !tick.is_zero())
+}
+
 impl<'a> Lv2aExchange<'a> {
     pub(crate) fn new(
         run: &'a Run,
@@ -168,6 +241,7 @@ impl<'a> Lv2aExchange<'a> {
             commission: None,
             start: None,
             live: None,
+            live_limit: None,
         }
     }
 
@@ -184,6 +258,29 @@ impl<'a> Lv2aExchange<'a> {
         self.live
             .as_ref()
             .ok_or_else(|| anyhow!("the case went on without having read the symbol's rules"))
+    }
+
+    /// The adapter that expresses an order in `style`.
+    fn live_for(&self, style: LegStyle) -> Result<&BinanceLive> {
+        match style {
+            LegStyle::Market => self.live(),
+            LegStyle::LimitIoc => self.live_limit.as_ref().ok_or_else(|| {
+                anyhow!("a limit-ioc leg was reached without the limit adapter having been built")
+            }),
+        }
+    }
+
+    /// `PRICE_FILTER.tickSize` of `symbol`, from the exchangeInfo the case read first.
+    fn price_tick(&self, symbol: &str) -> Option<Decimal> {
+        let body = self
+            .run
+            .gate()
+            .exchanges()
+            .into_iter()
+            .rev()
+            .find(|exchange| exchange.path == EXCHANGE_INFO_PATH)
+            .and_then(|exchange| exchange.body)?;
+        price_tick(&body, symbol)
     }
 
     fn rules(&self) -> Result<&SymbolRules> {
@@ -235,6 +332,9 @@ impl<'a> Lv2aExchange<'a> {
                 },
             )
             .await?;
+        // The tick is in the exchangeInfo body just read: the gate forgets a call's
+        // exchanges when the next one begins, so it is taken before the next read.
+        let tick = self.price_tick(&symbol);
         let commission = self
             .run
             .call(
@@ -276,10 +376,27 @@ impl<'a> Lv2aExchange<'a> {
             )?;
             return Ok(Flow::Stop);
         }
-        self.live = Some(BinanceLive::new(
-            self.rest()?,
-            HashMap::from([(symbol, rules.lot_step)]),
-        ));
+        let steps = HashMap::from([(symbol.clone(), rules.lot_step)]);
+        self.live = Some(BinanceLive::new(self.rest()?, steps.clone()));
+        if [self.settings.buy_order, self.settings.sell_order].contains(&LegStyle::LimitIoc) {
+            let Some(tick) = tick else {
+                self.run.computed(
+                    CASE,
+                    Verdict::Fail,
+                    &format!(
+                        "a limit-ioc leg was asked for and exchangeInfo gives {symbol} no \
+                         PRICE_FILTER tick to price it on: nothing was sent"
+                    ),
+                    None,
+                )?;
+                return Ok(Flow::Stop);
+            };
+            self.live_limit = Some(BinanceLive::new(self.rest()?, steps).with_order_style(
+                OrderStyle::LimitIoc {
+                    tick_size: HashMap::from([(symbol, tick)]),
+                },
+            ));
+        }
         Ok(Flow::Go)
     }
 
@@ -368,7 +485,11 @@ impl<'a> Lv2aExchange<'a> {
     /// One order and the checks on it.
     async fn leg(&self, trip: usize, side: OrderSide, want: Want) -> Result<Leg> {
         let rules = self.rules()?.clone();
-        let live = self.live()?;
+        let style = match side {
+            OrderSide::Buy => self.settings.buy_order,
+            OrderSide::Sell => self.settings.sell_order,
+        };
+        let live = self.live_for(style)?;
         let rates = self
             .commission
             .clone()
@@ -441,7 +562,7 @@ impl<'a> Lv2aExchange<'a> {
             Want::Quantity(quantity) => quantity,
         };
         let rounded = round_down(requested, rules.lot_step)?;
-        if let Some(why) = self.cannot_trade(side, &rules, &rates, rounded, &touch) {
+        if let Some(why) = self.cannot_trade(side, style, &rules, &rates, rounded, &touch) {
             self.run.computed(CASE, Verdict::Skipped, &why, None)?;
             return Ok(if side == OrderSide::Buy {
                 Leg::Skipped
@@ -478,13 +599,20 @@ impl<'a> Lv2aExchange<'a> {
                 CallSpec::new(CASE, Expected::ok()).record_as(&format!("{name}-order")),
                 || live.execute(&request),
                 |result| {
-                    Some(order_references(
+                    let mut references = order_references(
                         side,
                         Some(&touch),
                         sent().as_ref(),
                         result.as_ref().ok(),
                         Some(&rates),
-                    ))
+                    );
+                    // How the order was expressed, beside what it was priced against.
+                    references["order_style"] = json!(style.word());
+                    references["limit_price"] = match style {
+                        LegStyle::LimitIoc => json!(price.to_string()),
+                        LegStyle::Market => Value::Null,
+                    };
+                    Some(references)
                 },
                 |_| Grade::Pass,
             )
@@ -620,11 +748,15 @@ impl<'a> Lv2aExchange<'a> {
     }
 
     /// Whether a leg's order cannot be placed as sized, and why: under the
-    /// symbol's minimum, or (for a buy) too small for what it delivers to be sold
-    /// back above the minimum with a one per cent move against it.
+    /// symbol's minimum, a limit-ioc order the touch is too thin for (it would fill
+    /// in part, and a part may be too small to sell back), or (for a buy) too small
+    /// for what it delivers to be sold back above the minimum with a one per cent
+    /// move against it. `style` is this leg's; the sell leg's decides the sold-back
+    /// check.
     fn cannot_trade(
         &self,
         side: OrderSide,
+        style: LegStyle,
         rules: &SymbolRules,
         rates: &SymbolCommission,
         quantity: Decimal,
@@ -636,41 +768,60 @@ impl<'a> Lv2aExchange<'a> {
                 rules.min_qty
             ));
         }
-        let minimum = minimum_notional(rules)?;
         let (bid, ask) = (
             touch.snapshot.bids.first()?.0,
             touch.snapshot.asks.first()?.0,
         );
+        if style == LegStyle::LimitIoc {
+            let (price, available) = match side {
+                OrderSide::Buy => touch.snapshot.asks.first()?,
+                OrderSide::Sell => touch.snapshot.bids.first()?,
+            };
+            if *available < quantity {
+                return Some(format!(
+                    "the touch holds {available} {} at {price}, less than the {quantity} a \
+                     limit-ioc order at the touch asks for: it would fill in part",
+                    rules.base_asset
+                ));
+            }
+        }
         let at_risk = |quantity: Decimal, price: Decimal| quantity.checked_mul(price);
         match side {
             OrderSide::Sell => {
-                if at_risk(quantity, bid).is_none_or(|value| value < minimum) {
-                    return Some(format!(
-                        "{quantity} {} at {bid} is under the minimum notional of {minimum}: \
-                         the buy's quantity cannot be sold back",
-                        rules.base_asset
-                    ));
+                if let Some(minimum) = minimum_for(style, rules) {
+                    if at_risk(quantity, bid).is_none_or(|value| value < minimum) {
+                        return Some(format!(
+                            "{quantity} {} at {bid} is under the minimum notional of {minimum}: \
+                             the buy's quantity cannot be sold back",
+                            rules.base_asset
+                        ));
+                    }
                 }
             }
             OrderSide::Buy => {
-                if at_risk(quantity, ask).is_none_or(|value| value < minimum) {
-                    return Some(format!(
-                        "{quantity} {} at {ask} is under the minimum notional of {minimum}",
-                        rules.base_asset
-                    ));
+                if let Some(minimum) = minimum_for(style, rules) {
+                    if at_risk(quantity, ask).is_none_or(|value| value < minimum) {
+                        return Some(format!(
+                            "{quantity} {} at {ask} is under the minimum notional of {minimum}",
+                            rules.base_asset
+                        ));
+                    }
                 }
-                let rate = effective_rate(OrderSide::Buy, rates).ok()?;
-                let delivered =
-                    round_down(quantity.checked_mul(Decimal::ONE - rate)?, rules.lot_step).ok()?;
-                let back = delivered
-                    .checked_mul(bid)?
-                    .checked_mul(Decimal::new(99, 2))?;
-                if back < minimum {
-                    return Some(format!(
-                        "what {quantity} {} delivers would be worth about {back} when sold \
-                         back, under the minimum notional of {minimum}",
-                        rules.base_asset
-                    ));
+                if let Some(minimum) = minimum_for(self.settings.sell_order, rules) {
+                    let rate = effective_rate(OrderSide::Buy, rates).ok()?;
+                    let delivered =
+                        round_down(quantity.checked_mul(Decimal::ONE - rate)?, rules.lot_step)
+                            .ok()?;
+                    let back = delivered
+                        .checked_mul(bid)?
+                        .checked_mul(Decimal::new(99, 2))?;
+                    if back < minimum {
+                        return Some(format!(
+                            "what {quantity} {} delivers would be worth about {back} when sold \
+                             back, under the minimum notional of {minimum}",
+                            rules.base_asset
+                        ));
+                    }
                 }
             }
         }
@@ -821,6 +972,14 @@ mod tests {
         slow_first_reply: bool,
         /// The placing reply has no `transactTime`.
         no_transact_time: bool,
+        /// The first level of each side holds 500, so that a limit-ioc order at the
+        /// touch fills whole.
+        deep_touch: bool,
+        /// The book an order meets is 0.0010 worse than the one the depth read
+        /// showed: the touch moved between the read and the order.
+        book_moved: bool,
+        /// `exchangeInfo` gives the symbol no `PRICE_FILTER`.
+        no_price_filter: bool,
     }
 
     struct Trade {
@@ -841,6 +1000,9 @@ mod tests {
         quote: Decimal,
         time_ms: i64,
         trades: Vec<Trade>,
+        /// The limit price of a limit-ioc order; `None` for a market order.
+        limit: Option<Decimal>,
+        status: &'static str,
     }
 
     struct State {
@@ -910,6 +1072,20 @@ mod tests {
             self.state.lock().unwrap().orders.len()
         }
 
+        /// The book the depth read shows, a side of it.
+        fn book(&self, buy: bool) -> [(&'static str, &'static str); 2] {
+            let (mut asks, mut bids) = (ASKS, BIDS);
+            if self.knobs.deep_touch {
+                asks[0].1 = "500";
+                bids[0].1 = "500";
+            }
+            if buy {
+                asks
+            } else {
+                bids
+            }
+        }
+
         fn refuse(status: u16, code: i64, msg: &str) -> ResponseTemplate {
             ResponseTemplate::new(status).set_body_json(json!({"code": code, "msg": msg}))
         }
@@ -975,20 +1151,28 @@ mod tests {
             )
         }
 
-        fn exchange_info() -> Value {
+        fn exchange_info(&self) -> Value {
+            let mut filters = vec![
+                json!({"filterType": "LOT_SIZE", "minQty": "0.10000000",
+                       "maxQty": "100000.00000000", "stepSize": "0.10000000"}),
+                json!({"filterType": "NOTIONAL", "minNotional": "5.00000000",
+                       "applyMinToMarket": true, "maxNotional": "9000000.00000000",
+                       "applyMaxToMarket": false, "avgPriceMins": 5}),
+            ];
+            if !self.knobs.no_price_filter {
+                filters.insert(
+                    0,
+                    json!({"filterType": "PRICE_FILTER", "minPrice": "0.00010000",
+                           "maxPrice": "1000.00000000", "tickSize": "0.00010000"}),
+                );
+            }
             json!({
                 "timezone": "UTC", "serverTime": local_now_ms(), "rateLimits": [],
                 "exchangeFilters": [],
                 "symbols": [{
                     "symbol": "AEROUSDT", "status": "TRADING",
                     "baseAsset": "AERO", "quoteAsset": "USDT",
-                    "filters": [
-                        {"filterType": "LOT_SIZE", "minQty": "0.10000000",
-                         "maxQty": "100000.00000000", "stepSize": "0.10000000"},
-                        {"filterType": "NOTIONAL", "minNotional": "5.00000000",
-                         "applyMinToMarket": true, "maxNotional": "9000000.00000000",
-                         "applyMaxToMarket": false, "avgPriceMins": 5}
-                    ]
+                    "filters": filters
                 }]
             })
         }
@@ -1066,7 +1250,33 @@ mod tests {
                 .unwrap_or_default();
             let client_id = Self::param(request, "newClientOrderId").unwrap_or_default();
             let buy = side == "BUY";
-            let book: &[(&str, &str)] = if buy { &ASKS } else { &BIDS };
+            let book = self.book(buy);
+            // A limit order must say its price and be immediate-or-cancel here, and
+            // the price must sit on the tick, as Binance's filters require.
+            let limit = if Self::param(request, "type").as_deref() == Some("LIMIT") {
+                let Some(price) =
+                    Self::param(request, "price").and_then(|value| Decimal::from_str(&value).ok())
+                else {
+                    return Self::refuse(
+                        400,
+                        -1102,
+                        "Mandatory parameter 'price' was not sent, was empty/null, or malformed.",
+                    );
+                };
+                if Self::param(request, "timeInForce").as_deref() != Some("IOC") {
+                    return Self::refuse(
+                        400,
+                        -1102,
+                        "Mandatory parameter 'timeInForce' was not sent, was empty/null, or malformed.",
+                    );
+                }
+                if !is_on_step(price, d("0.0001")) {
+                    return Self::refuse(400, -1013, "Filter failure: PRICE_FILTER");
+                }
+                Some(price)
+            } else {
+                None
+            };
             if self.knobs.refuses_orders {
                 return Self::refuse(
                     400,
@@ -1081,15 +1291,31 @@ mod tests {
                 return Self::refuse(400, -1013, "Filter failure: NOTIONAL");
             }
 
-            // Walk the book.
+            // Walk the book, which may have moved since the depth read. A limit order
+            // meets only the levels at its price or better.
+            let shift = if self.knobs.book_moved {
+                d("0.0010")
+            } else {
+                Decimal::ZERO
+            };
             let mut remaining = quantity;
             let mut matched = Vec::new();
             for (price, available) in book {
                 if remaining.is_zero() {
                     break;
                 }
+                let level = if buy {
+                    d(price) + shift
+                } else {
+                    d(price) - shift
+                };
+                if let Some(limit) = limit {
+                    if (buy && level > limit) || (!buy && level < limit) {
+                        break;
+                    }
+                }
                 let used = remaining.min(d(available));
-                matched.push((d(price), used));
+                matched.push((level, used));
                 remaining -= used;
             }
             if let (Some(extra), Some(last)) = (self.knobs.extra_fill, matched.last_mut()) {
@@ -1170,6 +1396,12 @@ mod tests {
                     time_ms,
                 });
             }
+            // An immediate-or-cancel order that took less than it asked for expires.
+            let status = if limit.is_some() && total < quantity {
+                "EXPIRED"
+            } else {
+                "FILLED"
+            };
             state.orders.push(Order {
                 id,
                 client_id: client_id.clone(),
@@ -1178,6 +1410,8 @@ mod tests {
                 quote,
                 time_ms,
                 trades,
+                limit,
+                status,
             });
             drop(state);
             if let Some(on_order) = &self.on_order {
@@ -1186,9 +1420,12 @@ mod tests {
             let mut reply = json!({
                 "symbol": "AEROUSDT", "orderId": id, "orderListId": -1,
                 "clientOrderId": client_id, "transactTime": time_ms,
-                "price": "0.00000000", "origQty": quantity.to_string(),
+                "price": limit.map_or_else(|| "0.00000000".to_string(), |price| price.to_string()),
+                "origQty": quantity.to_string(),
                 "executedQty": total.to_string(), "cummulativeQuoteQty": quote.to_string(),
-                "status": "FILLED", "timeInForce": "GTC", "type": "MARKET", "side": side,
+                "status": status,
+                "timeInForce": if limit.is_some() { "IOC" } else { "GTC" },
+                "type": if limit.is_some() { "LIMIT" } else { "MARKET" }, "side": side,
                 "fills": fills
             });
             if self.knobs.no_transact_time {
@@ -1209,10 +1446,13 @@ mod tests {
             };
             Self::ok(json!({
                 "symbol": "AEROUSDT", "orderId": order.id, "orderListId": -1,
-                "clientOrderId": order.client_id, "price": "0.00000000",
+                "clientOrderId": order.client_id,
+                "price": order.limit.map_or_else(|| "0.00000000".to_string(), |price| price.to_string()),
                 "origQty": order.qty.to_string(), "executedQty": order.qty.to_string(),
-                "cummulativeQuoteQty": order.quote.to_string(), "status": "FILLED",
-                "timeInForce": "GTC", "type": "MARKET", "side": order.side,
+                "cummulativeQuoteQty": order.quote.to_string(), "status": order.status,
+                "timeInForce": if order.limit.is_some() { "IOC" } else { "GTC" },
+                "type": if order.limit.is_some() { "LIMIT" } else { "MARKET" },
+                "side": order.side,
                 "time": order.time_ms, "updateTime": order.time_ms + 5,
                 "isWorking": true, "origQuoteOrderQty": "0.00000000"
             }))
@@ -1259,10 +1499,10 @@ mod tests {
         fn respond(&self, request: &Request) -> ResponseTemplate {
             match (request.method.as_str(), request.url.path()) {
                 ("GET", "/api/v3/time") => Self::ok(json!({"serverTime": local_now_ms()})),
-                ("GET", "/api/v3/exchangeInfo") => Self::ok(Self::exchange_info()),
+                ("GET", "/api/v3/exchangeInfo") => Self::ok(self.exchange_info()),
                 ("GET", "/api/v3/depth") => Self::ok(json!({
                     "lastUpdateId": 1_027_024,
-                    "bids": Self::levels(&BIDS), "asks": Self::levels(&ASKS)
+                    "bids": Self::levels(&self.book(false)), "asks": Self::levels(&self.book(true))
                 })),
                 ("GET", "/api/v3/trades") => self.public_trades(),
                 (verb, path) => {
@@ -1295,6 +1535,17 @@ mod tests {
             symbol: "AEROUSDT".to_string(),
             order_usd: d("10"),
             round_trips,
+            buy_order: LegStyle::Market,
+            sell_order: LegStyle::Market,
+        }
+    }
+
+    /// `settings` with the order style of each leg.
+    fn styled(round_trips: usize, buy: LegStyle, sell: LegStyle) -> Settings {
+        Settings {
+            buy_order: buy,
+            sell_order: sell,
+            ..settings(round_trips)
         }
     }
 
@@ -1336,6 +1587,26 @@ mod tests {
                 .unwrap()
                 .iter()
                 .map(|request| format!("{} {}", request.method, request.url.path()))
+                .collect()
+        }
+
+        /// The parameters of every order the mock received, in the order sent.
+        async fn orders_sent(&self) -> Vec<HashMap<String, String>> {
+            self.server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "POST" && request.url.path() == ORDER_PATH
+                })
+                .map(|request| {
+                    request
+                        .url
+                        .query_pairs()
+                        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                        .collect()
+                })
                 .collect()
         }
     }
@@ -1959,6 +2230,245 @@ mod tests {
         assert!(skipped[0]["reason"].as_str().unwrap().contains("sold back"));
         assert!(played.clean);
         lab.setup.clean_up();
+    }
+
+    // --- one leg a limit-ioc order, the other a market order ---
+
+    /// The order styles of a round trip, as the first run was asked for: an IOC buy at
+    /// the ask seen, then a market sell of what it delivered. Every check passes, the
+    /// buy is a LIMIT / IOC at the touch on the wire, and the lines say how each was sent.
+    #[tokio::test]
+    async fn a_limit_ioc_buy_and_a_market_sell_make_a_round_trip_that_passes_every_check() {
+        let lab = Lab::new(
+            "ioc-buy",
+            Knobs {
+                deep_touch: true,
+                ..Knobs::default()
+            },
+        )
+        .await;
+        let played = play(&lab, styled(1, LegStyle::LimitIoc, LegStyle::Market)).await;
+
+        let mut expected = vec![("LV2a", "pass"); 3];
+        expected.extend(leg_cases());
+        expected.extend(leg_cases());
+        expected.extend([("EXIT", "pass"), ("EXIT", "pass")]);
+        assert_eq!(played.cases(), expected, "{:#?}", played.lines);
+        assert!(played.clean);
+
+        let sent = lab.orders_sent().await;
+        assert_eq!(sent.len(), 2);
+        assert_eq!(
+            (sent[0]["side"].as_str(), sent[0]["type"].as_str()),
+            ("BUY", "LIMIT")
+        );
+        assert_eq!(sent[0]["timeInForce"], "IOC");
+        assert_eq!(d(&sent[0]["price"]), d("1.0010"), "the ask the book showed");
+        assert_eq!(sent[0]["quantity"], "5.9");
+        assert_eq!(
+            (sent[1]["side"].as_str(), sent[1]["type"].as_str()),
+            ("SELL", "MARKET")
+        );
+        assert!(!sent[1].contains_key("price") && !sent[1].contains_key("timeInForce"));
+
+        let orders = played.orders();
+        let (buy, sell) = (&orders[0]["references"], &orders[1]["references"]);
+        assert_eq!(buy["order_style"], "limit-ioc");
+        assert_eq!(buy["limit_price"], "1.0010");
+        assert_eq!(sell["order_style"], "market");
+        assert!(sell["limit_price"].is_null());
+        // The IOC buy filled whole at the price seen; the touch held enough for it.
+        assert_eq!(d(buy["avg_fill"]["price"].as_str().unwrap()), d("1.0010"));
+        assert_eq!(d(buy["avg_fill"]["qty"].as_str().unwrap()), d("5.9"));
+        lab.setup.clean_up();
+    }
+
+    /// The other way round: a market buy, then an IOC sell at the bid seen.
+    #[tokio::test]
+    async fn a_market_buy_and_a_limit_ioc_sell_make_a_round_trip_that_passes_every_check() {
+        let lab = Lab::new(
+            "ioc-sell",
+            Knobs {
+                deep_touch: true,
+                ..Knobs::default()
+            },
+        )
+        .await;
+        let played = play(&lab, styled(1, LegStyle::Market, LegStyle::LimitIoc)).await;
+
+        assert!(played.clean, "{:#?}", played.lines);
+        let sent = lab.orders_sent().await;
+        assert_eq!(sent[0]["type"], "MARKET");
+        assert_eq!(
+            (sent[1]["type"].as_str(), sent[1]["timeInForce"].as_str()),
+            ("LIMIT", "IOC")
+        );
+        assert_eq!(d(&sent[1]["price"]), d("1.0000"), "the bid the book showed");
+        let orders = played.orders();
+        assert_eq!(orders[1]["references"]["order_style"], "limit-ioc");
+        assert_eq!(orders[1]["references"]["limit_price"], "1.0000");
+        lab.setup.clean_up();
+    }
+
+    /// If the touch moved away between the read and the order, an IOC at the old
+    /// touch fills nothing: the run stops with nothing held and no sell sent. A
+    /// market order would have filled at the worse price.
+    #[tokio::test]
+    async fn a_limit_ioc_buy_the_book_moved_away_from_fills_nothing_and_the_run_stops_flat() {
+        let lab = Lab::new(
+            "ioc-moved",
+            Knobs {
+                deep_touch: true,
+                book_moved: true,
+                ..Knobs::default()
+            },
+        )
+        .await;
+        let played = play(&lab, styled(1, LegStyle::LimitIoc, LegStyle::Market)).await;
+
+        assert_eq!(lab.orders_sent().await.len(), 1, "no sell follows");
+        assert!(!played.clean, "{:#?}", played.cases());
+        assert_eq!(
+            lab.exchange.holdings(),
+            (d("100"), d("20")),
+            "nothing was bought"
+        );
+        let order = played.orders()[0];
+        assert_ne!(order["verdict"], "pass", "{order}");
+        assert_eq!(order["references"]["order_style"], "limit-ioc");
+        lab.setup.clean_up();
+    }
+
+    /// The same moved book with market orders fills, at the worse price: the
+    /// difference the IOC refuses to pay.
+    #[tokio::test]
+    async fn a_market_buy_on_the_moved_book_fills_at_the_worse_price() {
+        let lab = Lab::new(
+            "market-moved",
+            Knobs {
+                deep_touch: true,
+                book_moved: true,
+                ..Knobs::default()
+            },
+        )
+        .await;
+        let played = play(&lab, settings(1)).await;
+
+        assert!(played.clean, "{:#?}", played.lines);
+        let buy = &played.orders()[0]["references"];
+        assert_eq!(d(buy["avg_fill"]["price"].as_str().unwrap()), d("1.0020"));
+        assert_eq!(buy["touch_at_send"]["best_ask"]["price"], "1.0010");
+        assert_eq!(buy["order_style"], "market");
+        lab.setup.clean_up();
+    }
+
+    /// An IOC at the touch fills only what the touch holds, so a touch thinner than
+    /// the order would fill in part, and a part may be too small to sell back: the
+    /// leg is not sent.
+    #[tokio::test]
+    async fn a_limit_ioc_leg_the_touch_is_too_thin_for_is_skipped_and_nothing_is_sent() {
+        let lab = Lab::new("ioc-thin", Knobs::default()).await; // 5 at the touch, 5.9 wanted
+        let played = play(&lab, styled(1, LegStyle::LimitIoc, LegStyle::Market)).await;
+
+        assert!(lab.orders_sent().await.is_empty());
+        let skipped: Vec<_> = played
+            .lines
+            .iter()
+            .filter(|line| line["verdict"] == "skipped")
+            .collect();
+        assert_eq!(skipped.len(), 1, "{:#?}", played.cases());
+        assert!(
+            skipped[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("fill in part"),
+            "{}",
+            skipped[0]["reason"]
+        );
+        assert!(played.clean);
+        lab.setup.clean_up();
+    }
+
+    /// A limit order is priced on the symbol's tick; without one in exchangeInfo the
+    /// run stops before any order, by name.
+    #[tokio::test]
+    async fn a_limit_ioc_leg_without_a_price_filter_stops_the_run_before_any_order() {
+        let lab = Lab::new(
+            "ioc-no-tick",
+            Knobs {
+                deep_touch: true,
+                no_price_filter: true,
+                ..Knobs::default()
+            },
+        )
+        .await;
+        let played = play(&lab, styled(1, LegStyle::LimitIoc, LegStyle::Market)).await;
+
+        assert!(lab.orders_sent().await.is_empty());
+        assert!(!played.clean);
+        assert!(
+            played.lines.iter().any(|line| line["verdict"] == "fail"
+                && line["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("PRICE_FILTER"))),
+            "{:#?}",
+            played.cases()
+        );
+        lab.setup.clean_up();
+    }
+
+    /// Market orders are what the case sent before the setting, and stay the default.
+    #[test]
+    fn each_legs_order_style_is_read_from_the_environment_and_defaults_to_market() {
+        use crate::production::env::MapEnv;
+
+        let none = Settings::from_env(&MapEnv::new(&[])).unwrap();
+        assert_eq!(
+            (none.buy_order, none.sell_order),
+            (LegStyle::Market, LegStyle::Market)
+        );
+        let mixed = Settings::from_env(&MapEnv::new(&[
+            ("VP_BUY_ORDER", "limit-ioc"),
+            ("VP_SELL_ORDER", "market"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            (mixed.buy_order, mixed.sell_order),
+            (LegStyle::LimitIoc, LegStyle::Market)
+        );
+        for bad in ["limit", "LIMIT-IOC", "ioc"] {
+            let why = Settings::from_env(&MapEnv::new(&[("VP_SELL_ORDER", bad)]))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                why.contains("VP_SELL_ORDER") && why.contains(bad),
+                "{bad}: {why}"
+            );
+        }
+        assert_eq!(LegStyle::LimitIoc.word(), "limit-ioc");
+    }
+
+    #[test]
+    fn the_tick_is_read_from_the_exchange_info_body_or_is_absent() {
+        let with = MiniExchange::new(Knobs::default())
+            .exchange_info()
+            .to_string();
+        assert_eq!(price_tick(&with, "AEROUSDT"), Some(d("0.0001")));
+        assert_eq!(price_tick(&with, "ETHUSDT"), None, "another symbol");
+        let without = MiniExchange::new(Knobs {
+            no_price_filter: true,
+            ..Knobs::default()
+        })
+        .exchange_info()
+        .to_string();
+        assert_eq!(price_tick(&without, "AEROUSDT"), None);
+        assert_eq!(price_tick("not json", "AEROUSDT"), None);
+        let zero = with.replace("0.00010000", "0.00000000");
+        assert_eq!(
+            price_tick(&zero, "AEROUSDT"),
+            None,
+            "a tick of zero prices nothing"
+        );
     }
 
     // --- dry run, record mode ---
