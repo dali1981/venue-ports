@@ -11,9 +11,11 @@
 //! quantity, because it would fill in part. The style of each order is on its line,
 //! in `references.order_style`, with `references.limit_price`.
 //!
-//! Before each order the case reads the book (five levels) and the account's
-//! balances; it sends the order; and it checks what the venue says of it against
-//! what `execute` returned, to the unit (`exchange_checks`):
+//! Before each order the case reads the account's balances and then the book (five
+//! levels), so that the order leaves right after the book and a limit-ioc order is
+//! priced on the freshest touch it can have; it sends the order; and it checks what
+//! the venue says of it against what `execute` returned, to the unit
+//! (`exchange_checks`):
 //!
 //! | # | Check | Where |
 //! |---|---|---|
@@ -498,8 +500,21 @@ impl<'a> Lv2aExchange<'a> {
         let symbol = self.settings.symbol.clone();
         let rest = live.rest();
 
-        // The book, then the balances: what the order is sized from and what
-        // E5 compares.
+        // The balances, which E5 compares, then the book, which the order is sized
+        // and priced from. The book is read last, so that the order leaves with
+        // nothing but arithmetic between: a touch is as old at the match as the time
+        // between its read and the order, and a limit-ioc order at a stale touch
+        // expires (11 October: the balances read between them took 589 ms).
+        let before = self
+            .run
+            .call(
+                CallSpec::new(CASE, Expected::ok()).record_as(&format!("{name}-account-before")),
+                || async { rest.balances().await },
+            )
+            .await?;
+        let Ok(before) = before.result else {
+            return self.not_sized(&before.verdict, "the account's balances were not read");
+        };
         let book = self
             .run
             .call(
@@ -521,16 +536,6 @@ impl<'a> Lv2aExchange<'a> {
             snapshot,
             read_sent_ns: read.sent_ns,
             read_returned_ns: read.returned_ns,
-        };
-        let before = self
-            .run
-            .call(
-                CallSpec::new(CASE, Expected::ok()).record_as(&format!("{name}-account-before")),
-                || async { rest.balances().await },
-            )
-            .await?;
-        let Ok(before) = before.result else {
-            return self.not_sized(&before.verdict, "the account's balances were not read");
         };
 
         // Size it.
@@ -2414,6 +2419,45 @@ mod tests {
             "{:#?}",
             played.cases()
         );
+        lab.setup.clean_up();
+    }
+
+    /// The book is read last: nothing but arithmetic lies between it and the order,
+    /// whatever the style, so the touch an order is priced on is as fresh as the
+    /// read can make it (11 October: a balances read between them was 589 ms).
+    #[tokio::test]
+    async fn the_book_is_the_last_read_before_each_order() {
+        let lab = Lab::new(
+            "book-last",
+            Knobs {
+                deep_touch: true,
+                ..Knobs::default()
+            },
+        )
+        .await;
+        let played = play(&lab, styled(1, LegStyle::LimitIoc, LegStyle::Market)).await;
+        assert!(played.clean, "{:#?}", played.lines);
+
+        let seen = lab.received().await;
+        let orders: Vec<_> = seen
+            .iter()
+            .enumerate()
+            .filter(|(_, request)| *request == "POST /api/v3/order")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(orders.len(), 2);
+        for index in orders {
+            assert_eq!(
+                seen[index - 1],
+                "GET /api/v3/depth",
+                "the request before an order is the book: {seen:#?}"
+            );
+            assert_eq!(
+                seen[index - 2],
+                "GET /api/v3/account",
+                "and the balances precede the book"
+            );
+        }
         lab.setup.clean_up();
     }
 
