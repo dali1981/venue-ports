@@ -385,6 +385,13 @@ pub(crate) struct SwapFacts<'a> {
     pub(crate) token_in: Address,
     pub(crate) token_out: Address,
     pub(crate) amount_in: U256,
+    /// The latest block the node reported, read just before the swap was prepared and sent: after the
+    /// quote and after the approval was confirmed (a transaction of its own, a block or more), so the
+    /// quote's block is not the block the swap was sent after. `inclusion_block − block_at_send` is how
+    /// many blocks it took to land. A node can report a block behind a receipt it has already served
+    /// (a preconfirmed one), so this can be one block stale and the difference one too many; it is
+    /// never too few. Known whether or not the swap landed, so never `null`.
+    pub(crate) block_at_send: u64,
     /// The local clock before the signed transaction left.
     pub(crate) sent_ns: Option<u128>,
     pub(crate) tx_hash: Option<B256>,
@@ -467,6 +474,7 @@ pub(crate) fn swap_references(facts: &SwapFacts<'_>) -> Value {
         "token_in": address(facts.token_in),
         "token_out": address(facts.token_out),
         "amount_in": facts.amount_in.to_string(),
+        "block_at_send": facts.block_at_send,
         "sent_ns": facts.sent_ns.map_or(Value::Null, ns),
         "tx_hash": facts.tx_hash.map(|hash| hash.to_string()),
         "first_seen_ns": facts.first_seen_ns.map_or(Value::Null, ns),
@@ -491,13 +499,14 @@ pub(crate) fn swap_references(facts: &SwapFacts<'_>) -> Value {
 
 /// The names of the fields every swap's `references` has, present or `null`.
 #[cfg(test)]
-pub(crate) const SWAP_REFERENCE_FIELDS: [&str; 22] = [
+pub(crate) const SWAP_REFERENCE_FIELDS: [&str; 23] = [
     "quote_pre_send",
     "calldata",
     "router",
     "token_in",
     "token_out",
     "amount_in",
+    "block_at_send",
     "sent_ns",
     "tx_hash",
     "first_seen_ns",
@@ -830,6 +839,7 @@ mod tests {
             token_in: TOKEN_IN,
             token_out: TOKEN_OUT,
             amount_in: U256::from(10_000_000u64),
+            block_at_send: 999,
             sent_ns: Some(1_700_000_000_500_000_000),
             tx_hash: Some(B256::from([0x11; 32])),
             first_seen_ns: Some(1_700_000_001_000_000_000),
@@ -852,6 +862,8 @@ mod tests {
             "10000000000000000000"
         );
         assert_eq!(references["quote_pre_send"]["block"], 998);
+        // The quote, then the block the swap was sent after, then the block it landed in.
+        assert_eq!(references["block_at_send"], 999);
         assert_eq!(references["calldata"], "0xabcd");
         assert_eq!(references["amount_in"], "10000000");
         assert_eq!(references["inclusion_block"], 1000);
@@ -939,9 +951,10 @@ mod tests {
                 references[field]
             );
         }
-        // What the swap was is known without a landing.
+        // What the swap was is known without a landing, and so is the block it was sent after.
         assert_eq!(references["amount_in"], "10000000");
         assert_eq!(references["calldata"], "0xabcd");
+        assert_eq!(references["block_at_send"], 999);
     }
 
     /// `Realised.at` of a swap that never reached a terminal state is the latest

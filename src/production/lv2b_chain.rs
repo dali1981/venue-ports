@@ -971,6 +971,7 @@ impl<'a> Lv2bChain<'a> {
                             token_in: from,
                             token_out: to,
                             amount_in,
+                            block_at_send,
                             sent_ns: landing.sent_ns,
                             tx_hash: landing.tx_hash,
                             first_seen_ns: landing.first_seen_ns,
@@ -990,6 +991,7 @@ impl<'a> Lv2bChain<'a> {
                             token_in: from,
                             token_out: to,
                             amount_in,
+                            block_at_send,
                             sent_ns: None,
                             tx_hash: None,
                             first_seen_ns: None,
@@ -1775,6 +1777,18 @@ mod tests {
             assert_eq!(references["amount_out"], record.amount_out.to_string());
             // Where it landed: its block, its place in it, and how long the block is.
             assert_eq!(number(&references["inclusion_block"]), record.block);
+            // The quote, then the block the swap was sent after, then the block it landed in. Not
+            // strictly increasing: the node's latest block can be behind a receipt it has served (the
+            // mock models that), so the block read after the approval can still be the quote's.
+            let (quoted, sent_after) = (
+                number(&references["quote_pre_send"]["block"]),
+                number(&references["block_at_send"]),
+            );
+            assert!(
+                quoted <= sent_after && sent_after <= record.block,
+                "quote {quoted}, sent after {sent_after}, landed {}",
+                record.block
+            );
             assert_eq!(number(&references["transaction_index"]), 2);
             assert_eq!(number(&references["block_tx_count"]), 4);
             // Its cost, as the receipt has it.
