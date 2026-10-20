@@ -166,6 +166,8 @@ impl SolanaRpc {
             .with_context(|| format!("{method} to {}", node(&self.url)))?
             .json()
             .await
+            // reqwest 0.13 writes the URL into a decode error too (Response::json: error::decode(..).with_url(..)).
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("decoding {method}'s answer"))?;
         if let Some(error) = response.get("error") {
             return Err(SolanaRpcError {
@@ -552,5 +554,26 @@ mod tests {
         let (shown, debug) = (format!("{e:#}"), format!("{e:?}"));
         assert!(!shown.contains("SECRETKEY") && !debug.contains("SECRETKEY"), "{shown} / {debug}");
         assert!(shown.contains("getSlot to http://127.0.0.1:9"), "{shown}");
+    }
+
+    /// An answer that is not JSON fails the decode, and reqwest 0.13 writes the URL into that error too: made without it.
+    #[tokio::test]
+    async fn an_undecodable_answer_names_no_key() {
+        let e = SolanaRpc::new(answers_not_json().await).call("getSlot", json!([])).await.unwrap_err();
+        let (shown, debug) = (format!("{e:#}"), format!("{e:?}"));
+        assert!(shown.contains("decoding") && !shown.contains("SECRETKEY") && !debug.contains("SECRETKEY"), "{shown} / {debug}");
+    }
+
+    /// A local node that answers 200 with a body that is not JSON, at a keyed path.
+    async fn answers_not_json() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v2/SECRETKEY", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut [0u8; 4096]).await;
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 8\r\nconnection: close\r\n\r\nnot json").await;
+        });
+        url
     }
 }
