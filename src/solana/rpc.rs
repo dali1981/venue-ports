@@ -124,10 +124,17 @@ pub struct Simulation {
     pub accounts: Vec<Option<AccountData>>,
 }
 
-#[derive(Debug, Clone)]
+/// Its `Debug` names the node by scheme, host and port: the key is in the URL.
+#[derive(Clone)]
 pub struct SolanaRpc {
     url: String,
     http: reqwest::Client,
+}
+
+impl std::fmt::Debug for SolanaRpc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SolanaRpc").field("url", &crate::node_url::shown(&self.url)).finish_non_exhaustive()
+    }
 }
 
 impl SolanaRpc {
@@ -163,7 +170,7 @@ impl SolanaRpc {
             .await
             // reqwest writes the URL it asked, a node's key and all, into its error: made without it, the node named by its host.
             .map_err(reqwest::Error::without_url)
-            .with_context(|| format!("{method} to {}", node(&self.url)))?
+            .with_context(|| format!("{method} to {}", crate::node_url::shown(&self.url)))?
             .json()
             .await
             // reqwest 0.13 writes the URL into a decode error too (Response::json: error::decode(..).with_url(..)).
@@ -529,19 +536,6 @@ pub fn address_from_slice(bytes: &[u8]) -> Result<Address> {
     Ok(Address::new_from_array(array))
 }
 
-/// A node URL as an error may name it: scheme, host and port. A provider's key is in its userinfo, path or query; a string that is not a
-/// URL is never echoed.
-fn node(url: &str) -> String {
-    match reqwest::Url::parse(url) {
-        Ok(u) => match (u.host_str(), u.port()) {
-            (Some(host), Some(port)) => format!("{}://{host}:{port}", u.scheme()),
-            (Some(host), None) => format!("{}://{host}", u.scheme()),
-            (None, _) => "<unparseable url>".to_string(),
-        },
-        Err(_) => "<unparseable url>".to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,7 +544,9 @@ mod tests {
     /// which node by scheme, host and port.
     #[tokio::test]
     async fn a_refused_call_names_no_key() {
-        let e = SolanaRpc::new("http://127.0.0.1:9/v2/SECRETKEY").call("getSlot", json!([])).await.unwrap_err();
+        let rpc = SolanaRpc::new("http://127.0.0.1:9/v2/SECRETKEY");
+        assert!(!format!("{rpc:?}").contains("SECRETKEY"), "{rpc:?}");
+        let e = rpc.call("getSlot", json!([])).await.unwrap_err();
         let (shown, debug) = (format!("{e:#}"), format!("{e:?}"));
         assert!(!shown.contains("SECRETKEY") && !debug.contains("SECRETKEY"), "{shown} / {debug}");
         assert!(shown.contains("getSlot to http://127.0.0.1:9"), "{shown}");

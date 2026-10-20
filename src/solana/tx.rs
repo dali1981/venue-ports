@@ -119,7 +119,7 @@ impl SolanaSender {
         bail!(
             "the Solana signing backend is not built: Live on {network} (node {}) waits until the \
              owner asks for it. Use SolanaSender::fork on a Surfpool node",
-            rpc.url()
+            crate::node_url::shown(rpc.url())
         )
     }
 
@@ -132,7 +132,7 @@ impl SolanaSender {
             bail!(
                 "refusing {}: it does not answer surfnet_getSurfnetInfo, so it is not a Surfpool \
                  fork — the fork backend sends transactions and must never send them anywhere real",
-                rpc.url()
+                crate::node_url::shown(rpc.url())
             );
         }
         let genesis_hash = rpc

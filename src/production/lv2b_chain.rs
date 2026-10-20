@@ -2760,11 +2760,14 @@ mod tests {
             .find(|line| line["verdict"] == "fail")
             .expect("a failed line");
         // The verdict's reason is generic; the node's words are the outcome's,
-        // with the provider's URL scrubbed.
+        // naming the node by its host, never its key.
         assert_eq!(refused["outcome"]["kind"], "not_sent");
         let said = refused["outcome"]["msg"].as_str().unwrap();
         assert!(
-            said.contains("is on chain 1") && said.contains("8453") && said.contains("[provider]"),
+            said.contains("is on chain 1")
+                && said.contains("8453")
+                && said.contains("127.0.0.1")
+                && !said.contains(KEY_IN_PATH),
             "{refused}"
         );
         assert_eq!(lab.chain.times_asked("eth_sendRawTransaction"), 0);

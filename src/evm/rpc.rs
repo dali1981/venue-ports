@@ -132,7 +132,8 @@ pub struct Receipt {
     pub transaction_index: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+/// Its `Debug` names the node by scheme, host and port: the key is in the URL.
+#[derive(Clone)]
 pub struct EvmRpc {
     url: String,
     http: reqwest::Client,
@@ -176,6 +177,12 @@ impl RpcTap {
 impl std::fmt::Debug for RpcTap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("RpcTap")
+    }
+}
+
+impl std::fmt::Debug for EvmRpc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EvmRpc").field("url", &crate::node_url::shown(&self.url)).finish_non_exhaustive()
     }
 }
 
@@ -774,7 +781,9 @@ pub(crate) mod tests {
     /// A node's key is in its URL, and reqwest writes the URL it asked into its error: a refused call's error names no key.
     #[tokio::test]
     async fn a_refused_call_names_no_key() {
-        let e = EvmRpc::new("http://127.0.0.1:9/v2/SECRETKEY").call("eth_blockNumber", json!([])).await.unwrap_err();
+        let rpc = EvmRpc::new("http://127.0.0.1:9/v2/SECRETKEY");
+        assert!(!format!("{rpc:?}").contains("SECRETKEY"), "{rpc:?}");
+        let e = rpc.call("eth_blockNumber", json!([])).await.unwrap_err();
         let (shown, debug) = (format!("{e:#}"), format!("{e:?}"));
         assert!(!shown.contains("SECRETKEY") && !debug.contains("SECRETKEY"), "{shown} / {debug}");
     }

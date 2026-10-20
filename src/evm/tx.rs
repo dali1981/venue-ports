@@ -287,7 +287,7 @@ impl EvmSender {
         if node_chain_id != chain_id {
             bail!(
                 "the node at {} is on chain {node_chain_id}, not the expected chain {chain_id}",
-                rpc.url()
+                crate::node_url::shown(rpc.url())
             );
         }
         let provenance = match rpc.client_version().await {
@@ -304,7 +304,7 @@ impl EvmSender {
                 return Err(err.context(format!(
                     "reading the node's web3_clientVersion at {}: without it the sender cannot \
                      say whether it sends to a fork",
-                    rpc.url()
+                    crate::node_url::shown(rpc.url())
                 )))
             }
         };
@@ -343,7 +343,7 @@ impl EvmSender {
         if !is_anvil(&version) {
             bail!(
                 "a fork sender only sends to an anvil node, and {} reports {version:?}",
-                rpc.url()
+                crate::node_url::shown(rpc.url())
             );
         }
         let node_chain_id = rpc
@@ -353,7 +353,7 @@ impl EvmSender {
         if node_chain_id != chain_id {
             bail!(
                 "the fork at {} is on chain {node_chain_id}, not the expected chain {chain_id}",
-                rpc.url()
+                crate::node_url::shown(rpc.url())
             );
         }
         if rpc.balance(owner).await? < U256::from(FORK_MIN_GAS_BALANCE) {

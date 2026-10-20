@@ -657,6 +657,21 @@ mod tests {
         }
     }
 
+    /// The line writer's net: a URL handed to `hide_urls`, its path and its query are replaced by `[provider]` wherever a line names
+    /// them, the whole URL before its parts. The clients make their errors without the URL; this catches text that names it on purpose.
+    #[tokio::test]
+    async fn a_hidden_url_its_path_and_its_query_are_written_as_provider() {
+        let server = MockServer::start().await;
+        let setup = Setup::new("hidden", &server);
+        let run = setup.run(&server).unwrap();
+        run.hide_urls(&["https://node.io/v2/PATHKEY12?apikey=QUERYKEY34".to_string()]);
+        assert_eq!(
+            run.scrub("at https://node.io/v2/PATHKEY12?apikey=QUERYKEY34, then /v2/PATHKEY12 and apikey=QUERYKEY34"),
+            "at [provider], then [provider] and [provider]"
+        );
+        setup.clean_up();
+    }
+
     #[tokio::test]
     async fn the_order_cap_defaults_to_twelve_and_a_cap_that_is_not_positive_is_refused() {
         let server = MockServer::start().await;
