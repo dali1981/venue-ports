@@ -229,7 +229,6 @@ impl EvmRpc {
             .with_context(|| format!("sending JSON-RPC request {method}"))?
             .json()
             .await
-            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("decoding JSON-RPC response body for {method}"))?;
 
         #[cfg(any(test, feature = "production"))]

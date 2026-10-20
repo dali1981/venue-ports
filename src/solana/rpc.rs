@@ -166,7 +166,6 @@ impl SolanaRpc {
             .with_context(|| format!("{method} to {}", node(&self.url)))?
             .json()
             .await
-            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("decoding {method}'s answer"))?;
         if let Some(error) = response.get("error") {
             return Err(SolanaRpcError {
