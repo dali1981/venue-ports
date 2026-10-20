@@ -161,9 +161,12 @@ impl SolanaRpc {
             .json(&body)
             .send()
             .await
-            .with_context(|| format!("{method} to {}", self.url))?
+            // reqwest writes the URL it asked, a node's key and all, into its error: made without it, the node named by its host.
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("{method} to {}", node(&self.url)))?
             .json()
             .await
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("decoding {method}'s answer"))?;
         if let Some(error) = response.get("error") {
             return Err(SolanaRpcError {
@@ -523,4 +526,32 @@ pub fn address_from_slice(bytes: &[u8]) -> Result<Address> {
         bail!("the all-zero key is not an address anything can own");
     }
     Ok(Address::new_from_array(array))
+}
+
+/// A node URL as an error may name it: scheme, host and port. A provider's key is in its userinfo, path or query; a string that is not a
+/// URL is never echoed.
+fn node(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(u) => match (u.host_str(), u.port()) {
+            (Some(host), Some(port)) => format!("{}://{host}:{port}", u.scheme()),
+            (Some(host), None) => format!("{}://{host}", u.scheme()),
+            (None, _) => "<unparseable url>".to_string(),
+        },
+        Err(_) => "<unparseable url>".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A node's key is in its URL, and reqwest writes the URL it asked into its error: a refused call's error names no key, and says
+    /// which node by scheme, host and port.
+    #[tokio::test]
+    async fn a_refused_call_names_no_key() {
+        let e = SolanaRpc::new("http://127.0.0.1:9/v2/SECRETKEY").call("getSlot", json!([])).await.unwrap_err();
+        let (shown, debug) = (format!("{e:#}"), format!("{e:?}"));
+        assert!(!shown.contains("SECRETKEY") && !debug.contains("SECRETKEY"), "{shown} / {debug}");
+        assert!(shown.contains("getSlot to http://127.0.0.1:9"), "{shown}");
+    }
 }

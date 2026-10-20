@@ -224,9 +224,12 @@ impl EvmRpc {
             .json(&body)
             .send()
             .await
+            // reqwest writes the URL it asked, a node's key and all, into its error: made without it.
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("sending JSON-RPC request {method}"))?
             .json()
             .await
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("decoding JSON-RPC response body for {method}"))?;
 
         #[cfg(any(test, feature = "production"))]
@@ -766,6 +769,14 @@ pub(crate) fn encode_error_string(reason: &str) -> Vec<u8> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A node's key is in its URL, and reqwest writes the URL it asked into its error: a refused call's error names no key.
+    #[tokio::test]
+    async fn a_refused_call_names_no_key() {
+        let e = EvmRpc::new("http://127.0.0.1:9/v2/SECRETKEY").call("eth_blockNumber", json!([])).await.unwrap_err();
+        let (shown, debug) = (format!("{e:#}"), format!("{e:?}"));
+        assert!(!shown.contains("SECRETKEY") && !debug.contains("SECRETKEY"), "{shown} / {debug}");
+    }
 
     #[test]
     fn first_word_reads_a_two_word_return_and_refuses_a_short_one() {

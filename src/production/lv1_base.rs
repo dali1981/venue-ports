@@ -1580,9 +1580,9 @@ mod tests {
             "skipped",
             "no latest block, so no log range"
         );
-        // The error names the URL, and the line does not.
+        // The client makes its error without the URL (reqwest's without_url), so the line names no key and has no URL to replace.
         assert!(!lab.text().contains(KEY), "{}", lab.text());
-        assert!(lab.text().contains("[provider]"));
+        assert!(lab.text().contains("sending JSON-RPC request"), "{}", lab.text());
         lab.setup.clean_up();
     }
 
