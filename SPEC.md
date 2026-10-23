@@ -432,7 +432,9 @@ pub trait DexExecutor: Send + Sync {
   `EvmSimulated::with_input_rule(address, InputRule::Word(n))` (the `n`th 32-byte word of the return data, as
   `PoolSwapper.swapV3` returns `amountInUsed`; a word that is missing, does not fit a `u128`, or exceeds the
   offer is an error). `InputRule::Offered` is the default, right for a router that spends the exact input it is
-  given and a guess for one that can take less without saying so. `EvmLive`'s amount in is the input token's
+  given and a guess for one that can take less without saying so. `EvmSimulated::without_funding()` gives the
+  input to no one: no balance or allowance is written and no slot is probed, for a contract that holds nothing
+  and pays each venue out of the next one's proceeds, whose losing call must revert as it would on the chain. `EvmLive`'s amount in is the input token's
   `Transfer`s out of the payer (the sender, or the contract called) less any back to it; a landed swap with none
   is an error naming its transaction, as one with no output `Transfer` is.
 - **`DexStub`** (today's `EvmStub`, renamed: it was never EVM-specific) — an in-process fake with no
@@ -608,7 +610,8 @@ Rules:
 
 The EVM chain family's plumbing is shared by every EVM adapter rather than copied into each:
 `src/evm/rpc.rs` (`EvmRpc`: JSON-RPC, `eth_call` with `from` and state overrides, receipts,
-revert-reason replay, hex/ABI helpers) and `src/evm/erc20.rs` (selectors, balance and allowance reads,
+revert-reason replay, hex/ABI helpers; `EvmRpc::with_replies(f)` hands `f` every exchange, the request as sent
+and the reply as the node wrote it, a revert's data inside, for a caller that keeps every reply raw) and `src/evm/erc20.rs` (selectors, balance and allowance reads,
 storage-slot probing). The probing is one prober for every adapter: a token's `balanceOf` and `allowance`
 mappings are found once per token, in one `eth_call` each, by writing a sentinel of its own into the slot
 each candidate base would put the entry at and reading back which one the token returns. The candidates are

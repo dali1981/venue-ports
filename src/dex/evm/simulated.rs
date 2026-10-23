@@ -48,6 +48,10 @@
 //! for per token the first time they're needed, then cached
 //! ([`crate::evm::erc20`]).
 //!
+//! **No funding** ([`EvmSimulated::without_funding`]): no balance or
+//! allowance is written and no slot is probed, for a contract that holds
+//! nothing and pays each venue out of the next one's proceeds.
+//!
 //! **A contract payer** (`Payer::CalledContract`): the contract the route
 //! calls holds the input and pays the venue itself, so the balance goes on
 //! that contract and no allowance is written. A contract not yet deployed
@@ -231,6 +235,8 @@ pub struct EvmSimulated {
     /// Whether a run with no block given reads the node's `pending` block
     /// rather than its latest one.
     pending_block: bool,
+    /// Whether the input is given to whoever pays it ([`EvmSimulated::without_funding`]).
+    fund: bool,
 }
 
 impl EvmSimulated {
@@ -243,6 +249,7 @@ impl EvmSimulated {
             returns: Rules::default(),
             inputs: Rules::default(),
             pending_block: false,
+            fund: true,
         }
     }
 
@@ -299,6 +306,18 @@ impl EvmSimulated {
         self
     }
 
+    /// Runs the call with no input given to anyone: no balance or allowance
+    /// is written, and no slot is probed for. For a contract that holds
+    /// nothing and pays each venue out of the next one's proceeds, whose
+    /// losing call must fail as it would on the chain. `Realised::amount_in`
+    /// is still read by the call's [`InputRule`] (its selector's, else its
+    /// address's), the offer by default, though nothing was given: such a
+    /// caller reads what the contract returns.
+    pub fn without_funding(mut self) -> Self {
+        self.fund = false;
+        self
+    }
+
     /// Runs every call with `code` placed at `address`, whatever the chain
     /// holds there: a contract not yet deployed, simulated on the chain's
     /// real state.
@@ -307,9 +326,9 @@ impl EvmSimulated {
         self
     }
 
-    /// The state overrides for one swap: every code override, then the
-    /// input's balance on whoever pays it, and an allowance to `router` only
-    /// when that is the sender.
+    /// The state overrides for one swap: every code override, then, unless
+    /// the run is unfunded, the input's balance on whoever pays it, and an
+    /// allowance to `router` only when that is the sender.
     async fn overrides(
         &self,
         ctx: &PendingSimulation,
@@ -327,6 +346,9 @@ impl EvmSimulated {
                 address.to_string(),
                 json!({ "code": hex_data(&code.runtime_code), "stateDiff": storage }),
             );
+        }
+        if !self.fund {
+            return Ok(Value::Object(overrides));
         }
 
         let holder = match ctx.payer {
@@ -955,6 +977,29 @@ mod tests {
             overrides[token.to_string()]["stateDiff"][holder_slot.to_string()],
             format_u256(U256::from(1_000u64))
         );
+    }
+
+    /// A contract that holds nothing, run as it is: its code placed, and no balance, no allowance, and no slot probe asked
+    /// of the node.
+    #[tokio::test]
+    async fn an_unfunded_simulation_places_the_code_and_nothing_else() {
+        let server = MockServer::start().await;
+        let contract = [0x11; 20];
+        let calldata = vec![0x01, 0x02, 0x03, 0x04];
+        mount_swap(&server, &calldata, U256::from(777u64).to_be_bytes::<32>().to_vec()).await;
+        let owner = Address::from([0xCC; 20]).into_word();
+        let code = CodeOverride { runtime_code: vec![0x60, 0x80], storage: vec![(B256::ZERO, owner)] };
+        let adapter = EvmSimulated::new(EvmRpc::new(server.uri())).with_code_override(Address::from(contract), code).without_funding();
+        let request = SwapRequest { payer: Payer::CalledContract, ..request() };
+        let prepared = adapter.prepare(&route(payload_for(contract, &calldata)), &request).await.unwrap();
+        let realised = adapter.execute(&prepared, Some(42)).await.unwrap();
+        assert_eq!((realised.amount_out, realised.amount_in), (Some(777), Some(1_000)));
+
+        let calls = eth_calls(&server).await;
+        assert_eq!(calls.len(), 1, "the swap alone: no slot probe {calls:?}");
+        let overrides = calls[0]["params"][2].as_object().unwrap();
+        assert_eq!(overrides.keys().collect::<Vec<_>>(), [&Address::from(contract).to_string()], "the contract's code and storage only");
+        assert_eq!(overrides[&Address::from(contract).to_string()]["stateDiff"][B256::ZERO.to_string()], owner.to_string());
     }
 
     /// README defect 1: a router returning `(returnAmount, gasUsed)` — 64

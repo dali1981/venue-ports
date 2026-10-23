@@ -142,7 +142,22 @@ pub struct EvmRpc {
     /// builds only; unset, the client is as it is.
     #[cfg(any(test, feature = "production"))]
     tap: Option<RpcTap>,
+    /// Told of every exchange ([`EvmRpc::with_replies`]); unset, nothing is told.
+    replies: Option<Replies>,
 }
+
+/// One JSON-RPC exchange as it went: the method, the request body as sent, and the node's reply as it wrote it (a result or
+/// an error, a revert's data inside), for a caller that keeps every reply raw. An exchange with no reply (the node never
+/// answered) is not told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcExchange {
+    pub method: String,
+    pub request: String,
+    pub reply: String,
+}
+
+#[derive(Clone)]
+struct Replies(std::sync::Arc<dyn Fn(RpcExchange) + Send + Sync>);
 
 /// What happened on the wire that a test taps: a signed transaction is about
 /// to be broadcast, the node answered the send, or a receipt poll was answered.
@@ -202,7 +217,14 @@ impl EvmRpc {
                 .expect("a reqwest client with only a timeout set always builds"),
             #[cfg(any(test, feature = "production"))]
             tap: None,
+            replies: None,
         }
+    }
+
+    /// This client, handing `f` every exchange it has with the node.
+    pub fn with_replies(mut self, f: impl Fn(RpcExchange) + Send + Sync + 'static) -> Self {
+        self.replies = Some(Replies(std::sync::Arc::new(f)));
+        self
     }
 
     /// This client, telling `tap` of each broadcast and each receipt poll.
@@ -225,7 +247,7 @@ impl EvmRpc {
             "method": method,
             "params": params,
         });
-        let response: Value = self
+        let reply = self
             .http
             .post(&self.url)
             .json(&body)
@@ -234,10 +256,15 @@ impl EvmRpc {
             // reqwest writes the URL it asked, a node's key and all, into its error: made without it.
             .map_err(reqwest::Error::without_url)
             .with_context(|| format!("sending JSON-RPC request {method}"))?
-            .json()
+            .text()
             .await
-            // reqwest 0.13 writes the URL into a decode error too (Response::json: error::decode(..).with_url(..)).
+            // reqwest 0.13 writes the URL into a body's error too.
             .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("reading JSON-RPC response body for {method}"))?;
+        if let Some(replies) = &self.replies {
+            (replies.0)(RpcExchange { method: method.to_string(), request: body.to_string(), reply: reply.clone() });
+        }
+        let response: Value = serde_json::from_str(&reply)
             .with_context(|| format!("decoding JSON-RPC response body for {method}"))?;
 
         #[cfg(any(test, feature = "production"))]
@@ -786,6 +813,34 @@ pub(crate) mod tests {
         let e = rpc.call("eth_blockNumber", json!([])).await.unwrap_err();
         let (shown, debug) = (format!("{e:#}"), format!("{e:?}"));
         assert!(!shown.contains("SECRETKEY") && !debug.contains("SECRETKEY"), "{shown} / {debug}");
+    }
+
+    /// A tapped client hands each exchange as it went: the request sent and the reply as the node wrote it, an error reply
+    /// (a revert, its data inside) as much as a result.
+    #[tokio::test]
+    async fn a_tapped_client_hands_each_exchange_as_the_node_sent_it() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let result = r#"{"jsonrpc":"2.0", "id":1,  "result":"0x2a"}"#;
+        let revert = r#"{"jsonrpc":"2.0","id":1,"error":{"code":3,"message":"execution reverted","data":"0xdeadbeef"}}"#;
+        for (m, body) in [("eth_blockNumber", result), ("eth_call", revert)] {
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({ "method": m })))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
+                .mount(&server)
+                .await;
+        }
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tap = seen.clone();
+        let rpc = EvmRpc::new(server.uri()).with_replies(move |x| tap.lock().unwrap().push(x));
+        assert_eq!(rpc.block_number().await.unwrap(), 42);
+        let err = rpc.eth_call(Address::ZERO, &[1, 2], None, BlockTag::Number(7), None).await.unwrap_err();
+        assert!(err.downcast_ref::<RpcError>().is_some_and(RpcError::is_revert), "{err:#}");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.iter().map(|x| (x.method.as_str(), x.reply.as_str())).collect::<Vec<_>>(), [("eth_blockNumber", result), ("eth_call", revert)]);
+        let asked: Value = serde_json::from_str(&seen[1].request).unwrap();
+        assert_eq!((asked["method"].as_str(), asked["params"][1].as_str()), (Some("eth_call"), Some("0x7")), "the request as sent");
     }
 
     /// An answer that is not JSON fails the decode, and reqwest 0.13 writes the URL into that error too: made without it.

@@ -6,7 +6,7 @@ pub mod erc20;
 pub mod rpc;
 pub mod tx;
 
-pub use rpc::{BlockTag, EvmRpc, Receipt, RpcError, RpcLog};
+pub use rpc::{BlockTag, EvmRpc, Receipt, RpcError, RpcExchange, RpcLog};
 pub use tx::{EvmSender, FeePolicy, PollSettings, Signer, TxOutcome, TxReplacedOrDropped};
 
 use crate::dex::EvmCall;
